@@ -1,0 +1,57 @@
+# QobuzProxy Configuration for Raspberry Pi
+#
+# Copy this file to /etc/qobuz-proxy/config.yaml
+# Set permissions: sudo chmod 600 /etc/qobuz-proxy/config.yaml
+
+# Qobuz account credentials
+qobuz:
+  email: "your-email@example.com"
+  password: "your-password"
+
+  # Audio quality setting
+  # 5 = MP3 320kbps (least bandwidth, most compatible)
+  # 6 = FLAC CD Quality 16-bit/44.1kHz (recommended for most setups)
+  # 7 = FLAC Hi-Res 24-bit/96kHz (higher quality, more bandwidth)
+  # 27 = FLAC Hi-Res Max 24-bit/192kHz (best quality, requires good network)
+  max_quality: 6  # CD quality is a good default for Pi
+
+# Device identification
+device:
+  # Name shown in Qobuz app's device list
+  name: "Raspberry Pi"
+
+  # Unique device identifier (auto-generated if not specified)
+  # uuid: "your-uuid-here"
+
+# Audio backend configuration
+backend:
+  type: "dlna"
+
+  dlna:
+    # IP address of your DLNA speaker/receiver
+    # Find this in your speaker's settings or router's device list
+    ip: "192.168.1.50"
+
+    # DLNA port (common values: 1400 for Sonos, 8080 for others)
+    port: 1400
+
+    # Set to true if you control volume with an external amplifier
+    # When true, volume commands from Qobuz app are ignored
+    fixed_volume: false
+
+# Server configuration
+server:
+  # HTTP port for mDNS discovery (Qobuz app uses this to find device)
+  http_port: 8689
+
+  # Audio proxy port for DLNA streaming
+  proxy_port: 7120
+
+  # Network interface to bind to (0.0.0.0 = all interfaces)
+  bind_address: "0.0.0.0"
+
+# Logging
+logging:
+  # Log level: debug, info, warning, error
+  # Use "debug" when troubleshooting, "info" for normal operation
+  level: "info"

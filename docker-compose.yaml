@@ -1,0 +1,65 @@
+# QobuzProxy Docker Compose Configuration
+#
+# IMPORTANT: network_mode: host is REQUIRED for mDNS to work.
+# This allows the Qobuz app to discover the device on your local network.
+# Without host networking, mDNS multicast packets won't reach the container.
+#
+# Alternative: Use macvlan network with a dedicated IP address on your LAN.
+
+version: "3.8"
+
+services:
+  qobuz-proxy:
+    # Build from local Dockerfile or use pre-built image
+    build: .
+    # image: qobuz-proxy:latest  # Uncomment to use pre-built image
+
+    container_name: qobuz-proxy
+
+    # REQUIRED: Host networking for mDNS multicast
+    # This exposes the container directly on the host's network
+    network_mode: host
+
+    # Environment variables for configuration
+    # These override any config file settings
+    environment:
+      # Required: Qobuz credentials
+      - QOBUZ_EMAIL=${QOBUZ_EMAIL}
+      - QOBUZ_PASSWORD=${QOBUZ_PASSWORD}
+
+      # Optional: Audio quality (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+      - QOBUZ_MAX_QUALITY=${QOBUZ_MAX_QUALITY:-27}
+
+      # Required: DLNA renderer IP address
+      - QOBUZPROXY_DLNA_IP=${QOBUZPROXY_DLNA_IP}
+
+      # Optional: DLNA renderer port (default: 1400 for Sonos)
+      - QOBUZPROXY_DLNA_PORT=${QOBUZPROXY_DLNA_PORT:-1400}
+
+      # Optional: Fixed volume mode - disable volume control (default: false)
+      - QOBUZPROXY_DLNA_FIXED_VOLUME=${QOBUZPROXY_DLNA_FIXED_VOLUME:-false}
+
+      # Optional: Device name shown in Qobuz app
+      - QOBUZPROXY_DEVICE_NAME=${QOBUZPROXY_DEVICE_NAME:-QobuzProxy}
+
+      # Optional: Server ports
+      - QOBUZPROXY_HTTP_PORT=${QOBUZPROXY_HTTP_PORT:-8689}
+      - QOBUZPROXY_PROXY_PORT=${QOBUZPROXY_PROXY_PORT:-7120}
+
+      # Optional: Log level (debug, info, warning, error)
+      - QOBUZPROXY_LOG_LEVEL=${QOBUZPROXY_LOG_LEVEL:-info}
+
+    # Optional: Mount config file instead of using env vars
+    # volumes:
+    #   - ./config.yaml:/app/config.yaml:ro
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Resource limits (optional, adjust as needed)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 256M
+    #     reservations:
+    #       memory: 128M

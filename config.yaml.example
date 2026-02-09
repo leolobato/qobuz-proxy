@@ -1,0 +1,26 @@
+# QobuzProxy Configuration
+# Copy to config.yaml and fill in your details
+
+qobuz:
+  email: "user@example.com"
+  password: "password"          # Or use QOBUZ_PASSWORD env var
+  max_quality: auto             # auto, 5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k
+
+device:
+  name: "QobuzProxy"            # Name shown in Qobuz app
+  uuid: null                    # Auto-generated if not specified
+
+backend:
+  type: "dlna"                  # Phase 1: dlna only
+  dlna:
+    ip: "192.168.1.50"          # Required: DLNA device IP
+    port: 1400                  # DLNA device port
+    fixed_volume: false         # Ignore volume commands
+
+server:
+  http_port: 8689               # mDNS discovery HTTP server
+  proxy_port: 7120              # DLNA audio proxy server
+  bind_address: "0.0.0.0"       # Network interface to bind
+
+logging:
+  level: "info"                 # debug, info, warning, error
