@@ -33,6 +33,7 @@ from .dlna import (
     StreamingURLProvider,
     MetadataServiceURLProvider,
 )
+from .local import LocalAudioBackend
 
 __all__ = [
     # Types
@@ -62,4 +63,6 @@ __all__ = [
     "RegisteredTrack",
     "StreamingURLProvider",
     "MetadataServiceURLProvider",
+    # Local backend
+    "LocalAudioBackend",
 ]

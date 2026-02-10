@@ -75,6 +75,11 @@ class BackendFactory:
                 ip=config.backend.dlna.ip,
                 port=config.backend.dlna.port or 1400,
             )
+        elif backend_type == "local":
+            return await cls.create_local(
+                device=config.backend.local.device,
+                buffer_size=config.backend.local.buffer_size,
+            )
         else:
             # Generic instantiation for registered backends
             return backend_class(name=f"{backend_type} Backend")
@@ -113,6 +118,26 @@ class BackendFactory:
         raise BackendNotFoundError(f"Failed to connect to DLNA device at {ip}:{port}")
 
     @classmethod
+    async def create_local(
+        cls,
+        device: str = "default",
+        buffer_size: int = 2048,
+        name: Optional[str] = None,
+    ) -> AudioBackend:
+        """Create a local audio backend."""
+        # Lazy import to avoid requiring sounddevice for DLNA users
+        from qobuz_proxy.backends.local import LocalAudioBackend
+
+        backend = LocalAudioBackend(
+            device=device,
+            buffer_size=buffer_size,
+            name=name or "Local Audio",
+        )
+        if await backend.connect():
+            return backend
+        raise BackendNotFoundError("Failed to initialize local audio backend")
+
+    @classmethod
     def list_available_backends(cls) -> list[str]:
         """List available backend types."""
         return BackendRegistry.available_types()
@@ -120,3 +145,11 @@ class BackendFactory:
 
 # Register backends
 BackendRegistry.register("dlna", DLNABackend)
+
+# Register local backend (lazy - import only when used)
+try:
+    from qobuz_proxy.backends.local import LocalAudioBackend
+
+    BackendRegistry.register("local", LocalAudioBackend)
+except ImportError:
+    pass  # sounddevice not installed

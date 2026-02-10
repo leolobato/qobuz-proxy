@@ -41,6 +41,9 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_DLNA_IP": ("backend", "dlna", "ip"),
     "QOBUZPROXY_DLNA_PORT": ("backend", "dlna", "port"),
     "QOBUZPROXY_DLNA_FIXED_VOLUME": ("backend", "dlna", "fixed_volume"),
+    # Local audio
+    "QOBUZPROXY_AUDIO_DEVICE": ("backend", "local", "device"),
+    "QOBUZPROXY_AUDIO_BUFFER_SIZE": ("backend", "local", "buffer_size"),
     # Server
     "QOBUZPROXY_HTTP_PORT": ("server", "http_port"),
     "QOBUZPROXY_PROXY_PORT": ("server", "proxy_port"),
@@ -86,11 +89,20 @@ class DLNAConfig:
 
 
 @dataclass
+class LocalConfig:
+    """Local audio backend configuration."""
+
+    device: str = "default"  # Device name, index, or "default"
+    buffer_size: int = 2048  # Audio buffer size in frames
+
+
+@dataclass
 class BackendConfig:
     """Audio backend configuration."""
 
     type: str = "dlna"
     dlna: DLNAConfig = field(default_factory=DLNAConfig)
+    local: LocalConfig = field(default_factory=LocalConfig)
 
 
 @dataclass
@@ -161,6 +173,14 @@ def validate_config(config: Config) -> None:
             errors.append("DLNA IP address is required when backend type is 'dlna'")
         if not validate_port(config.backend.dlna.port):
             errors.append(f"Invalid DLNA port: {config.backend.dlna.port}")
+    elif config.backend.type == "local":
+        if not (64 <= config.backend.local.buffer_size <= 16384):
+            errors.append(
+                f"Invalid buffer_size: {config.backend.local.buffer_size}. "
+                f"Must be between 64 and 16384"
+            )
+    elif config.backend.type != "stub":
+        errors.append(f"Unknown backend type: {config.backend.type}")
 
     # Server ports
     if not validate_port(config.server.http_port):
@@ -240,6 +260,7 @@ def load_env_config() -> dict:
                 "QOBUZPROXY_DLNA_PORT",
                 "QOBUZPROXY_HTTP_PORT",
                 "QOBUZPROXY_PROXY_PORT",
+                "QOBUZPROXY_AUDIO_BUFFER_SIZE",
             ):
                 try:
                     value = int(value)
@@ -309,6 +330,12 @@ def dict_to_config(d: dict) -> Config:
             config.backend.dlna.port = dlna.get("port", config.backend.dlna.port)
             config.backend.dlna.fixed_volume = dlna.get(
                 "fixed_volume", config.backend.dlna.fixed_volume
+            )
+        if "local" in b:
+            local = b["local"]
+            config.backend.local.device = local.get("device", config.backend.local.device)
+            config.backend.local.buffer_size = local.get(
+                "buffer_size", config.backend.local.buffer_size
             )
 
     # Server
