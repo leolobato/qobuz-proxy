@@ -98,6 +98,11 @@ Environment Variables:
         dest="json_output",
         help="Output as JSON (used with --discover)",
     )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List available audio output devices and exit",
+    )
 
     # Configuration
     parser.add_argument(
@@ -338,6 +343,30 @@ async def run_discovery(timeout: float, json_output: bool) -> int:
     return EXIT_SUCCESS
 
 
+def run_list_audio_devices() -> int:
+    """List available audio output devices."""
+    try:
+        from qobuz_proxy.backends.local.device import format_device_list, list_audio_devices
+    except ImportError:
+        print("Error: sounddevice not installed. Install with: pip install qobuz-proxy[local]")
+        return EXIT_CONFIG_ERROR
+
+    devices = list_audio_devices()
+    if not devices:
+        print("No audio output devices found.")
+        return EXIT_SUCCESS
+
+    print(f"Found {len(devices)} audio output device(s):\n")
+    print(format_device_list(devices))
+    print()
+    print("Config example (add to config.yaml):")
+    print("  backend:")
+    print("    type: local")
+    print("    local:")
+    print(f'      device: "{devices[0].name}"')
+    return EXIT_SUCCESS
+
+
 def run_serve(args: argparse.Namespace) -> int:
     """
     Run the proxy server.
@@ -405,6 +434,8 @@ def main() -> int:
 
     if args.discover:
         return asyncio.run(run_discovery(args.timeout, args.json_output))
+    elif args.list_audio_devices:
+        return run_list_audio_devices()
     else:
         return run_serve(args)
 

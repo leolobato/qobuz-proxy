@@ -48,6 +48,10 @@ dev = [
     "ruff>=0.1.0",
     "types-PyYAML>=6.0",
 ]
+local = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+]
 
 [project.scripts]
 qobuz-proxy = "qobuz_proxy.cli:main"

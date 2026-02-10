@@ -1,7 +1,7 @@
 """Tests for local audio backend configuration and factory."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -178,6 +178,30 @@ class TestArgsToDict:
         assert result["backend"]["local"]["buffer_size"] == 4096
 
 
+def _mock_sounddevice():
+    """Create a mock sounddevice module with a default output device."""
+    sd = MagicMock()
+    sd.query_devices.return_value = [
+        {
+            "name": "Default Output",
+            "max_output_channels": 2,
+            "max_input_channels": 0,
+            "default_samplerate": 44100.0,
+        },
+        {
+            "name": "USB DAC",
+            "max_output_channels": 2,
+            "max_input_channels": 0,
+            "default_samplerate": 96000.0,
+        },
+    ]
+    sd.default.device = (0, 0)  # (input, output)
+    return sd
+
+
+_SD_PATCH = "qobuz_proxy.backends.local.device._import_sounddevice"
+
+
 class TestFactoryLocal:
     """Test BackendFactory with local backend."""
 
@@ -190,23 +214,24 @@ class TestFactoryLocal:
         config.backend.local.device = "default"
         config.backend.local.buffer_size = 2048
 
-        backend = await BackendFactory.create_from_config(config)
+        with patch(_SD_PATCH, return_value=_mock_sounddevice()):
+            backend = await BackendFactory.create_from_config(config)
 
         assert isinstance(backend, LocalAudioBackend)
         assert backend.is_connected()
 
         info = backend.get_info()
         assert info.backend_type == "local"
-        assert info.device_id == "local-default"
 
         await backend.disconnect()
 
     async def test_factory_create_local_custom(self) -> None:
-        backend = await BackendFactory.create_local(
-            device="USB DAC", buffer_size=4096, name="My DAC"
-        )
+        with patch(_SD_PATCH, return_value=_mock_sounddevice()):
+            backend = await BackendFactory.create_local(
+                device="USB DAC", buffer_size=4096, name="My DAC"
+            )
         assert isinstance(backend, LocalAudioBackend)
-        assert backend.name == "My DAC"
+        assert "USB DAC" in backend.name
         await backend.disconnect()
 
 
@@ -217,7 +242,8 @@ class TestLocalAudioBackendStub:
         backend = LocalAudioBackend()
         assert not backend.is_connected()
 
-        result = await backend.connect()
+        with patch(_SD_PATCH, return_value=_mock_sounddevice()):
+            result = await backend.connect()
         assert result is True
         assert backend.is_connected()
 

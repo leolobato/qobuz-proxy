@@ -1,8 +1,8 @@
 """
-Local audio backend (stub).
+Local audio backend.
 
-Full implementation in QPROXY-021. This stub allows the factory
-and configuration to be tested before audio playback is implemented.
+Playback implementation in QPROXY-021. Device discovery and selection
+are functional; playback methods are stubs.
 """
 
 import logging
@@ -58,9 +58,22 @@ class LocalAudioBackend(AudioBackend):
         return self._state
 
     async def connect(self) -> bool:
-        logger.info(f"[LOCAL-STUB] connect(device={self._device_config})")
-        self._is_connected = True
-        return True
+        """Initialize connection — resolve and validate audio device."""
+        try:
+            from qobuz_proxy.backends.local.device import resolve_device
+
+            self._device_info = resolve_device(self._device_config)
+            self.name = f"Local: {self._device_info.name}"
+            self._is_connected = True
+            logger.info(
+                f"Audio output device: {self._device_info.name} "
+                f"({int(self._device_info.default_samplerate)} Hz, "
+                f"{self._device_info.channels}ch)"
+            )
+            return True
+        except (ValueError, ImportError) as e:
+            logger.error(f"Failed to initialize audio device: {e}")
+            return False
 
     async def disconnect(self) -> None:
         self._is_connected = False
