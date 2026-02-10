@@ -142,6 +142,34 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_file_audio_quality_changed_with_metadata(self, codec: ProtocolCodec) -> None:
+        """Test file audio quality changed encodes all 4 fields."""
+        frame = codec.encode_file_audio_quality_changed(
+            quality=6, sampling_rate=44100, bit_depth=16, nb_channels=2,
+        )
+        decoded = codec.decode_frame(frame)
+        assert decoded is not None
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch is not None
+        msg = batch.messages[0]
+        assert msg.messageType == QConnectMessageType.RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED
+        faq = msg.rndrSrvrFileAudioQualityChanged
+        assert faq.sampling_rate == 44100
+        assert faq.bit_depth == 16
+        assert faq.nb_channels == 2
+        assert faq.audio_quality == 2  # CD -> protocol value 2
+
+    def test_encode_file_audio_quality_defaults_from_quality_id(self, codec: ProtocolCodec) -> None:
+        """Test that omitting audio params derives defaults from quality ID."""
+        frame = codec.encode_file_audio_quality_changed(quality=27)
+        decoded = codec.decode_frame(frame)
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        faq = batch.messages[0].rndrSrvrFileAudioQualityChanged
+        assert faq.sampling_rate == 192000
+        assert faq.bit_depth == 24
+        assert faq.nb_channels == 2
+        assert faq.audio_quality == 4  # Hi-Res 192k -> protocol value 4
+
     def test_encode_device_audio_quality_changed(self, codec: ProtocolCodec) -> None:
         """Test device audio quality changed message encoding."""
         frame = codec.encode_device_audio_quality_changed(quality=6)  # CD quality
@@ -150,6 +178,18 @@ class TestEncoding:
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
 
+    def test_encode_device_audio_quality_changed_with_metadata(self, codec: ProtocolCodec) -> None:
+        """Test device audio quality changed encodes sampling_rate, bit_depth, nb_channels."""
+        frame = codec.encode_device_audio_quality_changed(
+            quality=7, sampling_rate=96000, bit_depth=24, nb_channels=2,
+        )
+        decoded = codec.decode_frame(frame)
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        daq = batch.messages[0].rndrSrvrDeviceAudioQualityChanged
+        assert daq.sampling_rate == 96000
+        assert daq.bit_depth == 24
+        assert daq.nb_channels == 2
+
     def test_encode_max_audio_quality_changed(self, codec: ProtocolCodec) -> None:
         """Test max audio quality changed message encoding."""
         frame = codec.encode_max_audio_quality_changed(quality=7)  # Hi-Res 96k
@@ -157,6 +197,15 @@ class TestEncoding:
         assert isinstance(frame, bytes)
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
+
+    def test_encode_max_audio_quality_changed_with_network_type(self, codec: ProtocolCodec) -> None:
+        """Test max audio quality changed encodes audio_quality and network_type."""
+        frame = codec.encode_max_audio_quality_changed(quality=27, network_type=1)
+        decoded = codec.decode_frame(frame)
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        maq = batch.messages[0].rndrSrvrMaxAudioQualityChanged
+        assert maq.audio_quality == 4  # Hi-Res 192k -> protocol value 4
+        assert maq.network_type == 1
 
 
 class TestDecoding:

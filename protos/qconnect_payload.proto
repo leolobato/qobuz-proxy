@@ -176,9 +176,21 @@ message RndrSrvrStateUpdated      { optional QueueRendererState state = 1; }
 message RndrSrvrRendererAction    { optional int32 action = 1; } // enum numeric
 message RndrSrvrVolumeChanged     { optional uint32 volume = 1; }
 message RndrSrvrVolumeMuted       { optional bool   value  = 1; }
-message RndrSrvrFileAudioQualityChanged   { optional int32 value = 1; }
-message RndrSrvrDeviceAudioQualityChanged { optional int32 value = 1; }
-message RndrSrvrMaxAudioQualityChanged    { optional int32 value = 1; }
+message RndrSrvrFileAudioQualityChanged {
+  optional int32 sampling_rate = 1;
+  optional int32 bit_depth     = 2;
+  optional int32 nb_channels   = 3;
+  optional int32 audio_quality = 4;
+}
+message RndrSrvrDeviceAudioQualityChanged {
+  optional int32 sampling_rate = 1;
+  optional int32 bit_depth     = 2;
+  optional int32 nb_channels   = 3;
+}
+message RndrSrvrMaxAudioQualityChanged {
+  optional int32 audio_quality = 1;
+  optional int32 network_type  = 2;
+}
 
 // Server → Renderer commands
 message SrvrRndrSetState { // Xt (control variant)

@@ -79,6 +79,14 @@ class DecodedMessage:
 QUALITY_TO_PROTOCOL = {5: 1, 6: 2, 7: 3, 27: 4}
 PROTOCOL_TO_QUALITY = {1: 5, 2: 6, 3: 7, 4: 27}
 
+# Default audio properties for each quality level: (sample_rate_hz, bit_depth, nb_channels)
+QUALITY_AUDIO_PROPERTIES = {
+    5: (44100, 16, 2),   # MP3 320kbps
+    6: (44100, 16, 2),   # CD quality FLAC
+    7: (96000, 24, 2),   # Hi-Res 96kHz
+    27: (192000, 24, 2), # Hi-Res 192kHz
+}
+
 
 class ProtocolCodec:
     """
@@ -307,7 +315,13 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
-    def encode_file_audio_quality_changed(self, quality: int) -> bytes:
+    def encode_file_audio_quality_changed(
+        self,
+        quality: int,
+        sampling_rate: int = 0,
+        bit_depth: int = 0,
+        nb_channels: int = 0,
+    ) -> bytes:
         """
         Encode file audio quality changed notification.
 
@@ -315,14 +329,24 @@ class ProtocolCodec:
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            sampling_rate: Sample rate in Hz (e.g. 44100, 96000). 0 = derive from quality.
+            bit_depth: Bit depth (16 or 24). 0 = derive from quality.
+            nb_channels: Number of channels. 0 = derive from quality.
 
         Returns:
             Encoded frame bytes
         """
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
+        defaults = QUALITY_AUDIO_PROPERTIES.get(quality, (44100, 16, 2))
+        sampling_rate = sampling_rate or defaults[0]
+        bit_depth = bit_depth or defaults[1]
+        nb_channels = nb_channels or defaults[2]
 
         quality_msg = payload_pb2.RndrSrvrFileAudioQualityChanged()
-        quality_msg.value = proto_quality
+        quality_msg.sampling_rate = sampling_rate
+        quality_msg.bit_depth = bit_depth
+        quality_msg.nb_channels = nb_channels
+        quality_msg.audio_quality = proto_quality
 
         qc_msg = payload_pb2.QConnectMessage()
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_FILE_AUDIO_QUALITY_CHANGED
@@ -335,7 +359,13 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
-    def encode_device_audio_quality_changed(self, quality: int) -> bytes:
+    def encode_device_audio_quality_changed(
+        self,
+        quality: int,
+        sampling_rate: int = 0,
+        bit_depth: int = 0,
+        nb_channels: int = 0,
+    ) -> bytes:
         """
         Encode device audio quality changed notification.
 
@@ -343,14 +373,22 @@ class ProtocolCodec:
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            sampling_rate: Max sample rate in Hz. 0 = derive from quality.
+            bit_depth: Max bit depth. 0 = derive from quality.
+            nb_channels: Number of channels. 0 = derive from quality.
 
         Returns:
             Encoded frame bytes
         """
-        proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
+        defaults = QUALITY_AUDIO_PROPERTIES.get(quality, (44100, 16, 2))
+        sampling_rate = sampling_rate or defaults[0]
+        bit_depth = bit_depth or defaults[1]
+        nb_channels = nb_channels or defaults[2]
 
         quality_msg = payload_pb2.RndrSrvrDeviceAudioQualityChanged()
-        quality_msg.value = proto_quality
+        quality_msg.sampling_rate = sampling_rate
+        quality_msg.bit_depth = bit_depth
+        quality_msg.nb_channels = nb_channels
 
         qc_msg = payload_pb2.QConnectMessage()
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_DEVICE_AUDIO_QUALITY_CHANGED
@@ -363,7 +401,7 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
-    def encode_max_audio_quality_changed(self, quality: int) -> bytes:
+    def encode_max_audio_quality_changed(self, quality: int, network_type: int = 1) -> bytes:
         """
         Encode max audio quality changed notification.
 
@@ -371,6 +409,7 @@ class ProtocolCodec:
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            network_type: Network type (1=WiFi)
 
         Returns:
             Encoded frame bytes
@@ -382,7 +421,8 @@ class ProtocolCodec:
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
 
         quality_msg = payload_pb2.RndrSrvrMaxAudioQualityChanged()
-        quality_msg.value = proto_quality
+        quality_msg.audio_quality = proto_quality
+        quality_msg.network_type = network_type
 
         qc_msg = payload_pb2.QConnectMessage()
         qc_msg.messageType = QConnectMessageType.RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED

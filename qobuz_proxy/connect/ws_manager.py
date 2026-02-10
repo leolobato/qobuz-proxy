@@ -214,12 +214,21 @@ class WsManager:
         data = self._codec.encode_volume_changed(volume)
         return await self.send_message(data)
 
-    async def send_file_audio_quality_changed(self, quality: int) -> bool:
+    async def send_file_audio_quality_changed(
+        self,
+        quality: int,
+        sampling_rate: int = 0,
+        bit_depth: int = 0,
+        nb_channels: int = 0,
+    ) -> bool:
         """
         Send file audio quality changed notification.
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            sampling_rate: Sample rate in Hz (e.g. 44100, 96000). 0 = derive from quality.
+            bit_depth: Bit depth (16 or 24). 0 = derive from quality.
+            nb_channels: Number of channels. 0 = derive from quality.
 
         Returns:
             True if sent successfully
@@ -227,16 +236,30 @@ class WsManager:
         from qobuz_proxy.connect.protocol import QUALITY_TO_PROTOCOL
 
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
-        logger.debug(f"Sending FILE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}")
-        data = self._codec.encode_file_audio_quality_changed(quality)
+        logger.debug(
+            f"Sending FILE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}, "
+            f"sr={sampling_rate}, bd={bit_depth}, ch={nb_channels}"
+        )
+        data = self._codec.encode_file_audio_quality_changed(
+            quality, sampling_rate=sampling_rate, bit_depth=bit_depth, nb_channels=nb_channels,
+        )
         return await self.send_message(data)
 
-    async def send_device_audio_quality_changed(self, quality: int) -> bool:
+    async def send_device_audio_quality_changed(
+        self,
+        quality: int,
+        sampling_rate: int = 0,
+        bit_depth: int = 0,
+        nb_channels: int = 0,
+    ) -> bool:
         """
         Send device audio quality changed notification.
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            sampling_rate: Max sample rate in Hz. 0 = derive from quality.
+            bit_depth: Max bit depth. 0 = derive from quality.
+            nb_channels: Number of channels. 0 = derive from quality.
 
         Returns:
             True if sent successfully
@@ -244,16 +267,22 @@ class WsManager:
         from qobuz_proxy.connect.protocol import QUALITY_TO_PROTOCOL
 
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
-        logger.debug(f"Sending DEVICE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}")
-        data = self._codec.encode_device_audio_quality_changed(quality)
+        logger.debug(
+            f"Sending DEVICE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}, "
+            f"sr={sampling_rate}, bd={bit_depth}, ch={nb_channels}"
+        )
+        data = self._codec.encode_device_audio_quality_changed(
+            quality, sampling_rate=sampling_rate, bit_depth=bit_depth, nb_channels=nb_channels,
+        )
         return await self.send_message(data)
 
-    async def send_max_audio_quality_changed(self, quality: int) -> bool:
+    async def send_max_audio_quality_changed(self, quality: int, network_type: int = 1) -> bool:
         """
         Send max audio quality changed notification.
 
         Args:
             quality: Quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            network_type: Network type (1=WiFi)
 
         Returns:
             True if sent successfully
@@ -262,7 +291,7 @@ class WsManager:
 
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
         logger.debug(f"Sending MAX_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}")
-        data = self._codec.encode_max_audio_quality_changed(quality)
+        data = self._codec.encode_max_audio_quality_changed(quality, network_type=network_type)
         return await self.send_message(data)
 
     # -------------------------------------------------------------------------

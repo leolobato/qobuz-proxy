@@ -308,15 +308,14 @@ class QobuzProxy:
             # Wire volume reporting
             self._player.set_volume_report_callback(self._ws_manager.send_volume_changed)
 
-            # Note: File quality reporting removed - reference implementation doesn't use it
-            # and it may cause "UNKNOWN QUALITY" display issues
+            # Wire file quality reporting (sends per-track quality info to app)
+            self._player.set_file_quality_report_callback(
+                self._ws_manager.send_file_audio_quality_changed
+            )
 
             # Start WebSocket connection
             await self._ws_manager.start()
             logger.info("WebSocket connected to Qobuz servers")
-
-            # Note: Initial quality is communicated via JOIN_SESSION capabilities
-            # Sending additional quality notifications may confuse the app
 
             # Start state reporter
             await self._state_reporter.start()

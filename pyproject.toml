@@ -24,10 +24,6 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio",
 ]
 
-[project.urls]
-Repository = "https://github.com/leolobato/qobuz-proxy"
-"Bug Tracker" = "https://github.com/leolobato/qobuz-proxy/issues"
-
 dependencies = [
     "websockets>=12.0",
     "protobuf>=4.25.0",
@@ -38,6 +34,10 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "pyjwt>=2.8.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/leolobato/qobuz-proxy"
+"Bug Tracker" = "https://github.com/leolobato/qobuz-proxy/issues"
 
 [project.optional-dependencies]
 dev = [
