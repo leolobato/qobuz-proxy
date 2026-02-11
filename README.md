@@ -1,6 +1,6 @@
 # QobuzProxy
 
-A bridge between Qobuz Connect and DLNA speakers.
+A bridge between Qobuz Connect and DLNA speakers. Also supports local audio playback.
 
 ## Why?
 
@@ -14,6 +14,7 @@ QobuzProxy solves this by acting as a virtual Qobuz Connect device on your netwo
 
 - Appears as a Qobuz Connect device in the official Qobuz app
 - Streams audio to DLNA renderers (Sonos, Denon HEOS, etc.)
+- Local audio playback via PortAudio (play directly through your machine's speakers/DAC)
 - Auto-detects device capabilities to select optimal audio quality
 - Runs on Raspberry Pi, Docker, or any Linux/macOS system
 
@@ -21,6 +22,9 @@ QobuzProxy solves this by acting as a virtual Qobuz Connect device on your netwo
 
 ```bash
 pip install qobuz-proxy
+
+# For local audio playback support (optional)
+pip install qobuz-proxy[local]
 ```
 
 ## Quick Start
@@ -89,6 +93,27 @@ Or with a config file:
 
 ```bash
 qobuz-proxy --config config.yaml
+```
+
+## Local Audio Playback
+
+QobuzProxy can also play audio directly through your machine's speakers or DAC, without needing a DLNA device. This requires the `local` extra dependencies:
+
+```bash
+pip install qobuz-proxy[local]
+```
+
+Then start with the `--backend-type local` flag:
+
+```bash
+qobuz-proxy --email your@email.com --password yourpassword --backend-type local
+```
+
+You can list available audio devices and select a specific one (e.g. a USB DAC):
+
+```bash
+qobuz-proxy --list-audio-devices
+qobuz-proxy --backend-type local --audio-device "USB DAC" --email ...
 ```
 
 ## Docker Deployment
@@ -164,6 +189,9 @@ source venv/bin/activate
 
 # Install with dev dependencies
 pip install -e ".[dev]"
+
+# Include local audio backend
+pip install -e ".[dev,local]"
 
 # Run
 qobuz-proxy --help

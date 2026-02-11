@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-QobuzProxy is a headless Qobuz music player that appears as a Qobuz Connect device, controllable from the official Qobuz app. It streams audio to DLNA renderers (Sonos, Denon HEOS, etc.).
+QobuzProxy is a headless Qobuz music player that appears as a Qobuz Connect device, controllable from the official Qobuz app. It supports two audio backends: DLNA renderers (Sonos, Denon HEOS, etc.) and local audio output via PortAudio.
 
 ## Commands
 
@@ -12,6 +12,7 @@ QobuzProxy is a headless Qobuz music player that appears as a Qobuz Connect devi
 # Setup
 python3 -m venv venv && source venv/bin/activate
 pip install -e ".[dev]"
+pip install -e ".[dev,local]"              # Include local audio backend (sounddevice, numpy, soundfile)
 
 # Run
 python3 -m qobuz_proxy
@@ -54,13 +55,17 @@ Proto files in `protos/`: `qconnect_common.proto`, `qconnect_envelope.proto`, `q
 1. **Auth** (`auth/`): Scrapes Qobuz web player for app credentials (`credentials.py`), signs API requests with MD5 (`api_client.py`), manages session/JWT tokens (`tokens.py`)
 2. **Connect** (`connect/`): Registers as mDNS device + HTTP discovery endpoints (`discovery.py`), manages WebSocket connection to Qobuz servers (`ws_manager.py`), encodes/decodes protobuf messages (`protocol.py`)
 3. **Playback** (`playback/`): State machine player (`player.py`), queue management (`queue.py`), track metadata from Qobuz API (`metadata.py`), command handlers (`command_handler.py`, `queue_handler.py`, `volume_handler.py`), periodic state reporting to Qobuz app (`state_reporter.py`)
-4. **Backend** (`backends/`): Abstract `AudioBackend` interface (`base.py`), DLNA implementation in `dlna/` subpackage with SOAP/UPnP client (`client.py`), device capability detection (`capabilities.py`), audio proxy server (`proxy_server.py`)
+4. **Backend** (`backends/`): Abstract `AudioBackend` interface (`base.py`), factory/registry pattern (`factory.py`). Two implementations:
+   - **DLNA** (`dlna/`): SOAP/UPnP client (`client.py`), device capability detection (`capabilities.py`), audio proxy server (`proxy_server.py`)
+   - **Local** (`local/`): Downloads FLAC, decodes to float32, plays via PortAudio (`backend.py`), ring buffer for streaming (`ring_buffer.py`), sounddevice output stream (`stream.py`). Optional deps: `sounddevice`, `numpy`, `soundfile`
 
 ### Key Data Flows
 
 **Qobuz app command → audio playback**: WebSocket message → `protocol.py` decodes → `ws_manager.py` dispatches to handler → `command_handler.py`/`queue_handler.py` → `player.py` state machine → `DLNABackend` → DLNA SOAP commands to device
 
-**Audio streaming**: Qobuz CDN → `proxy_server.py` (aiohttp server on port 7120) → DLNA device. The proxy is needed because DLNA devices fetch audio via HTTP GET, and Qobuz streaming URLs require specific headers.
+**Audio streaming (DLNA)**: Qobuz CDN → `proxy_server.py` (aiohttp server on port 7120) → DLNA device. The proxy is needed because DLNA devices fetch audio via HTTP GET, and Qobuz streaming URLs require specific headers.
+
+**Audio streaming (Local)**: Qobuz CDN → aiohttp download → soundfile FLAC decode → float32 samples → `RingBuffer` → `AudioOutputStream` (PortAudio callback) → speakers
 
 **State reporting**: `state_reporter.py` periodically builds state (playback state, position, queue) → `protocol.py` encodes to protobuf → WebSocket → Qobuz servers → Qobuz app UI
 
@@ -102,7 +107,7 @@ For Qobuz Connect protocol issues, the key files in [StreamCore32](https://githu
 - `stream/qobuz/src/QobuzPlayer.cpp` — Position tracking, state management
 - `stream/qobuz/src/QobuzStream.cpp` — WebSocket message handling
 
-### Position Tracking Data Flow
+### Position Tracking Data Flow (DLNA)
 
 ```
 DLNA Device (GetPositionInfo SOAP → RelTime string)
