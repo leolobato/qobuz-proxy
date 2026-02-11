@@ -107,6 +107,10 @@ class AudioOutputStream:
         """Get volume level (0-100)."""
         return int(self._volume * 100)
 
+    def set_ring_buffer(self, ring_buffer: RingBuffer) -> None:
+        """Replace the ring buffer (used when sample rate/channels change per-track)."""
+        self._ring_buffer = ring_buffer
+
     @property
     def sample_rate(self) -> int:
         """Current stream sample rate."""
