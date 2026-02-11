@@ -33,7 +33,10 @@ from .dlna import (
     StreamingURLProvider,
     MetadataServiceURLProvider,
 )
-from .local import LocalAudioBackend
+try:
+    from .local import LocalAudioBackend
+except ImportError:
+    pass  # sounddevice/numpy not installed
 
 __all__ = [
     # Types
