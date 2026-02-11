@@ -375,6 +375,50 @@ class QobuzPlayer:
 
         return success
 
+    async def reload_current_track(self) -> bool:
+        """
+        Reload the current track (e.g. after quality change).
+
+        Saves position, stops, clears cached URL, and restarts at saved position.
+
+        Returns:
+            True if track was reloaded successfully
+        """
+        if not self._current_track:
+            return False
+
+        if self._state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            # Not actively playing — just clear cached URL so next play uses new quality
+            self._current_track.streaming_url = None
+            return True
+
+        was_playing = self._state == PlaybackState.PLAYING
+
+        # Save current position
+        saved_position = self.current_position_ms
+        logger.info(
+            f"Reloading track {self._current_track.track_id} at position {saved_position}ms"
+        )
+
+        # Stop current playback
+        await self.backend.stop()
+
+        # Clear cached streaming URL so it's re-fetched at new quality
+        self._current_track.streaming_url = None
+
+        if was_playing:
+            # Restart playback from saved position
+            success = await self._start_playback()
+            if success and saved_position > 0:
+                await self.backend.seek(saved_position)
+            return success
+        else:
+            # Was paused — just reset state, will re-fetch URL on next play
+            self._state = PlaybackState.STOPPED
+            self._position_value_ms = saved_position
+            self._position_timestamp_ms = int(time.time() * 1000)
+            return True
+
     async def pause(self) -> bool:
         """
         Pause playback.
@@ -670,12 +714,14 @@ class QobuzPlayer:
                 artwork_url=meta.get("artwork_url", "") if meta else "",
             )
 
-            # Log now playing
-            self.metadata.log_now_playing_info(backend_meta)
+            # Get actual quality from cache (set during URL fetch)
+            actual_quality = self.metadata.get_track_actual_quality(track.track_id)
+
+            # Log now playing with actual quality
+            self.metadata.log_now_playing_info(backend_meta, actual_quality)
 
             # Report file quality if callback is set
             if self._file_quality_report_callback:
-                actual_quality = self.metadata.get_track_actual_quality(track.track_id)
                 logger.debug(f"Track {track.track_id} actual_quality={actual_quality}")
                 if actual_quality:
                     await self._file_quality_report_callback(actual_quality)

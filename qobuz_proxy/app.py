@@ -346,8 +346,9 @@ class QobuzProxy:
         if self._metadata_service:
             self._metadata_service.set_max_quality(new_quality)
 
-        # Note: Reference implementation does NOT send confirmation
-        # The server handles notifying controllers
+        # Reload current track at new quality
+        if self._player:
+            await self._player.reload_current_track()
 
     def _handle_protocol_error(self, msg_type: int, msg) -> None:
         """Handle protocol error messages from server."""

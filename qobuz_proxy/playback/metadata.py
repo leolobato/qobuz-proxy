@@ -271,17 +271,19 @@ class MetadataService:
             qualities = self._get_quality_fallback_order()
 
             for quality in qualities:
-                url = await self._api.get_track_url(metadata.track_id, quality)
-                if url:
-                    metadata.streaming_url = url
+                result = await self._api.get_track_url(metadata.track_id, quality)
+                if result:
+                    metadata.streaming_url = result["url"]
                     metadata.streaming_url_expires_at = int(time.time()) + self.URL_TTL_SECONDS
-                    metadata.actual_quality = quality
+                    # Use the actual format_id from API response (may differ from requested)
+                    actual_quality = result.get("format_id", quality)
+                    metadata.actual_quality = actual_quality
 
-                    if quality != self._max_quality:
+                    if actual_quality != self._max_quality:
                         logger.info(
-                            f"Track {metadata.track_id}: quality fallback "
-                            f"{AudioQuality.get_name(self._max_quality)} -> "
-                            f"{AudioQuality.get_name(quality)}"
+                            f"Track {metadata.track_id}: actual quality "
+                            f"{AudioQuality.get_name(actual_quality)} "
+                            f"(requested {AudioQuality.get_name(self._max_quality)})"
                         )
                     return
 
@@ -312,14 +314,19 @@ class MetadataService:
             f"[{metadata.album}] ({quality_name})"
         )
 
-    def log_now_playing_info(self, metadata: "BackendTrackMetadata") -> None:
+    def log_now_playing_info(
+        self, metadata: "BackendTrackMetadata", actual_quality: Optional[int] = None
+    ) -> None:
         """
         Log currently playing track at INFO level using backend metadata.
 
         Args:
             metadata: Backend track metadata to log
+            actual_quality: Actual quality ID from API (uses max_quality if not provided)
         """
-        quality_name = AudioQuality.get_name(self._max_quality)
+        quality_name = AudioQuality.get_name(
+            actual_quality if actual_quality is not None else self._max_quality
+        )
         logger.info(
             f"Now playing: {metadata.artist} - {metadata.title} "
             f"[{metadata.album}] ({quality_name})"

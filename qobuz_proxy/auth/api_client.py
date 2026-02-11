@@ -146,16 +146,19 @@ class QobuzAPIClient:
 
         return False
 
-    async def get_track_url(self, track_id: str, quality: int = 27) -> Optional[str]:
+    async def get_track_url(
+        self, track_id: str, quality: int = 27
+    ) -> Optional[dict[str, Any]]:
         """
-        Get streaming URL for a track.
+        Get streaming URL and format info for a track.
 
         Args:
             track_id: Track ID
             quality: Audio quality (5, 6, 7, or 27)
 
         Returns:
-            Streaming URL or None
+            Dict with 'url', 'format_id', 'bit_depth', 'sampling_rate',
+            'mime_type' keys, or None on failure
         """
         if not await self.start_session():
             logger.error("Failed to start session")
@@ -198,8 +201,16 @@ class QobuzAPIClient:
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        url_result: Optional[str] = data.get("url")
-                        return url_result
+                        url_result = data.get("url")
+                        if url_result:
+                            return {
+                                "url": url_result,
+                                "format_id": data.get("format_id", quality),
+                                "bit_depth": data.get("bit_depth", 0),
+                                "sampling_rate": data.get("sampling_rate", 0),
+                                "mime_type": data.get("mime_type", ""),
+                            }
+                        return None
                     else:
                         logger.error(f"Failed to get track URL: {resp.status}")
 

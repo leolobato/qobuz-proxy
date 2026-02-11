@@ -311,7 +311,13 @@ class TestMetadataService:
             "duration_ms": 180000,
             "album_art_url": "",
         }
-        mock_api.get_track_url.return_value = "https://streaming.example.com/track.flac"
+        mock_api.get_track_url.return_value = {
+            "url": "https://streaming.example.com/track.flac",
+            "format_id": 27,
+            "bit_depth": 24,
+            "sampling_rate": 192000,
+            "mime_type": "audio/flac",
+        }
 
         result = await metadata_service.get_metadata("12345", fetch_url=True)
 
@@ -331,7 +337,13 @@ class TestMetadataService:
             "duration_ms": 180000,
             "album_art_url": "",
         }
-        mock_api.get_track_url.return_value = "https://streaming.example.com/track.flac"
+        mock_api.get_track_url.return_value = {
+            "url": "https://streaming.example.com/track.flac",
+            "format_id": 27,
+            "bit_depth": 24,
+            "sampling_rate": 192000,
+            "mime_type": "audio/flac",
+        }
 
         result = await metadata_service.get_streaming_url("12345")
 
@@ -349,11 +361,17 @@ class TestMetadataService:
             "duration_ms": 180000,
             "album_art_url": "",
         }
-        # Return None for quality 27, URL for quality 6
+        # Return None for quality 27 and 7, dict for quality 6
         mock_api.get_track_url.side_effect = [
             None,  # 27 fails
             None,  # 7 fails
-            "https://streaming.example.com/track.flac",  # 6 succeeds
+            {  # 6 succeeds
+                "url": "https://streaming.example.com/track.flac",
+                "format_id": 6,
+                "bit_depth": 16,
+                "sampling_rate": 44100,
+                "mime_type": "audio/flac",
+            },
         ]
 
         result = await metadata_service.get_metadata("12345", fetch_url=True)
@@ -375,8 +393,20 @@ class TestMetadataService:
             "album_art_url": "",
         }
         mock_api.get_track_url.side_effect = [
-            "https://streaming.example.com/first.flac",
-            "https://streaming.example.com/second.flac",
+            {
+                "url": "https://streaming.example.com/first.flac",
+                "format_id": 27,
+                "bit_depth": 24,
+                "sampling_rate": 192000,
+                "mime_type": "audio/flac",
+            },
+            {
+                "url": "https://streaming.example.com/second.flac",
+                "format_id": 27,
+                "bit_depth": 24,
+                "sampling_rate": 192000,
+                "mime_type": "audio/flac",
+            },
         ]
 
         # Get initial URL
