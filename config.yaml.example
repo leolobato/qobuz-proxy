@@ -11,15 +11,18 @@ device:
   uuid: null                    # Auto-generated if not specified
 
 backend:
-  type: "dlna"                  # Phase 1: dlna only
+  type: "dlna"                  # dlna or local
   dlna:
     ip: "192.168.1.50"          # Required: DLNA device IP
     port: 1400                  # DLNA device port
     fixed_volume: false         # Ignore volume commands
+    proxy_port: 7120            # Audio proxy port for DLNA streaming
+  # local:
+  #   device: "default"         # Audio device name or "default"
+  #   buffer_size: 2048         # Audio buffer size in frames
 
 server:
   http_port: 8689               # mDNS discovery HTTP server
-  proxy_port: 7120              # DLNA audio proxy server
   bind_address: "0.0.0.0"       # Network interface to bind
 
 logging:

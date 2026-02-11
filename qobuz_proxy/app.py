@@ -176,12 +176,12 @@ class QobuzProxy:
             self._proxy_server = AudioProxyServer(
                 url_provider=url_provider,
                 host=self._config.server.bind_address,
-                port=self._config.server.proxy_port,
+                port=self._config.backend.dlna.proxy_port,
             )
             await self._proxy_server.start()
             logger.info(
                 f"Audio proxy listening on "
-                f"{self._config.server.bind_address}:{self._config.server.proxy_port}"
+                f"{self._config.server.bind_address}:{self._config.backend.dlna.proxy_port}"
             )
             backend.set_proxy_server(self._proxy_server)
 

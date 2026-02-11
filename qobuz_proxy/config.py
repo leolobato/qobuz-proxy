@@ -41,12 +41,14 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_DLNA_IP": ("backend", "dlna", "ip"),
     "QOBUZPROXY_DLNA_PORT": ("backend", "dlna", "port"),
     "QOBUZPROXY_DLNA_FIXED_VOLUME": ("backend", "dlna", "fixed_volume"),
+    # Backend type
+    "QOBUZPROXY_BACKEND": ("backend", "type"),
     # Local audio
     "QOBUZPROXY_AUDIO_DEVICE": ("backend", "local", "device"),
     "QOBUZPROXY_AUDIO_BUFFER_SIZE": ("backend", "local", "buffer_size"),
     # Server
     "QOBUZPROXY_HTTP_PORT": ("server", "http_port"),
-    "QOBUZPROXY_PROXY_PORT": ("server", "proxy_port"),
+    "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
     # Logging
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
 }
@@ -86,6 +88,7 @@ class DLNAConfig:
     ip: str = ""
     port: int = 1400
     fixed_volume: bool = False
+    proxy_port: int = 7120
 
 
 @dataclass
@@ -110,7 +113,6 @@ class ServerConfig:
     """Server configuration."""
 
     http_port: int = 8689
-    proxy_port: int = 7120
     bind_address: str = "0.0.0.0"
 
 
@@ -173,6 +175,8 @@ def validate_config(config: Config) -> None:
             errors.append("DLNA IP address is required when backend type is 'dlna'")
         if not validate_port(config.backend.dlna.port):
             errors.append(f"Invalid DLNA port: {config.backend.dlna.port}")
+        if not validate_port(config.backend.dlna.proxy_port):
+            errors.append(f"Invalid proxy port: {config.backend.dlna.proxy_port}")
     elif config.backend.type == "local":
         if not (64 <= config.backend.local.buffer_size <= 16384):
             errors.append(
@@ -185,8 +189,6 @@ def validate_config(config: Config) -> None:
     # Server ports
     if not validate_port(config.server.http_port):
         errors.append(f"Invalid HTTP port: {config.server.http_port}")
-    if not validate_port(config.server.proxy_port):
-        errors.append(f"Invalid proxy port: {config.server.proxy_port}")
 
     # Logging
     if config.logging.level.lower() not in VALID_LOG_LEVELS:
@@ -331,6 +333,9 @@ def dict_to_config(d: dict) -> Config:
             config.backend.dlna.fixed_volume = dlna.get(
                 "fixed_volume", config.backend.dlna.fixed_volume
             )
+            config.backend.dlna.proxy_port = dlna.get(
+                "proxy_port", config.backend.dlna.proxy_port
+            )
         if "local" in b:
             local = b["local"]
             config.backend.local.device = local.get("device", config.backend.local.device)
@@ -342,7 +347,6 @@ def dict_to_config(d: dict) -> Config:
     if "server" in d:
         s = d["server"]
         config.server.http_port = s.get("http_port", config.server.http_port)
-        config.server.proxy_port = s.get("proxy_port", config.server.proxy_port)
         config.server.bind_address = s.get("bind_address", config.server.bind_address)
 
     # Logging

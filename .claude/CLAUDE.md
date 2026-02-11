@@ -72,7 +72,7 @@ When `max_quality: auto`: DLNA `GetProtocolInfo` → `capabilities.py` parses Si
 
 1. CLI arguments (highest) → 2. Environment variables → 3. YAML config file → 4. Code defaults
 
-Key env vars: `QOBUZ_EMAIL`, `QOBUZ_PASSWORD`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_LOG_LEVEL`
+Key env vars: `QOBUZ_EMAIL`, `QOBUZ_PASSWORD`, `QOBUZ_MAX_QUALITY`, `QOBUZPROXY_BACKEND`, `QOBUZPROXY_DEVICE_NAME`, `QOBUZPROXY_DLNA_IP`, `QOBUZPROXY_AUDIO_DEVICE`, `QOBUZPROXY_LOG_LEVEL`
 
 ## Code Style
 

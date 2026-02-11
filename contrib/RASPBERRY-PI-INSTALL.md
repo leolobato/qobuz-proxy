@@ -116,10 +116,10 @@ backend:
     ip: "192.168.1.50"     # Your DLNA speaker's IP
     port: 1400             # Default for Sonos
     fixed_volume: false
+    proxy_port: 7120
 
 server:
   http_port: 8689
-  proxy_port: 7120
   bind_address: "0.0.0.0"
 
 logging:

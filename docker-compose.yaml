@@ -30,21 +30,17 @@ services:
       # Optional: Audio quality (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
       - QOBUZ_MAX_QUALITY=${QOBUZ_MAX_QUALITY:-27}
 
-      # Required: DLNA renderer IP address
-      - QOBUZPROXY_DLNA_IP=${QOBUZPROXY_DLNA_IP}
-
-      # Optional: DLNA renderer port (default: 1400 for Sonos)
-      - QOBUZPROXY_DLNA_PORT=${QOBUZPROXY_DLNA_PORT:-1400}
-
-      # Optional: Fixed volume mode - disable volume control (default: false)
-      - QOBUZPROXY_DLNA_FIXED_VOLUME=${QOBUZPROXY_DLNA_FIXED_VOLUME:-false}
-
       # Optional: Device name shown in Qobuz app
       - QOBUZPROXY_DEVICE_NAME=${QOBUZPROXY_DEVICE_NAME:-QobuzProxy}
 
-      # Optional: Server ports
-      - QOBUZPROXY_HTTP_PORT=${QOBUZPROXY_HTTP_PORT:-8689}
+      # DLNA backend settings
+      - QOBUZPROXY_DLNA_IP=${QOBUZPROXY_DLNA_IP}
+      - QOBUZPROXY_DLNA_PORT=${QOBUZPROXY_DLNA_PORT:-1400}
+      - QOBUZPROXY_DLNA_FIXED_VOLUME=${QOBUZPROXY_DLNA_FIXED_VOLUME:-false}
       - QOBUZPROXY_PROXY_PORT=${QOBUZPROXY_PROXY_PORT:-7120}
+
+      # Optional: Server port
+      - QOBUZPROXY_HTTP_PORT=${QOBUZPROXY_HTTP_PORT:-8689}
 
       # Optional: Log level (debug, info, warning, error)
       - QOBUZPROXY_LOG_LEVEL=${QOBUZPROXY_LOG_LEVEL:-info}

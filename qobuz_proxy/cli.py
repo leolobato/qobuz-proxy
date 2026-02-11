@@ -242,7 +242,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "audio_buffer_size": ("backend", "local", "buffer_size"),
         "backend_type": ("backend", "type"),
         "http_port": ("server", "http_port"),
-        "proxy_port": ("server", "proxy_port"),
+        "proxy_port": ("backend", "dlna", "proxy_port"),
         "bind": ("server", "bind_address"),
         "log_level": ("logging", "level"),
     }
@@ -271,7 +271,9 @@ def log_config(config: Config) -> None:
         logger.info(f"Audio buffer size: {config.backend.local.buffer_size} frames")
     logger.info(f"HTTP server: {config.server.bind_address}:{config.server.http_port}")
     if config.backend.type == "dlna":
-        logger.info(f"Proxy server: {config.server.bind_address}:{config.server.proxy_port}")
+        logger.info(
+            f"Proxy server: {config.server.bind_address}:{config.backend.dlna.proxy_port}"
+        )
     logger.info(f"Max quality: {config.qobuz.max_quality}")
 
 
