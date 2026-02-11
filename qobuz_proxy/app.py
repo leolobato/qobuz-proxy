@@ -132,13 +132,9 @@ class QobuzProxy:
 
         # 3. Create audio backend
         logger.debug("Creating audio backend...")
-        backend = await BackendFactory.create_dlna(
-            ip=self._config.backend.dlna.ip,
-            port=self._config.backend.dlna.port,
-            fixed_volume=self._config.backend.dlna.fixed_volume,
-        )
+        backend = await BackendFactory.create_from_config(self._config)
         self._backend = backend
-        logger.info(f"Connected to DLNA device: {backend.name}")
+        logger.info(f"Connected to backend: {backend.name}")
 
         # 4. Resolve effective quality (handle auto-detection)
         self._effective_quality = self._config.qobuz.max_quality
@@ -162,8 +158,9 @@ class QobuzProxy:
                         "Capability discovery unavailable, using fallback quality: CD (FLAC 16/44)"
                     )
             else:
-                self._effective_quality = AUTO_FALLBACK_QUALITY
-                logger.info(f"Non-DLNA backend, using fallback quality: {self._effective_quality}")
+                # Local backend: default to Hi-Res 192k
+                self._effective_quality = 27
+                logger.info("Local backend, using max quality: Hi-Res (24/192)")
 
         # 5. Create metadata service (needed by proxy server URL provider)
         logger.debug("Creating metadata service...")
@@ -172,22 +169,20 @@ class QobuzProxy:
             max_quality=self._effective_quality,
         )
 
-        # 6. Create and start audio proxy server
-        logger.debug("Starting audio proxy server...")
-        url_provider = MetadataServiceURLProvider(self._metadata_service)
-        self._proxy_server = AudioProxyServer(
-            url_provider=url_provider,
-            host=self._config.server.bind_address,
-            port=self._config.server.proxy_port,
-        )
-        await self._proxy_server.start()
-        logger.info(
-            f"Audio proxy listening on "
-            f"{self._config.server.bind_address}:{self._config.server.proxy_port}"
-        )
-
-        # Wire backend to proxy (DLNA-specific)
+        # 6. Create and start audio proxy server (DLNA only)
         if isinstance(backend, DLNABackend):
+            logger.debug("Starting audio proxy server...")
+            url_provider = MetadataServiceURLProvider(self._metadata_service)
+            self._proxy_server = AudioProxyServer(
+                url_provider=url_provider,
+                host=self._config.server.bind_address,
+                port=self._config.server.proxy_port,
+            )
+            await self._proxy_server.start()
+            logger.info(
+                f"Audio proxy listening on "
+                f"{self._config.server.bind_address}:{self._config.server.proxy_port}"
+            )
             backend.set_proxy_server(self._proxy_server)
 
         # 7. Create queue and player
@@ -198,7 +193,9 @@ class QobuzProxy:
             metadata_service=self._metadata_service,
             backend=backend,
         )
-        self._player.set_fixed_volume_mode(self._config.backend.dlna.fixed_volume)
+        # Only set fixed volume for DLNA backends
+        if isinstance(backend, DLNABackend):
+            self._player.set_fixed_volume_mode(self._config.backend.dlna.fixed_volume)
 
         # 8. Create and start discovery service
         logger.debug("Starting discovery service...")

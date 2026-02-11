@@ -17,6 +17,7 @@ from qobuz_proxy.backends.base import AudioBackend
 from qobuz_proxy.backends.types import (
     BackendInfo,
     BackendTrackMetadata,
+    BufferStatus,
     PlaybackState,
 )
 from .device import AudioDeviceInfo, resolve_device
@@ -57,6 +58,9 @@ class LocalAudioBackend(AudioBackend):
 
         # Seek support
         self._seek_target: Optional[int] = None
+
+        # Buffer status tracking
+        self._last_buffer_status: BufferStatus = BufferStatus.OK
 
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
         """Download FLAC, decode, and start playback."""
@@ -147,6 +151,9 @@ class LocalAudioBackend(AudioBackend):
                 chunk = self._audio_data[self._frames_fed:end]
                 written = self._ring_buffer.write(chunk)
                 self._frames_fed += written
+
+                # Check buffer health
+                self._check_buffer_status()
 
                 # Notify position update (with buffer latency correction)
                 buffer_latency_frames = self._ring_buffer.available()
@@ -259,6 +266,45 @@ class LocalAudioBackend(AudioBackend):
 
     async def get_state(self) -> PlaybackState:
         return self._state
+
+    async def get_buffer_status(self) -> BufferStatus:
+        """Get buffer health based on ring buffer fill level."""
+        if not self._ring_buffer:
+            return BufferStatus.OK
+
+        level = self._ring_buffer.fill_level()
+
+        if level == 0.0:
+            return BufferStatus.EMPTY
+        elif level < 0.10:
+            return BufferStatus.LOW
+        elif level >= 1.0:
+            return BufferStatus.FULL
+        else:
+            return BufferStatus.OK
+
+    def _check_buffer_status(self) -> None:
+        """Check and notify buffer status changes."""
+        if not self._ring_buffer:
+            return
+
+        level = self._ring_buffer.fill_level()
+
+        if level == 0.0:
+            status = BufferStatus.EMPTY
+        elif level < 0.10:
+            status = BufferStatus.LOW
+        elif level >= 1.0:
+            status = BufferStatus.FULL
+        else:
+            status = BufferStatus.OK
+
+        if status != self._last_buffer_status:
+            self._last_buffer_status = status
+            self._notify_buffer_status(status)
+
+            if status == BufferStatus.EMPTY:
+                logger.warning("Audio buffer underrun — audio may glitch")
 
     async def connect(self) -> bool:
         """Initialize connection — resolve device and create audio stream."""
