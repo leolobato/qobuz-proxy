@@ -129,8 +129,12 @@ class LocalAudioBackend(AudioBackend):
                     self._seek_target = None
                     self._ring_buffer.clear()
                     self._frames_fed = min(target, self._total_frames)
+                    logger.debug(f"Seek applied: jumping to frame {self._frames_fed}")
                     if self._frames_fed >= self._total_frames:
                         break
+                    # Notify position immediately after seek
+                    position_ms = int(self._frames_fed / self._sample_rate * 1000)
+                    self._notify_position_update(position_ms)
                     continue
 
                 # Pace: wait if buffer is full enough
@@ -144,8 +148,10 @@ class LocalAudioBackend(AudioBackend):
                 written = self._ring_buffer.write(chunk)
                 self._frames_fed += written
 
-                # Notify position update
-                position_ms = int(self._frames_fed / self._sample_rate * 1000)
+                # Notify position update (with buffer latency correction)
+                buffer_latency_frames = self._ring_buffer.available()
+                actual_frames_played = self._frames_fed - buffer_latency_frames
+                position_ms = int(max(0, actual_frames_played) / self._sample_rate * 1000)
                 self._notify_position_update(position_ms)
 
                 await asyncio.sleep(0)  # Yield to event loop
@@ -198,14 +204,50 @@ class LocalAudioBackend(AudioBackend):
         self._notify_state_change(PlaybackState.STOPPED)
 
     async def seek(self, position_ms: int) -> None:
-        if self._sample_rate > 0:
-            target_frame = int(position_ms / 1000 * self._sample_rate)
-            self._seek_target = target_frame
+        """Seek to position in current track."""
+        if self._sample_rate == 0 or self._audio_data is None:
+            return
+
+        target_frame = int(position_ms / 1000 * self._sample_rate)
+
+        # Edge case: seek beyond duration → trigger track end
+        if target_frame >= self._total_frames:
+            logger.debug(f"Seek beyond duration ({position_ms}ms), ending track")
+            await self._cancel_feeding()
+            if self._ring_buffer:
+                self._ring_buffer.clear()
+            self._frames_fed = self._total_frames
+            self._notify_state_change(PlaybackState.STOPPED)
+            self._notify_track_ended()
+            return
+
+        # Edge case: seek to negative → clamp to 0
+        target_frame = max(0, target_frame)
+
+        logger.debug(f"Seek to {position_ms}ms (frame {target_frame})")
+        self._seek_target = target_frame
+
+        # If no feeding loop is running (e.g., paused after track end),
+        # update position directly
+        if self._feeding_task is None or self._feeding_task.done():
+            if self._ring_buffer:
+                self._ring_buffer.clear()
+            self._frames_fed = target_frame
 
     async def get_position(self) -> int:
+        """Get current playback position accounting for buffer latency."""
         if self._sample_rate == 0:
             return 0
-        return int(self._frames_fed / self._sample_rate * 1000)
+
+        raw_position_ms = self._frames_fed / self._sample_rate * 1000
+
+        # Subtract buffer latency (frames in buffer haven't been played yet)
+        buffer_latency_ms = 0.0
+        if self._ring_buffer:
+            buffer_latency_ms = self._ring_buffer.available() / self._sample_rate * 1000
+
+        actual_position_ms = max(0.0, raw_position_ms - buffer_latency_ms)
+        return int(actual_position_ms)
 
     async def set_volume(self, level: int) -> None:
         self._volume = max(0, min(100, level))
