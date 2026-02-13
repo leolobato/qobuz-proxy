@@ -321,6 +321,14 @@ class QobuzProxy:
             await self._player.start()
             logger.info("Player started")
 
+            # Send initial volume from backend so app shows accurate value
+            try:
+                initial_volume = await self._player.get_volume()
+                await self._ws_manager.send_volume_changed(initial_volume)
+                logger.info(f"Sent initial volume to app: {initial_volume}%")
+            except Exception as e:
+                logger.warning(f"Failed to send initial volume: {e}")
+
             # Signal that connection is complete
             self._ws_connected_event.set()
 
