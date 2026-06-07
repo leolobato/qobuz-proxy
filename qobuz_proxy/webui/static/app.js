@@ -32,7 +32,17 @@
         // callback returns to this exact UI, prefix and all. Strip the trailing
         // slash so the server can append "/auth/callback".
         var base = document.baseURI.replace(/\/$/, "");
-        window.location.href = "auth/login?origin=" + encodeURIComponent(base);
+        var url = "auth/login?origin=" + encodeURIComponent(base);
+        // Behind Home Assistant ingress the UI runs in an iframe, but Qobuz (and
+        // the third-party login providers on its sign-in page, e.g. Google) send
+        // X-Frame-Options and refuse to be framed. Open the OAuth flow in a new
+        // top-level tab; the /api/status poll flips this panel to "connected"
+        // once login completes. On direct access (not framed) navigate in place.
+        if (window.self !== window.top) {
+            window.open(url, "_blank");
+        } else {
+            window.location.href = url;
+        }
     }
 
     function logout() {

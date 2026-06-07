@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qobuz-proxy"
-version = "1.3.7"
+version = "1.3.8"
 description = "Headless Qobuz music player service with DLNA support"
 readme = "README.md"
 requires-python = ">=3.10"
