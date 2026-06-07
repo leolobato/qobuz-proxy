@@ -28,12 +28,15 @@
     }
 
     function startLogin() {
-        var origin = window.location.origin;
-        window.location.href = "/auth/login?origin=" + encodeURIComponent(origin);
+        // Use the document base (honors HA ingress <base href>) so the OAuth
+        // callback returns to this exact UI, prefix and all. Strip the trailing
+        // slash so the server can append "/auth/callback".
+        var base = document.baseURI.replace(/\/$/, "");
+        window.location.href = "auth/login?origin=" + encodeURIComponent(base);
     }
 
     function logout() {
-        fetch("/api/auth/logout", { method: "POST" })
+        fetch("api/auth/logout", { method: "POST" })
             .then(function () {
                 showAuthState("disconnected");
                 lastSpeakersJson = null;
@@ -384,7 +387,7 @@
         }
         if (rescanBtn) rescanBtn.disabled = true;
 
-        fetch("/api/discover/dlna", {
+        fetch("api/discover/dlna", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ timeout: 5 }),
@@ -427,7 +430,7 @@
     }
 
     function startAudioDeviceDiscovery() {
-        fetch("/api/discover/audio-devices")
+        fetch("api/discover/audio-devices")
             .then(function (r) {
                 if (r.status === 404) throw new Error("not_supported");
                 return r.json();
@@ -602,7 +605,7 @@
             submitBtn.textContent = "Adding…";
         }
 
-        fetch("/api/speakers", {
+        fetch("api/speakers", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -671,7 +674,7 @@
             submitBtn.textContent = "Saving…";
         }
 
-        fetch("/api/speakers/" + encodeURIComponent(id), {
+        fetch("api/speakers/" + encodeURIComponent(id), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -703,7 +706,7 @@
     function removeSpeaker(id) {
         if (!confirm("Remove this speaker?")) return;
 
-        fetch("/api/speakers/" + encodeURIComponent(id), { method: "DELETE" })
+        fetch("api/speakers/" + encodeURIComponent(id), { method: "DELETE" })
             .then(function (r) {
                 if (!r.ok) {
                     return r.json().then(function (d) { throw new Error(d.error || "Failed to remove speaker"); });
@@ -737,7 +740,7 @@
     // -------------------------------------------------------------------------
 
     function fetchStatus() {
-        fetch("/api/status")
+        fetch("api/status")
             .then(function (response) {
                 if (!response.ok) throw new Error("HTTP " + response.status);
                 return response.json();

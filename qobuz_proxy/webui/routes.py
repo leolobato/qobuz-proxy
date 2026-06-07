@@ -29,10 +29,23 @@ def _format_uptime(seconds: float) -> str:
     return f"{minutes}m"
 
 
+def _ingress_base(request: web.Request) -> str:
+    """Return the base path the UI is served under, with a trailing slash.
+
+    Home Assistant ingress forwards requests with an ``X-Ingress-Path`` header
+    holding the path prefix (e.g. ``/api/hassio_ingress/<token>``). Using it as
+    the document ``<base href>`` lets all relative links/fetches resolve both
+    behind ingress and on direct ``http://host:8689/`` access.
+    """
+    ingress_path = request.headers.get("X-Ingress-Path", "")
+    return f"{ingress_path}/" if ingress_path else "/"
+
+
 async def _handle_index(request: web.Request) -> web.Response:
     """Serve index.html with version-based cache busting."""
     html = (_STATIC_DIR / "index.html").read_text()
     html = html.replace("{{version}}", request.app.get("version", "0"))
+    html = html.replace("{{base}}", _ingress_base(request))
     return web.Response(text=html, content_type="text/html")
 
 
@@ -62,16 +75,18 @@ async def _handle_auth_login(request: web.Request) -> web.Response:
 
 async def _handle_auth_callback(request: web.Request) -> web.Response:
     """Handle the OAuth redirect from Qobuz, exchange code, and authenticate."""
+    base = _ingress_base(request)
+
     try:
         code = extract_code(str(request.url))
     except ValueError:
-        raise web.HTTPFound("/?error=missing_code")
+        raise web.HTTPFound(f"{base}?error=missing_code")
 
     try:
         creds = await exchange_code(code)
     except Exception:
         logger.exception("OAuth code exchange failed")
-        raise web.HTTPFound("/?error=exchange_failed")
+        raise web.HTTPFound(f"{base}?error=exchange_failed")
 
     profile = {
         "email": creds.get("email", ""),
@@ -85,9 +100,9 @@ async def _handle_auth_callback(request: web.Request) -> web.Response:
     )
 
     if not success:
-        raise web.HTTPFound("/?error=auth_failed")
+        raise web.HTTPFound(f"{base}?error=auth_failed")
 
-    raise web.HTTPFound("/")
+    raise web.HTTPFound(base)
 
 
 async def _handle_logout(request: web.Request) -> web.Response:

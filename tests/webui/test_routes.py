@@ -157,6 +157,59 @@ async def test_auth_callback_auth_failure(client: TestClient) -> None:
     assert "error=auth_failed" in resp.headers["Location"]
 
 
+async def test_index_uses_root_base_without_ingress(client: TestClient) -> None:
+    """Served index.html should carry a root <base href> when not behind ingress."""
+    resp = await client.get("/")
+    assert resp.status == 200
+    body = await resp.text()
+    assert '<base href="/">' in body
+    # Assets are referenced relative to that base.
+    assert 'href="static/style.css' in body
+    assert 'src="static/app.js' in body
+
+
+async def test_index_injects_ingress_base(client: TestClient) -> None:
+    """The X-Ingress-Path header should become the document <base href>."""
+    resp = await client.get("/", headers={"X-Ingress-Path": "/api/hassio_ingress/abc123"})
+    assert resp.status == 200
+    body = await resp.text()
+    assert '<base href="/api/hassio_ingress/abc123/">' in body
+
+
+async def test_auth_callback_redirects_under_ingress(client: TestClient) -> None:
+    """On success the callback should redirect back to the ingress base, not root."""
+    mock_creds = {
+        "user_id": "12345",
+        "user_auth_token": "secret-token",
+        "display_name": "Test User",
+        "email": "test@example.com",
+        "avatar": "",
+    }
+    with patch(
+        "qobuz_proxy.webui.routes.exchange_code",
+        new_callable=AsyncMock,
+        return_value=mock_creds,
+    ):
+        resp = await client.get(
+            "/auth/callback?code_autorisation=test-code",
+            headers={"X-Ingress-Path": "/api/hassio_ingress/abc123"},
+            allow_redirects=False,
+        )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/api/hassio_ingress/abc123/"
+
+
+async def test_auth_callback_error_redirects_under_ingress(client: TestClient) -> None:
+    """Error redirects should also stay within the ingress base path."""
+    resp = await client.get(
+        "/auth/callback",
+        headers={"X-Ingress-Path": "/api/hassio_ingress/abc123"},
+        allow_redirects=False,
+    )
+    assert resp.status == 302
+    assert resp.headers["Location"] == "/api/hassio_ingress/abc123/?error=missing_code"
+
+
 async def test_auth_logout(client: TestClient) -> None:
     resp = await client.post("/api/auth/logout")
     assert resp.status == 200
