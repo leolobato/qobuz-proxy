@@ -13,7 +13,7 @@ version: "3.8"
 
 services:
   qobuz-proxy:
-    image: ghcr.io/leolobato/qobuz-proxy:latest
+    image: ghcr.io/felixmusil/qobuz-proxy:latest
     # build: .  # Uncomment to build from local Dockerfile instead
 
     container_name: qobuz-proxy
