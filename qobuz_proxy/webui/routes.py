@@ -46,6 +46,7 @@ async def _handle_index(request: web.Request) -> web.Response:
     html = (_STATIC_DIR / "index.html").read_text()
     html = html.replace("{{version}}", request.app.get("version", "0"))
     html = html.replace("{{base}}", _ingress_base(request))
+    html = html.replace("{{http_port}}", str(request.app.get("http_port", 8689)))
     return web.Response(text=html, content_type="text/html")
 
 

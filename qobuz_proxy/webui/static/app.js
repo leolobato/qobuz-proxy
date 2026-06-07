@@ -32,7 +32,22 @@
         // callback returns to this exact UI, prefix and all. Strip the trailing
         // slash so the server can append "/auth/callback".
         var base = document.baseURI.replace(/\/$/, "");
-        window.location.href = "auth/login?origin=" + encodeURIComponent(base);
+        var url = "auth/login?origin=" + encodeURIComponent(base);
+        // Behind Home Assistant ingress the UI runs in an iframe. Qobuz (and the
+        // third-party providers on its sign-in page, e.g. Google) refuse to be
+        // framed, AND the OAuth callback can't return through ingress (HA's
+        // ingress_session cookie isn't sent on the cross-site return from Qobuz,
+        // so the callback 401s). So run login against the add-on's DIRECT port
+        // in a new top-level tab — host networking exposes it and /data (the
+        // saved token) is shared with this panel, which flips to "connected" via
+        // the /api/status poll once login completes.
+        if (window.self !== window.top) {
+            var port = window.QOBUZ_DIRECT_PORT || "8689";
+            var direct = window.location.protocol + "//" + window.location.hostname + ":" + port;
+            window.open(direct + "/auth/login?origin=" + encodeURIComponent(direct), "_blank");
+        } else {
+            window.location.href = url;
+        }
     }
 
     function logout() {

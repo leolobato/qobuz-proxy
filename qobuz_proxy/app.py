@@ -383,6 +383,7 @@ class QobuzProxy:
         self._web_app["get_speakers"] = lambda: [s.get_status() for s in self._speakers]
         self._web_app["version"] = __version__
         self._web_app["commit"] = __commit__
+        self._web_app["http_port"] = self._config.server.http_port
         self._web_app["on_auth_token"] = self._on_auth_token
         self._web_app["on_logout"] = self._on_logout
         self._web_app["on_add_speaker"] = self._on_add_speaker
