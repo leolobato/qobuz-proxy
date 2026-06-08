@@ -32,6 +32,7 @@ dependencies = [
     "async-upnp-client>=0.38.0",
     "pyyaml>=6.0",
     "pyjwt>=2.8.0",
+    "numpy>=1.24.0",
 ]
 
 [project.urls]

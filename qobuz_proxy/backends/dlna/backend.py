@@ -253,16 +253,49 @@ class DLNABackend(AudioBackend):
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
     async def _play_via_transport(self, url: str, didl: str) -> bool:
-        """Start playback using SetAVTransportURI (standard DLNA)."""
+        """Start playback using SetAVTransportURI (standard DLNA).
+
+        If the first attempt fails (e.g. the renderer is wedged after a rapid
+        track switch), recover the connection and reset the device transport,
+        then retry once before reporting an error. This lets a stuck renderer
+        recover without restarting the addon or power-cycling the device.
+        """
         assert self._client
-        if await self._client.set_av_transport_uri(url, didl):
-            if await self._client.play():
-                return True
-            else:
-                self._notify_playback_error("Failed to start playback")
+        stage = await self._try_transport_sequence(url, didl)
+        if stage is None:
+            return True
+
+        logger.warning(f"Playback {stage} failed; attempting transport recovery")
+        # Recover the HTTP session and clear the device's stuck transport.
+        await self._client.reset_session()
+        try:
+            await self._client.stop()
+        except Exception:
+            pass
+
+        stage = await self._try_transport_sequence(url, didl)
+        if stage is None:
+            logger.info("Transport recovery succeeded")
+            return True
+
+        if stage == "play":
+            self._notify_playback_error("Failed to start playback")
         else:
             self._notify_playback_error("Failed to set transport URI")
         return False
+
+    async def _try_transport_sequence(self, url: str, didl: str) -> Optional[str]:
+        """Run SetAVTransportURI + Play once.
+
+        Returns None on success, or the name of the failed stage
+        ("set_uri" or "play").
+        """
+        assert self._client
+        if not await self._client.set_av_transport_uri(url, didl):
+            return "set_uri"
+        if not await self._client.play():
+            return "play"
+        return None
 
     async def _play_via_queue(self, url: str, didl: str) -> bool:
         """Start playback using Sonos queue (shows metadata in Sonos app)."""

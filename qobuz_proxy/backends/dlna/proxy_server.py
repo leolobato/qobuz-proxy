@@ -9,6 +9,7 @@ import asyncio
 import logging
 import socket
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_URL_MAX_AGE_SECONDS = 240  # Refresh before 5-minute TTL
 STREAM_CHUNK_SIZE = 64 * 1024  # 64KB chunks
 REQUEST_TIMEOUT_SECONDS = 30
+# Per-read timeout: fail fast when the CDN stalls mid-stream instead of hanging
+# forever (the overall stream has no total timeout).
+READ_TIMEOUT_SECONDS = 30
+# How many times to (re)establish the upstream connection before giving up,
+# while we have not yet sent response headers to the device.
+UPSTREAM_MAX_ATTEMPTS = 3
 
 
 @dataclass
@@ -213,12 +220,37 @@ class AudioProxyServer:
         # Forward request to Qobuz CDN
         return await self._proxy_stream(request, track)
 
+    async def _refresh_track_url(self, track: RegisteredTrack, attempt: int) -> bool:
+        """Fetch a fresh streaming URL before retrying the upstream fetch.
+
+        Returns True if a fresh URL was obtained and another attempt should be
+        made; False if we are out of attempts or the refetch failed.
+        """
+        if attempt >= UPSTREAM_MAX_ATTEMPTS - 1:
+            return False
+        try:
+            fresh_url = await self._url_provider.get_streaming_url(track.track_id)
+            track.qobuz_url = fresh_url
+            track.url_fetched_at = time.time()
+            logger.info(f"Refetched streaming URL for track {track.track_id} before retry")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to refetch URL for track {track.track_id}: {e}")
+            return False
+
     async def _proxy_stream(
         self,
         request: web.Request,
         track: RegisteredTrack,
     ) -> web.StreamResponse:
-        """Proxy the audio stream from Qobuz CDN."""
+        """Proxy the audio stream from Qobuz CDN.
+
+        The upstream connection is (re)established up to UPSTREAM_MAX_ATTEMPTS
+        times *before* any response headers are sent to the device, refetching
+        a fresh streaming URL between attempts. Once headers are committed a
+        mid-stream failure can no longer be retried, so it is logged and the
+        partial response is returned (the device re-requests via Range).
+        """
         # Build headers for upstream request
         headers: Dict[str, str] = {}
 
@@ -228,89 +260,109 @@ class AudioProxyServer:
             headers["Range"] = range_header
             logger.debug(f"Proxying with Range: {range_header}")
 
-        # Create a fresh session for each request (like reference implementation)
-        # This avoids connection pooling issues with long-running streams
-        timeout = ClientTimeout(total=None, connect=30)  # No total timeout for streaming
+        # No total timeout for streaming, but a per-read timeout so a stalled
+        # CDN connection fails fast instead of hanging forever.
+        timeout = ClientTimeout(total=None, connect=30, sock_read=READ_TIMEOUT_SECONDS)
 
-        try:
-            logger.debug(
-                f"Connecting to upstream URL for track {track.track_id}: {track.qobuz_url[:100]}..."
-            )
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    track.qobuz_url,
-                    headers=headers,
-                ) as upstream_response:
-                    # Determine response status
-                    if upstream_response.status == 206:
-                        status = 206  # Partial Content
-                    elif upstream_response.status == 200:
-                        status = 200
-                    else:
-                        logger.warning(
-                            f"Upstream error for track {track.track_id}: {upstream_response.status}"
-                        )
-                        return web.Response(
-                            status=502, text=f"Upstream error: {upstream_response.status}"
-                        )
-
-                    # Build response headers
-                    response_headers: Dict[str, str] = {
-                        "Content-Type": track.content_type,
-                        "Accept-Ranges": "bytes",
-                    }
-
-                    # Forward content headers
-                    if "Content-Length" in upstream_response.headers:
-                        response_headers["Content-Length"] = upstream_response.headers[
-                            "Content-Length"
-                        ]
-                    if "Content-Range" in upstream_response.headers:
-                        response_headers["Content-Range"] = upstream_response.headers[
-                            "Content-Range"
-                        ]
-
-                    logger.debug(f"Streaming track {track.track_id}, headers: {response_headers}")
-
-                    # Create streaming response
-                    response = web.StreamResponse(
-                        status=status,
-                        headers=response_headers,
-                    )
-                    await response.prepare(request)
-
-                    # Stream chunks to client
-                    bytes_sent = 0
-                    async for chunk in upstream_response.content.iter_chunked(STREAM_CHUNK_SIZE):
-                        try:
-                            await response.write(chunk)
-                            bytes_sent += len(chunk)
-                        except (ConnectionResetError, ConnectionError):
-                            logger.debug(
-                                f"Client disconnected after {bytes_sent} bytes for track {track.track_id}"
+        last_error = "Upstream fetch failed"
+        for attempt in range(UPSTREAM_MAX_ATTEMPTS):
+            try:
+                logger.debug(
+                    f"Connecting to upstream URL for track {track.track_id} "
+                    f"(attempt {attempt + 1}): {track.qobuz_url[:100]}..."
+                )
+                # Create a fresh session for each request (like reference
+                # implementation) to avoid connection pooling issues.
+                async with ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        track.qobuz_url,
+                        headers=headers,
+                    ) as upstream_response:
+                        # Validate status before committing any response headers.
+                        if upstream_response.status not in (200, 206):
+                            last_error = f"Upstream status {upstream_response.status}"
+                            logger.warning(
+                                f"Upstream error for track {track.track_id}: "
+                                f"{upstream_response.status} (attempt {attempt + 1})"
                             )
-                            return response
+                            if await self._refresh_track_url(track, attempt):
+                                continue
+                            return web.Response(status=502, text=last_error)
 
-                    await response.write_eof()
-                    logger.debug(
-                        f"Finished streaming track {track.track_id}, sent {bytes_sent} bytes"
-                    )
-                    return response
+                        status = upstream_response.status
 
-        except asyncio.CancelledError:
-            logger.debug(f"Stream cancelled for track {track.track_id}")
-            raise
-        except (ConnectionResetError, ConnectionError) as e:
-            # Client disconnected - this is normal when Sonos probes or seeks
-            logger.debug(f"Client connection closed for track {track.track_id}: {type(e).__name__}")
-            return web.Response(status=499, text="Client closed connection")
-        except Exception as e:
-            logger.error(f"Proxy error for track {track.track_id}: {type(e).__name__}: {e}")
-            logger.error(f"URL was: {track.qobuz_url[:100]}...")
-            import traceback
+                        # Build response headers
+                        response_headers: Dict[str, str] = {
+                            "Content-Type": track.content_type,
+                            "Accept-Ranges": "bytes",
+                        }
+                        if "Content-Length" in upstream_response.headers:
+                            response_headers["Content-Length"] = upstream_response.headers[
+                                "Content-Length"
+                            ]
+                        if "Content-Range" in upstream_response.headers:
+                            response_headers["Content-Range"] = upstream_response.headers[
+                                "Content-Range"
+                            ]
 
-            logger.debug(f"Full traceback: {traceback.format_exc()}")
-            return web.Response(status=502, text=f"Proxy error: {e}")
+                        logger.debug(
+                            f"Streaming track {track.track_id}, headers: {response_headers}"
+                        )
+
+                        # Headers are about to be committed — past this point a
+                        # failure cannot be retried.
+                        response = web.StreamResponse(status=status, headers=response_headers)
+                        bytes_sent = 0
+                        try:
+                            await response.prepare(request)
+                            async for chunk in upstream_response.content.iter_chunked(
+                                STREAM_CHUNK_SIZE
+                            ):
+                                try:
+                                    await response.write(chunk)
+                                    bytes_sent += len(chunk)
+                                except (ConnectionResetError, ConnectionError):
+                                    logger.debug(
+                                        f"Client disconnected after {bytes_sent} bytes "
+                                        f"for track {track.track_id}"
+                                    )
+                                    return response
+                            await response.write_eof()
+                            logger.debug(
+                                f"Finished streaming track {track.track_id}, "
+                                f"sent {bytes_sent} bytes"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            expected = upstream_response.headers.get("Content-Length", "?")
+                            logger.warning(
+                                f"Upstream stream interrupted for track {track.track_id} "
+                                f"after {bytes_sent}/{expected} bytes: {type(e).__name__}: {e}"
+                            )
+                        return response
+
+            except asyncio.CancelledError:
+                logger.debug(f"Stream cancelled for track {track.track_id}")
+                raise
+            except (ConnectionResetError, ConnectionError) as e:
+                # Client disconnected before streaming - normal when Sonos probes/seeks
+                logger.debug(
+                    f"Client connection closed for track {track.track_id}: {type(e).__name__}"
+                )
+                return web.Response(status=499, text="Client closed connection")
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.error(
+                    f"Proxy error for track {track.track_id} (attempt {attempt + 1}): {last_error}"
+                )
+                logger.error(f"URL was: {track.qobuz_url[:100]}...")
+                logger.debug(f"Full traceback: {traceback.format_exc()}")
+                if await self._refresh_track_url(track, attempt):
+                    continue
+                return web.Response(status=502, text=f"Proxy error: {last_error}")
+
+        return web.Response(status=502, text=last_error)
 
     def _get_local_ip(self) -> str:
         """Get local IP address for proxy URL."""

@@ -107,16 +107,7 @@ class DLNAClient:
         Raises:
             DLNAClientError: If connection fails
         """
-        # force_close=True opens a fresh TCP connection for every request and
-        # closes it after the response. DLNA renderers (gmediarender in
-        # particular) tend to drop idle keep-alive sockets on their own, which
-        # surfaces as `[Errno None] Can not write request body` when aiohttp
-        # picks the half-closed socket out of its pool.
-        connector = aiohttp.TCPConnector(force_close=True)
-        self._session = aiohttp.ClientSession(
-            timeout=ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
-            connector=connector,
-        )
+        self._session = self._build_session()
 
         # Try to fetch device description
         self.device_info = await self._fetch_device_description()
@@ -125,6 +116,37 @@ class DLNAClient:
 
         logger.info(f"Connected to DLNA device: {self.device_info.friendly_name}")
         return self.device_info
+
+    @staticmethod
+    def _build_session() -> aiohttp.ClientSession:
+        """Create the HTTP session used for SOAP requests.
+
+        force_close=True opens a fresh TCP connection for every request and
+        closes it after the response. DLNA renderers (gmediarender in
+        particular) tend to drop idle keep-alive sockets on their own, which
+        surfaces as `[Errno None] Can not write request body` when aiohttp
+        picks the half-closed socket out of its pool.
+        """
+        connector = aiohttp.TCPConnector(force_close=True)
+        return aiohttp.ClientSession(
+            timeout=ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
+            connector=connector,
+        )
+
+    async def reset_session(self) -> None:
+        """Recreate the HTTP session after a connection-level failure.
+
+        When a renderer wedges or drops its control socket, the existing
+        session can keep handing out dead connections. Closing and rebuilding
+        it lets subsequent SOAP calls recover without restarting the addon.
+        """
+        logger.debug("Resetting DLNA HTTP session")
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = self._build_session()
 
     async def disconnect(self) -> None:
         """Disconnect and clean up."""
@@ -782,8 +804,16 @@ class DLNAClient:
                         last_error = f"HTTP {response.status}"
 
             except Exception as e:
-                logger.warning(f"SOAP {action} error (attempt {attempt + 1}): {e}")
-                last_error = str(e)
+                # aiohttp connection/timeout errors often stringify to an empty
+                # string, so include the exception type to keep the log useful.
+                detail = f"{type(e).__name__}: {e}".rstrip(": ")
+                logger.warning(f"SOAP {action} error (attempt {attempt + 1}): {detail}")
+                last_error = detail
+                # A connection/timeout failure can leave the force_close session
+                # holding a half-dead socket. Recreate it so the remaining
+                # retries run against a fresh connection.
+                if isinstance(e, (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError)):
+                    await self.reset_session()
 
             if attempt < retries - 1:
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
