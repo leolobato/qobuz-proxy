@@ -17,6 +17,7 @@ from aiohttp import web
 from qobuz_proxy import __commit__, __version__
 from qobuz_proxy.auth import (
     QobuzAPIClient,
+    TransientAuthError,
     clear_user_token,
     load_user_token,
     save_user_token,
@@ -40,6 +41,12 @@ logger = logging.getLogger(__name__)
 # races between containers). After the ramp, keep trying at a steady pace.
 SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
 SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
+
+# Backoff for token validation at startup. Qobuz's login endpoint can be slow
+# or briefly unreachable (e.g. network not fully up yet right after boot);
+# without this a single 10s timeout looked identical to a genuinely bad
+# token and required a manual re-auth via the web UI.
+AUTH_RETRY_DELAYS_SECONDS: tuple[float, ...] = (3.0, 8.0)
 
 
 class QobuzProxy:
@@ -186,9 +193,24 @@ class QobuzProxy:
 
         self._api_client = QobuzAPIClient(self._app_id, self._app_secret)
         logger.info(f"Authenticating user {user_id}...")
-        if await self._api_client.login_with_token(user_id=user_id, auth_token=auth_token):
-            logger.info("Authentication successful")
-            return True
+
+        max_attempts = len(AUTH_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if await self._api_client.login_with_token(user_id=user_id, auth_token=auth_token):
+                    logger.info("Authentication successful")
+                    return True
+                break  # definitive HTTP 401/403 — retrying won't help
+            except TransientAuthError as e:
+                if attempt == max_attempts:
+                    logger.warning(f"Token validation still failing after {attempt} attempts: {e}")
+                    break
+                delay = AUTH_RETRY_DELAYS_SECONDS[attempt - 1]
+                logger.warning(
+                    f"Token validation attempt {attempt} failed transiently ({e}); "
+                    f"retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
 
         logger.warning("Authentication failed — invalid credentials")
         self._api_client = None

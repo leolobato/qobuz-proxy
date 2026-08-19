@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 from qobuz_proxy.app import QobuzProxy
+from qobuz_proxy.auth.exceptions import TransientAuthError
 from qobuz_proxy.config import (
     Config,
     QobuzConfig,
@@ -77,6 +78,82 @@ class TestStartupWithCachedToken:
                 mock_auth.assert_awaited_once_with("999", "tok")
             finally:
                 await app.stop()
+
+
+class TestAuthenticateRetriesTransientErrors:
+    """Regression tests for the missing retry on token validation at startup.
+
+    Previously, any exception from login_with_token (timeouts included —
+    asyncio.TimeoutError stringifies to '') was indistinguishable from a
+    genuinely bad token: one slow response from Qobuz right after boot
+    permanently required a manual re-auth via the web UI.
+    """
+
+    async def test_retries_and_succeeds_after_transient_errors(self):
+        config = _make_config()
+        app = QobuzProxy(config)
+        # Normally set by start() (step 2, before auto-auth); tests call
+        # _authenticate() directly so it needs setting explicitly.
+        app._app_id = "test_app_id"
+        app._app_secret = "test_app_secret"
+        with (
+            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch(
+                "qobuz_proxy.app.QobuzAPIClient.login_with_token",
+                new_callable=AsyncMock,
+                side_effect=[
+                    TransientAuthError("timeout"),
+                    TransientAuthError("timeout"),
+                    True,
+                ],
+            ),
+        ):
+            result = await app._authenticate("999", "tok")
+
+        assert result is True
+        assert mock_sleep.await_count == 2
+
+    async def test_gives_up_after_max_attempts_of_transient_errors(self):
+        config = _make_config()
+        app = QobuzProxy(config)
+        app._app_id = "test_app_id"
+        app._app_secret = "test_app_secret"
+        with (
+            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock),
+            patch(
+                "qobuz_proxy.app.QobuzAPIClient.login_with_token",
+                new_callable=AsyncMock,
+                side_effect=TransientAuthError("timeout"),
+            ) as mock_login,
+        ):
+            result = await app._authenticate("999", "tok")
+
+        assert result is False
+        assert app._api_client is None
+        assert mock_login.await_count == 3  # 1 initial + 2 retries
+
+    async def test_does_not_retry_on_definitive_bad_token(self):
+        """A real 401/403 (login_with_token returns False) should fail fast —
+        no point retrying a token that's actually invalid."""
+        config = _make_config()
+        app = QobuzProxy(config)
+        # Normally set by start() (step 2, before auto-auth); tests call
+        # _authenticate() directly so it needs setting explicitly.
+        app._app_id = "test_app_id"
+        app._app_secret = "test_app_secret"
+        with (
+            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch(
+                "qobuz_proxy.app.QobuzAPIClient.login_with_token",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_login,
+        ):
+            result = await app._authenticate("999", "bad_tok")
+
+        assert result is False
+        assert mock_login.await_count == 1
+        mock_sleep.assert_not_awaited()
 
 
 class TestWebUIAuthCallback:

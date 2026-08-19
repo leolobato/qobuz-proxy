@@ -14,6 +14,8 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+from .exceptions import TransientAuthError
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +73,12 @@ class QobuzAPIClient:
 
         Used on startup to check if a previously saved token is still valid.
         On success, stores the (potentially refreshed) token from the response.
+
+        Raises:
+            TransientAuthError: validation couldn't be completed (timeout,
+                connection error, non-401/403 HTTP error, unexpected response
+                shape) — the token's validity is still unknown, caller should
+                retry rather than treat this as a bad token.
         """
         try:
             url = f"{self.API_BASE}/user/login"
@@ -84,12 +92,12 @@ class QobuzAPIClient:
                 async with session.post(
                     url, data="extra=partner", headers=headers, timeout=timeout
                 ) as resp:
+                    if resp.status in (401, 403):
+                        logger.warning(f"Login validation failed: HTTP {resp.status} — bad token")
+                        return False
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning(
-                            f"Login validation failed: HTTP {resp.status} — {body[:200]}"
-                        )
-                        return False
+                        raise TransientAuthError(f"HTTP {resp.status} — {body[:200]}")
                     response = await resp.json()
 
             if response and "user_auth_token" in response:
@@ -98,10 +106,14 @@ class QobuzAPIClient:
                 logger.info(f"Logged in as user {self.user_id}")
                 return True
 
-        except Exception as e:
-            logger.error(f"Login failed: {e}")
+            raise TransientAuthError(f"Unexpected login response shape: {response!r}"[:200])
 
-        return False
+        except TransientAuthError:
+            raise
+        except Exception as e:
+            # Covers timeouts (str() is empty on asyncio.TimeoutError) and
+            # connection errors — neither means the token is actually bad.
+            raise TransientAuthError(f"{type(e).__name__}: {e}") from e
 
     async def start_session(self) -> bool:
         """
