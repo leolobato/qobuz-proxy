@@ -41,6 +41,22 @@ class TestProtocolCodec:
         assert id2 == 2
         assert id3 == 3
 
+    def test_envelope_msg_ids_are_consecutive(self, codec: ProtocolCodec) -> None:
+        """Consecutive payload encodes must produce consecutive envelope msgIds.
+
+        The server tolerates only small msgId gaps between messages on a
+        connection, so the batch messagesId must come from its own counter
+        instead of consuming envelope ids.
+        """
+        frame1 = codec.encode_volume_changed(50)
+        frame2 = codec.encode_volume_changed(51)
+
+        decoded1 = codec.decode_frame(frame1)
+        decoded2 = codec.decode_frame(frame2)
+
+        assert decoded1 is not None and decoded2 is not None
+        assert decoded2.msg_id == decoded1.msg_id + 1
+
 
 class TestEncoding:
     """Tests for message encoding."""

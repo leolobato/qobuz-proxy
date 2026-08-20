@@ -67,10 +67,6 @@ class TestWsManagerInit:
         """Test that handler dict is empty initially."""
         assert len(ws_manager._handlers) == 0
 
-    def test_init_empty_pending_messages(self, ws_manager: WsManager) -> None:
-        """Test that pending messages queue is empty."""
-        assert len(ws_manager._pending_messages) == 0
-
     def test_init_reconnect_delay(self, ws_manager: WsManager) -> None:
         """Test initial reconnect delay."""
         assert ws_manager._reconnect_delay == INITIAL_RECONNECT_DELAY
@@ -240,34 +236,26 @@ class TestReconnectionConstants:
             delay = min(delay * RECONNECT_BACKOFF_MULTIPLIER, MAX_RECONNECT_DELAY)
 
 
-class TestMessageQueueing:
-    """Tests for message queueing during disconnect."""
+class TestMessageDropWhenDisconnected:
+    """Messages produced while disconnected are dropped, never queued.
+
+    Replaying stale frames on a fresh connection gets it killed by the
+    server (error 1003 "Message gap too large"); everything we send is
+    ephemeral state that is re-announced after reconnecting.
+    """
 
     @pytest.mark.asyncio
-    async def test_send_message_queues_when_disconnected(self, ws_manager: WsManager) -> None:
-        """Test that messages are queued when not connected."""
+    async def test_send_message_dropped_when_disconnected(self, ws_manager: WsManager) -> None:
+        """Test that raw messages are dropped when not connected."""
         assert ws_manager.is_connected is False
 
-        data = b"test_message_data"
-        result = await ws_manager.send_message(data)
+        result = await ws_manager.send_message(b"test_message_data")
 
         assert result is False
-        assert len(ws_manager._pending_messages) == 1
-        assert ws_manager._pending_messages[0] == data
 
     @pytest.mark.asyncio
-    async def test_multiple_messages_queued(self, ws_manager: WsManager) -> None:
-        """Test that multiple messages can be queued."""
-        messages = [b"msg1", b"msg2", b"msg3"]
-
-        for msg in messages:
-            await ws_manager.send_message(msg)
-
-        assert len(ws_manager._pending_messages) == 3
-
-    @pytest.mark.asyncio
-    async def test_send_state_update_queues(self, ws_manager: WsManager) -> None:
-        """Test that state updates are queued when disconnected."""
+    async def test_send_state_update_dropped_when_disconnected(self, ws_manager: WsManager) -> None:
+        """Test that state updates are dropped when disconnected."""
         result = await ws_manager.send_state_update(
             playing_state=2,
             buffer_state=2,
@@ -279,15 +267,20 @@ class TestMessageQueueing:
         )
 
         assert result is False
-        assert len(ws_manager._pending_messages) == 1
 
     @pytest.mark.asyncio
-    async def test_send_volume_changed_queues(self, ws_manager: WsManager) -> None:
-        """Test that volume changes are queued when disconnected."""
-        result = await ws_manager.send_volume_changed(75)
+    async def test_dropped_message_does_not_consume_msg_ids(self, ws_manager: WsManager) -> None:
+        """Dropped messages must not advance the codec counters.
 
-        assert result is False
-        assert len(ws_manager._pending_messages) == 1
+        The server tolerates only small msgId gaps between consecutive
+        messages on a connection, so ids consumed by never-sent messages
+        would poison the sequence.
+        """
+        counter_before = ws_manager._codec._msg_counter
+
+        await ws_manager.send_volume_changed(75)
+
+        assert ws_manager._codec._msg_counter == counter_before
 
 
 class TestStartStop:

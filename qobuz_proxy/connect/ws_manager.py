@@ -76,8 +76,8 @@ class WsManager:
         # Message handlers: message_type -> handler
         self._handlers: Dict[int, MessageHandler] = {}
 
-        # Outgoing message queue (for messages during disconnect)
-        self._pending_messages: list[bytes] = []
+        # Serializes encode+send so msgIds hit the wire in increasing order
+        self._send_lock = asyncio.Lock()
 
         # Tasks
         self._receive_task: Optional[asyncio.Task[None]] = None
@@ -183,18 +183,34 @@ class WsManager:
             data: Encoded frame bytes
 
         Returns:
-            True if sent, False if queued for later
+            True if sent, False if dropped (not connected)
         """
-        if self._ws and self._is_connected:
+        return await self._encode_and_send(lambda: data)
+
+    async def _encode_and_send(self, encode: Callable[[], bytes]) -> bool:
+        """
+        Encode and transmit a message atomically.
+
+        The codec stamps a monotonically increasing msgId at encode time and
+        the server kills connections whose msgIds arrive out of order or with
+        large gaps (error 1003 "Message gap too large"), so encoding and
+        transmission must happen under the same lock. Messages produced while
+        disconnected are dropped rather than queued: everything we send is
+        ephemeral current state that is re-announced after reconnecting, and
+        replaying stale frames with old msgIds gets the new connection killed.
+
+        Returns:
+            True if sent, False if dropped (not connected) or send failed
+        """
+        async with self._send_lock:
+            if not (self._ws and self._is_connected):
+                return False
             try:
-                await self._ws.send(data)
+                await self._ws.send(encode())
                 return True
             except Exception as e:
                 logger.error(f"Failed to send message: {e}")
-
-        # Queue for when connection is restored
-        self._pending_messages.append(data)
-        return False
+                return False
 
     async def send_state_update(
         self,
@@ -213,17 +229,18 @@ class WsManager:
         Returns:
             True if sent successfully
         """
-        data = self._codec.encode_state_update(
-            playing_state=playing_state,
-            buffer_state=buffer_state,
-            position_ms=position_ms,
-            duration_ms=duration_ms,
-            queue_item_id=queue_item_id,
-            queue_version_major=queue_version_major,
-            queue_version_minor=queue_version_minor,
-            position_timestamp_ms=position_timestamp_ms,
+        return await self._encode_and_send(
+            lambda: self._codec.encode_state_update(
+                playing_state=playing_state,
+                buffer_state=buffer_state,
+                position_ms=position_ms,
+                duration_ms=duration_ms,
+                queue_item_id=queue_item_id,
+                queue_version_major=queue_version_major,
+                queue_version_minor=queue_version_minor,
+                position_timestamp_ms=position_timestamp_ms,
+            )
         )
-        return await self.send_message(data)
 
     async def send_volume_changed(self, volume: int) -> bool:
         """
@@ -235,8 +252,7 @@ class WsManager:
         Returns:
             True if sent successfully
         """
-        data = self._codec.encode_volume_changed(volume)
-        return await self.send_message(data)
+        return await self._encode_and_send(lambda: self._codec.encode_volume_changed(volume))
 
     async def send_file_audio_quality_changed(
         self,
@@ -264,13 +280,14 @@ class WsManager:
             f"Sending FILE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}, "
             f"sr={sampling_rate}, bd={bit_depth}, ch={nb_channels}"
         )
-        data = self._codec.encode_file_audio_quality_changed(
-            quality,
-            sampling_rate=sampling_rate,
-            bit_depth=bit_depth,
-            nb_channels=nb_channels,
+        return await self._encode_and_send(
+            lambda: self._codec.encode_file_audio_quality_changed(
+                quality,
+                sampling_rate=sampling_rate,
+                bit_depth=bit_depth,
+                nb_channels=nb_channels,
+            )
         )
-        return await self.send_message(data)
 
     async def send_device_audio_quality_changed(
         self,
@@ -298,13 +315,14 @@ class WsManager:
             f"Sending DEVICE_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}, "
             f"sr={sampling_rate}, bd={bit_depth}, ch={nb_channels}"
         )
-        data = self._codec.encode_device_audio_quality_changed(
-            quality,
-            sampling_rate=sampling_rate,
-            bit_depth=bit_depth,
-            nb_channels=nb_channels,
+        return await self._encode_and_send(
+            lambda: self._codec.encode_device_audio_quality_changed(
+                quality,
+                sampling_rate=sampling_rate,
+                bit_depth=bit_depth,
+                nb_channels=nb_channels,
+            )
         )
-        return await self.send_message(data)
 
     async def send_max_audio_quality_changed(self, quality: int, network_type: int = 1) -> bool:
         """
@@ -321,8 +339,9 @@ class WsManager:
 
         proto_quality = QUALITY_TO_PROTOCOL.get(quality, 4)
         logger.debug(f"Sending MAX_AUDIO_QUALITY_CHANGED: qobuz={quality} -> proto={proto_quality}")
-        data = self._codec.encode_max_audio_quality_changed(quality, network_type=network_type)
-        return await self.send_message(data)
+        return await self._encode_and_send(
+            lambda: self._codec.encode_max_audio_quality_changed(quality, network_type=network_type)
+        )
 
     # -------------------------------------------------------------------------
     # Connection Loop
@@ -394,9 +413,6 @@ class WsManager:
                 # Notify connected callback
                 if self._on_connected:
                     self._on_connected()
-
-                # Send any queued messages
-                await self._flush_pending_messages()
 
                 # Message receive loop
                 await self._receive_loop()
@@ -498,20 +514,6 @@ class WsManager:
                     logger.error(f"Handler error for type {msg_type}: {e}")
             else:
                 logger.debug(f"No handler for message type {msg_type}")
-
-    async def _flush_pending_messages(self) -> None:
-        """Send any messages queued during disconnect."""
-        if not self._pending_messages:
-            return
-
-        logger.debug(f"Flushing {len(self._pending_messages)} pending messages")
-        for data in self._pending_messages:
-            try:
-                await self._ws.send(data)
-            except Exception as e:
-                logger.error(f"Failed to flush message: {e}")
-
-        self._pending_messages.clear()
 
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
         """Wait until a non-expired token is available or shutdown is requested."""
