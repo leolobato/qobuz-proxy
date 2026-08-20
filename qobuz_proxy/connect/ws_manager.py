@@ -6,6 +6,7 @@ Handles connection lifecycle, authentication, and message routing.
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -25,6 +26,7 @@ PING_INTERVAL = 10.0  # seconds
 PONG_TIMEOUT = 30.0  # seconds
 RECV_TIMEOUT = 1.0  # seconds (for periodic checks)
 TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
+TOKEN_REFRESH_IDLE_PERIOD = 60.0  # seconds without a send before a refresh reconnect
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
@@ -83,6 +85,8 @@ class WsManager:
 
         # Serializes encode+send so msgIds hit the wire in increasing order
         self._send_lock = asyncio.Lock()
+        self._last_tx_time = time.monotonic()
+        self._refresh_deferred = False
 
         # Tasks
         self._receive_task: Optional[asyncio.Task[None]] = None
@@ -225,6 +229,7 @@ class WsManager:
                 return False
             try:
                 await self._ws.send(encode())
+                self._last_tx_time = time.monotonic()
                 return True
             except Exception as e:
                 logger.error(f"Failed to send message: {e}")
@@ -426,6 +431,8 @@ class WsManager:
 
                 self._is_connected = True
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
+                self._last_tx_time = time.monotonic()
+                self._refresh_deferred = False
                 logger.info("Connected and authenticated")
 
                 # Notify connected callback
@@ -491,13 +498,34 @@ class WsManager:
                 await self._handle_message(data)
 
             except asyncio.TimeoutError:
-                # Check token refresh
-                if self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER):
-                    logger.warning("Token expiring soon, need refresh")
-                    raise TokenRefreshRequired()
+                self._check_token_refresh()
 
             except websockets.ConnectionClosed:
                 raise
+
+    def _check_token_refresh(self) -> None:
+        """Reconnect with a fresh token, once the session is quiet enough.
+
+        Swapping the token means dropping and re-establishing the connection,
+        and the Qobuz app pauses a renderer that disappears and comes back
+        mid-track. So an expiring token only triggers the reconnect after the
+        session has gone quiet, matching the StreamCore32 reference, which
+        gates the same reconnect on 60s without a transmission (its player
+        heartbeat keeps sending while a track is loaded). If the session never
+        goes quiet the token lapses and the server closes the connection; the
+        reconnect that follows mints a fresh token.
+        """
+        if not (self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER)):
+            return
+
+        if time.monotonic() - self._last_tx_time < TOKEN_REFRESH_IDLE_PERIOD:
+            if not self._refresh_deferred:
+                logger.info("Token expiring soon, deferring refresh until the session is idle")
+                self._refresh_deferred = True
+            return
+
+        logger.warning("Token expiring soon, need refresh")
+        raise TokenRefreshRequired()
 
     async def _handle_message(self, data: bytes) -> None:
         """Decode and route incoming message."""
