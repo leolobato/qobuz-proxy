@@ -232,9 +232,7 @@ class TestContextUuidPropagation:
         stale_ctx = uuid.UUID("99999999-9999-9999-9999-999999999999").bytes
 
         # Live: playing the track at ~60s with the real context.
-        player._current_track = QueueTrack(
-            queue_item_id=9, track_id="222", context_uuid=live_ctx
-        )
+        player._current_track = QueueTrack(queue_item_id=9, track_id="222", context_uuid=live_ctx)
         player._state = PlaybackState.PLAYING
         player._position_value_ms = 60_000
         player._position_timestamp_ms = 0  # avoid time-based interpolation drift

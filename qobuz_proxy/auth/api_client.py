@@ -10,9 +10,11 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import aiohttp
+
+from qobuz_proxy.auth.tokens import WSToken
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ class QobuzAPIClient:
         self.x_session_id: Optional[str] = None
         self.x_session_expires_at: int = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        self._has_ws_token: bool = False
 
     async def __aenter__(self) -> "QobuzAPIClient":
         """Async context manager entry."""
@@ -155,6 +158,68 @@ class QobuzAPIClient:
             logger.error(f"Failed to start session: {e}")
 
         return False
+
+    async def get_ws_token(self) -> Optional[WSToken]:
+        """
+        Mint a Qobuz Connect WebSocket token (qws/createToken or qws/refreshToken).
+
+        The Qobuz app supplies a WS token when it connects to the device, but
+        those tokens are only valid for ~60 minutes. Minting our own lets the
+        device stay connected through long playback sessions without waiting
+        for the app to reconnect.
+
+        Returns:
+            WSToken on success, None on failure
+        """
+        if not self.user_auth_token:
+            logger.debug("Cannot mint WS token without user auth token")
+            return None
+
+        await self.start_session()
+
+        headers = {
+            "Referer": "https://play.qobuz.com/",
+            "Origin": "https://play.qobuz.com",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-App-Id": self.app_id,
+            "X-User-Auth-Token": self.user_auth_token,
+        }
+        if self.x_session_id:
+            headers["X-Session-Id"] = self.x_session_id
+
+        action = "refreshToken" if self._has_ws_token else "createToken"
+        url = f"{self.API_BASE}/qws/{action}"
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, data="jwt=jwt_qws", headers=headers, timeout=timeout
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"qws/{action} failed: HTTP {resp.status} — {body[:200]}")
+                        return None
+                    data = await resp.json()
+
+            tok = data.get("jwt_qws") or {}
+            token = WSToken(
+                jwt=tok.get("jwt", ""),
+                exp_s=int(tok.get("exp", 0)),
+                endpoint=unquote(tok.get("endpoint", "")),
+            )
+            if not token.is_valid():
+                logger.warning(f"qws/{action} returned an incomplete token")
+                return None
+
+            self._has_ws_token = True
+            validity_min = max(0, token.exp_s - int(time.time())) // 60
+            logger.info(f"Minted WebSocket token via qws/{action} (valid ~{validity_min} min)")
+            return token
+
+        except Exception as e:
+            logger.error(f"Failed to mint WS token: {e}")
+            return None
 
     async def get_track_url(self, track_id: str, quality: int = 27) -> Optional[dict[str, Any]]:
         """

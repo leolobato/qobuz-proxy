@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect.ws_manager import (
@@ -299,3 +300,87 @@ class TestStartStop:
         """Test that stopping when not running is safe."""
         await ws_manager.stop()
         assert ws_manager._should_run is False
+
+
+class TestTokenRefresher:
+    """Tests for self-minted WS tokens (qws/createToken flow)."""
+
+    @pytest.mark.asyncio
+    async def test_refresher_supplies_token_when_expired(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """An expiring token is replaced via the refresher without waiting for the app."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+
+        fresh = WSToken(jwt="fresh_jwt", exp_s=9999999999, endpoint="wss://test/ws")
+        refresher = AsyncMock(return_value=fresh)
+        ws_manager.set_token_refresher(refresher)
+
+        result = await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), timeout=1.0)
+
+        assert result is True
+        assert ws_manager._ws_token is fresh
+        refresher.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refresher_not_called_when_token_valid(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """A valid token is used as-is; the refresher is not consulted."""
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+
+        refresher = AsyncMock()
+        ws_manager.set_token_refresher(refresher)
+
+        result = await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), timeout=1.0)
+
+        assert result is True
+        refresher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_app_tokens_when_refresher_fails(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """When minting fails, app-provided tokens still unblock the wait."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+        ws_manager.set_token_refresher(AsyncMock(return_value=None))
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+    @pytest.mark.asyncio
+    async def test_refresher_exception_does_not_crash_wait(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """A refresher that raises is treated as a failed mint."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+        ws_manager.set_token_refresher(AsyncMock(side_effect=RuntimeError("api down")))
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True

@@ -7,7 +7,7 @@ Handles connection lifecycle, authentication, and message routing.
 import asyncio
 import logging
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import websockets
 from websockets import ClientConnection
@@ -28,9 +28,13 @@ TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
+TOKEN_MINT_RETRY_DELAY = 30.0  # seconds between self-mint attempts
 
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
+
+# Async callback that mints a fresh WS token (returns None on failure)
+TokenRefresher = Callable[[], Awaitable[Optional[WSToken]]]
 
 
 class TokenRefreshRequired(Exception):
@@ -72,6 +76,7 @@ class WsManager:
         # Token refresh state
         self._token_update_event = asyncio.Event()
         self._token_version = 0
+        self._token_refresher: Optional[TokenRefresher] = None
 
         # Message handlers: message_type -> handler
         self._handlers: Dict[int, MessageHandler] = {}
@@ -118,6 +123,19 @@ class WsManager:
         if tokens_changed and self._ws and self._should_run:
             logger.info("Received refreshed WebSocket tokens, reconnecting")
             asyncio.create_task(self._close_for_token_refresh())
+
+    def set_token_refresher(self, refresher: TokenRefresher) -> None:
+        """
+        Register a callback that mints a fresh WS token via the Qobuz API.
+
+        With a refresher set, an expiring token triggers a self-refresh and a
+        quick reconnect instead of leaving the device offline until the Qobuz
+        app reconnects and pushes new tokens.
+
+        Args:
+            refresher: Async callable returning a WSToken, or None on failure
+        """
+        self._token_refresher = refresher
 
     def set_max_audio_quality(self, quality: int) -> None:
         """
@@ -516,7 +534,12 @@ class WsManager:
                 logger.debug(f"No handler for message type {msg_type}")
 
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
-        """Wait until a non-expired token is available or shutdown is requested."""
+        """Obtain a non-expired token, or wait until one arrives or shutdown is requested.
+
+        Tries the token refresher (self-mint via the Qobuz API) first; falls
+        back to waiting for the Qobuz app to push fresh tokens, retrying the
+        refresher periodically in case the failure was transient.
+        """
         logged_wait = False
 
         while self._should_run:
@@ -527,6 +550,16 @@ class WsManager:
             ):
                 return True
 
+            if self._token_refresher:
+                try:
+                    token = await self._token_refresher()
+                except Exception as e:
+                    logger.warning(f"WS token refresh failed: {e}")
+                    token = None
+                if token and token.is_valid() and not token.is_expired(buffer_s):
+                    self._ws_token = token
+                    return True
+
             if not logged_wait:
                 logger.warning("Token expired, waiting for refreshed token from Qobuz app")
                 logged_wait = True
@@ -535,7 +568,17 @@ class WsManager:
             self._token_update_event.clear()
             if self._token_version != token_version:
                 continue
-            await self._token_update_event.wait()
+            if self._token_refresher:
+                # Wake up periodically to retry the refresher even if the app
+                # never reconnects.
+                try:
+                    await asyncio.wait_for(
+                        self._token_update_event.wait(), timeout=TOKEN_MINT_RETRY_DELAY
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await self._token_update_event.wait()
 
         return False
 
