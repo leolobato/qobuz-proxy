@@ -24,6 +24,12 @@ MSG_TYPE_SET_LOOP_MODE = 45  # SrvrRndrSetLoopMode
 MSG_TYPE_SET_SHUFFLE_MODE = 46  # SrvrRndrSetShuffleMode
 MSG_TYPE_SET_AUTOPLAY_MODE = 47  # SrvrRndrSetAutoplayMode
 
+# The app sends nextQueueItem with all-ones ids to signal "no next track"
+# (e.g. on the last track of an album when the next album lives in a different
+# queue context). trackId is a fixed32, queueItemId a uint64 on the wire.
+SENTINEL_TRACK_ID = 0xFFFFFFFF
+SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
+
 
 class PlaybackCommandHandler:
     """
@@ -124,8 +130,16 @@ class PlaybackCommandHandler:
 
         # Extract and store next queue item for auto-advance
         next_track_changed = False
-        if state.HasField("nextQueueItem"):
-            next_item = state.nextQueueItem
+        next_item = state.nextQueueItem if state.HasField("nextQueueItem") else None
+        if next_item is not None and (
+            next_item.trackId == SENTINEL_TRACK_ID
+            or next_item.queueItemId == SENTINEL_QUEUE_ITEM_ID
+        ):
+            # "No next track" sentinel — treat like an absent nextQueueItem,
+            # otherwise auto-advance tries to load track 4294967295 and fails.
+            logger.debug("Next track sentinel received (no next track)")
+            next_item = None
+        if next_item is not None:
             old_queue_item_id = (
                 self._next_track_info.get("queueItemId") if self._next_track_info else None
             )
