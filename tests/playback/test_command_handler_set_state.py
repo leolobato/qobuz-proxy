@@ -133,3 +133,81 @@ class TestSetStateHandling:
         assert player.current_track is not None
         assert player.current_track.track_id == "1002"
         assert backend.played[-1] == "1002"
+
+
+class TestNextTrackSentinel:
+    """The app sends nextQueueItem with all-ones ids to mean "no next track"
+    (issue #17: last track of an album with another album queued in a
+    different context). It must be treated like an absent nextQueueItem."""
+
+    async def test_sentinel_next_item_is_not_stored(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+
+        msg = _set_state_msg(track_id=1001, queue_item_id=1)
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
+        msg.srvrRndrSetState.nextQueueItem.trackId = 0xFFFFFFFF
+        await handler._handle_set_state(msg)
+
+        assert handler.get_next_track_info() is None
+
+    async def test_sentinel_track_id_alone_is_not_stored(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+
+        msg = _set_state_msg(track_id=1001, queue_item_id=1)
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        msg.srvrRndrSetState.nextQueueItem.trackId = 0xFFFFFFFF
+        await handler._handle_set_state(msg)
+
+        assert handler.get_next_track_info() is None
+
+    async def test_sentinel_clears_previous_next_and_notifies(self) -> None:
+        """A sentinel replacing a real next track must clear it and fire the
+        change callback so a stale gapless arm is torn down."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+
+        changed = 0
+
+        async def on_changed() -> None:
+            nonlocal changed
+            changed += 1
+
+        first = _set_state_msg(track_id=1001, queue_item_id=1)
+        first.srvrRndrSetState.nextQueueItem.queueItemId = 2
+        first.srvrRndrSetState.nextQueueItem.trackId = 1002
+        await handler._handle_set_state(first)
+        assert handler.get_next_track_info() is not None
+
+        handler.set_on_next_track_changed(on_changed)
+        second = _set_state_msg(track_id=1001, queue_item_id=1)
+        second.srvrRndrSetState.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
+        second.srvrRndrSetState.nextQueueItem.trackId = 0xFFFFFFFF
+        await handler._handle_set_state(second)
+
+        assert handler.get_next_track_info() is None
+        assert changed == 1
+
+    async def test_track_end_with_sentinel_stops_instead_of_advancing(self) -> None:
+        """Issue #17 repro: track ends while the stored next is the sentinel —
+        playback must stop cleanly, never try to load track 4294967295."""
+        from qobuz_proxy.playback.queue import QobuzQueue
+
+        player, backend = _make_player()
+        player.queue = QobuzQueue()  # real queue: track-end path awaits get_state()
+        handler = PlaybackCommandHandler(player, queue=player.queue)
+        player.set_next_track_callbacks(
+            get_callback=handler.get_next_track_info,
+            clear_callback=handler.clear_next_track_info,
+        )
+
+        msg = _set_state_msg(track_id=1001, queue_item_id=1)
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
+        msg.srvrRndrSetState.nextQueueItem.trackId = 0xFFFFFFFF
+        await handler._handle_set_state(msg)
+
+        await player._handle_track_ended(player.current_track)
+
+        assert player.state == PlaybackState.STOPPED
+        assert "4294967295" not in backend.played

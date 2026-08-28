@@ -1,17 +1,21 @@
 """Tests for WebSocket manager."""
 
 import asyncio
+import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect.ws_manager import (
     INITIAL_RECONNECT_DELAY,
     MAX_RECONNECT_DELAY,
     RECONNECT_BACKOFF_MULTIPLIER,
+    TOKEN_REFRESH_IDLE_PERIOD,
+    TokenRefreshRequired,
     WsManager,
 )
 
@@ -66,10 +70,6 @@ class TestWsManagerInit:
     def test_init_empty_handlers(self, ws_manager: WsManager) -> None:
         """Test that handler dict is empty initially."""
         assert len(ws_manager._handlers) == 0
-
-    def test_init_empty_pending_messages(self, ws_manager: WsManager) -> None:
-        """Test that pending messages queue is empty."""
-        assert len(ws_manager._pending_messages) == 0
 
     def test_init_reconnect_delay(self, ws_manager: WsManager) -> None:
         """Test initial reconnect delay."""
@@ -240,34 +240,26 @@ class TestReconnectionConstants:
             delay = min(delay * RECONNECT_BACKOFF_MULTIPLIER, MAX_RECONNECT_DELAY)
 
 
-class TestMessageQueueing:
-    """Tests for message queueing during disconnect."""
+class TestMessageDropWhenDisconnected:
+    """Messages produced while disconnected are dropped, never queued.
+
+    Replaying stale frames on a fresh connection gets it killed by the
+    server (error 1003 "Message gap too large"); everything we send is
+    ephemeral state that is re-announced after reconnecting.
+    """
 
     @pytest.mark.asyncio
-    async def test_send_message_queues_when_disconnected(self, ws_manager: WsManager) -> None:
-        """Test that messages are queued when not connected."""
+    async def test_send_message_dropped_when_disconnected(self, ws_manager: WsManager) -> None:
+        """Test that raw messages are dropped when not connected."""
         assert ws_manager.is_connected is False
 
-        data = b"test_message_data"
-        result = await ws_manager.send_message(data)
+        result = await ws_manager.send_message(b"test_message_data")
 
         assert result is False
-        assert len(ws_manager._pending_messages) == 1
-        assert ws_manager._pending_messages[0] == data
 
     @pytest.mark.asyncio
-    async def test_multiple_messages_queued(self, ws_manager: WsManager) -> None:
-        """Test that multiple messages can be queued."""
-        messages = [b"msg1", b"msg2", b"msg3"]
-
-        for msg in messages:
-            await ws_manager.send_message(msg)
-
-        assert len(ws_manager._pending_messages) == 3
-
-    @pytest.mark.asyncio
-    async def test_send_state_update_queues(self, ws_manager: WsManager) -> None:
-        """Test that state updates are queued when disconnected."""
+    async def test_send_state_update_dropped_when_disconnected(self, ws_manager: WsManager) -> None:
+        """Test that state updates are dropped when disconnected."""
         result = await ws_manager.send_state_update(
             playing_state=2,
             buffer_state=2,
@@ -279,15 +271,20 @@ class TestMessageQueueing:
         )
 
         assert result is False
-        assert len(ws_manager._pending_messages) == 1
 
     @pytest.mark.asyncio
-    async def test_send_volume_changed_queues(self, ws_manager: WsManager) -> None:
-        """Test that volume changes are queued when disconnected."""
-        result = await ws_manager.send_volume_changed(75)
+    async def test_dropped_message_does_not_consume_msg_ids(self, ws_manager: WsManager) -> None:
+        """Dropped messages must not advance the codec counters.
 
-        assert result is False
-        assert len(ws_manager._pending_messages) == 1
+        The server tolerates only small msgId gaps between consecutive
+        messages on a connection, so ids consumed by never-sent messages
+        would poison the sequence.
+        """
+        counter_before = ws_manager._codec._msg_counter
+
+        await ws_manager.send_volume_changed(75)
+
+        assert ws_manager._codec._msg_counter == counter_before
 
 
 class TestStartStop:
@@ -306,3 +303,158 @@ class TestStartStop:
         """Test that stopping when not running is safe."""
         await ws_manager.stop()
         assert ws_manager._should_run is False
+
+
+class TestTokenRefresher:
+    """Tests for self-minted WS tokens (qws/createToken flow)."""
+
+    @pytest.mark.asyncio
+    async def test_refresher_supplies_token_when_expired(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """An expiring token is replaced via the refresher without waiting for the app."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+
+        fresh = WSToken(jwt="fresh_jwt", exp_s=9999999999, endpoint="wss://test/ws")
+        refresher = AsyncMock(return_value=fresh)
+        ws_manager.set_token_refresher(refresher)
+
+        result = await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), timeout=1.0)
+
+        assert result is True
+        assert ws_manager._ws_token is fresh
+        refresher.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refresher_not_called_when_token_valid(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """A valid token is used as-is; the refresher is not consulted."""
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._should_run = True
+
+        refresher = AsyncMock()
+        ws_manager.set_token_refresher(refresher)
+
+        result = await asyncio.wait_for(ws_manager._wait_for_valid_token(buffer_s=60), timeout=1.0)
+
+        assert result is True
+        refresher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_app_tokens_when_refresher_fails(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """When minting fails, app-provided tokens still unblock the wait."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+        ws_manager.set_token_refresher(AsyncMock(return_value=None))
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+    @pytest.mark.asyncio
+    async def test_refresher_exception_does_not_crash_wait(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """A refresher that raises is treated as a failed mint."""
+        expired = ConnectTokens(
+            session_id=str(uuid.uuid4()),
+            ws_token=JWTConnectToken(jwt="expired", exp=1, endpoint="wss://test/ws"),
+        )
+        ws_manager.set_tokens(expired)
+        ws_manager._should_run = True
+        ws_manager.set_token_refresher(AsyncMock(side_effect=RuntimeError("api down")))
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(buffer_s=60))
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+
+class TestTokenRefreshIdleGate:
+    """An expiring token only forces a reconnect once the session goes quiet.
+
+    Swapping the token means dropping and re-establishing the connection, and
+    the Qobuz app pauses a renderer that disappears and comes back mid-track.
+    So the reconnect waits for a lull, matching the StreamCore32 reference.
+    """
+
+    @staticmethod
+    def _set_expiring_token(ws_manager: WsManager) -> None:
+        ws_manager.set_tokens(
+            ConnectTokens(
+                session_id=str(uuid.uuid4()),
+                ws_token=JWTConnectToken(jwt="expiring", exp=1, endpoint="wss://test/ws"),
+            )
+        )
+
+    def test_refresh_deferred_while_session_is_active(self, ws_manager: WsManager) -> None:
+        """A track still streaming keeps sending state, so the reconnect waits."""
+        self._set_expiring_token(ws_manager)
+        ws_manager._last_tx_time = time.monotonic()
+
+        ws_manager._check_token_refresh()
+
+        assert ws_manager._refresh_deferred is True
+
+    def test_refresh_triggered_once_session_is_idle(self, ws_manager: WsManager) -> None:
+        """With nothing sent for the idle period, the reconnect goes ahead."""
+        self._set_expiring_token(ws_manager)
+        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+
+        with pytest.raises(TokenRefreshRequired):
+            ws_manager._check_token_refresh()
+
+    def test_healthy_token_never_triggers_refresh(
+        self, ws_manager: WsManager, valid_tokens: ConnectTokens
+    ) -> None:
+        """An idle connection with a token far from expiry is left alone."""
+        ws_manager.set_tokens(valid_tokens)
+        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+
+        ws_manager._check_token_refresh()
+
+        assert ws_manager._refresh_deferred is False
+
+    @pytest.mark.asyncio
+    async def test_sending_a_message_restarts_the_idle_clock(self, ws_manager: WsManager) -> None:
+        """Any outgoing frame postpones a refresh that was otherwise due."""
+        self._set_expiring_token(ws_manager)
+        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+        ws_manager._ws = AsyncMock()
+        ws_manager._is_connected = True
+
+        assert await ws_manager.send_message(b"state_update") is True
+
+        ws_manager._check_token_refresh()
+
+    def test_deferral_is_logged_only_once(
+        self, ws_manager: WsManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The check runs every second while waiting; it must not spam the log."""
+        self._set_expiring_token(ws_manager)
+        ws_manager._last_tx_time = time.monotonic()
+
+        with caplog.at_level("INFO", logger="qobuz_proxy.connect.ws_manager"):
+            for _ in range(5):
+                ws_manager._check_token_refresh()
+
+        assert sum("deferring refresh" in r.message for r in caplog.records) == 1

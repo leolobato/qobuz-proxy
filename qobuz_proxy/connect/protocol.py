@@ -103,12 +103,22 @@ class ProtocolCodec:
             device_uuid: 16-byte device UUID
         """
         self.device_uuid = device_uuid
+        # Envelope msgId and batch messagesId are independent sequences.
+        # The server validates that envelope msgIds on a connection increase
+        # with only small gaps, so the envelope counter must not be consumed
+        # by anything else.
         self._msg_counter = 0
+        self._batch_counter = 0
 
     def _next_msg_id(self) -> int:
-        """Get next message ID."""
+        """Get next envelope message ID."""
         self._msg_counter += 1
         return self._msg_counter
+
+    def _next_batch_id(self) -> int:
+        """Get next QConnectBatch messagesId."""
+        self._batch_counter += 1
+        return self._batch_counter
 
     def _now_ms(self) -> int:
         """Current time in milliseconds."""
@@ -234,7 +244,7 @@ class ProtocolCodec:
         # Wrap in QConnectBatch
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
@@ -295,7 +305,7 @@ class ProtocolCodec:
         # Wrap in QConnectBatch
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
@@ -319,7 +329,7 @@ class ProtocolCodec:
 
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
@@ -363,7 +373,7 @@ class ProtocolCodec:
 
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
@@ -405,7 +415,7 @@ class ProtocolCodec:
 
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
@@ -439,7 +449,7 @@ class ProtocolCodec:
 
         batch = payload_pb2.QConnectBatch()
         batch.messagesTime = self._now_ms()
-        batch.messagesId = self._next_msg_id()
+        batch.messagesId = self._next_batch_id()
         batch.messages.append(qc_msg)
 
         return self.encode_payload(batch.SerializeToString())
