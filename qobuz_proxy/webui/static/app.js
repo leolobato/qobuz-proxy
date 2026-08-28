@@ -259,6 +259,7 @@
             html += '<label>Description URL (optional)</label>';
             html += '<input type="text" id="edit-dlna-url" value="' + escapeHtml(cfg.description_url || "") + '" placeholder="http://192.168.1.x:1400/xml/device_description.xml">';
             html += '</div>';
+            html += '<div class="form-group"><label><input type="checkbox" id="edit-fixed-vol" style="width:auto;display:inline;margin-right:6px;"' + (cfg.fixed_volume ? ' checked' : '') + '> Fixed volume</label></div>';
         } else if (s.backend === "local") {
             html += '<div class="form-group">';
             html += '<label>Audio Device (leave blank for default)</label>';
@@ -713,6 +714,8 @@
             payload.dlna_ip = ip;
             payload.dlna_port = portEl ? (parseInt(portEl.value) || 1400) : 1400;
             payload.description_url = urlEl ? urlEl.value.trim() : "";
+            var fixedVolEl = document.getElementById("edit-fixed-vol");
+            if (fixedVolEl) payload.fixed_volume = fixedVolEl.checked;
         } else if (backend === "local") {
             var devEl = document.getElementById("edit-audio-device");
             payload.audio_device = devEl ? devEl.value.trim() : "";
