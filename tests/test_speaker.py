@@ -548,6 +548,14 @@ class TestNowPlayingStatus:
         assert "volume" not in status["now_playing"]
         assert status["config"]["fixed_volume"] is True
 
+    def test_local_speaker_ignores_stale_fixed_volume_flag(self):
+        """Fixed volume is a DLNA-only setting; a leftover flag on a local speaker
+        must not hide the volume the proxy does control."""
+        speaker = self._playing_speaker(backend_type="local", dlna_fixed_volume=True)
+        np = speaker.get_status()["now_playing"]
+
+        assert np["volume"] == 50
+
 
 class TestQualitySourceStatus:
     """get_status() must say where the effective quality came from."""

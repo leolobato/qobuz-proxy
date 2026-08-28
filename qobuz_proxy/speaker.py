@@ -136,9 +136,11 @@ class Speaker:
                 "album_art_url": meta.get("artwork_url", ""),
                 "quality": meta.get("quality_name", ""),
             }
-            # With fixed volume the proxy never touches or tracks the renderer's
-            # level, so the cached value is just the initial default — omit it.
-            if not self._config.dlna_fixed_volume:
+            # With fixed volume (a DLNA-only setting) the proxy never touches or
+            # tracks the renderer's level, so the cached value is just the
+            # initial default — omit it.
+            fixed_volume = self._config.backend_type == "dlna" and self._config.dlna_fixed_volume
+            if not fixed_volume:
                 now_playing["volume"] = self._player._volume
 
         # Build config section
