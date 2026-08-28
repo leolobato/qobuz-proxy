@@ -3,6 +3,8 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from qobuz_proxy.app import QobuzProxy
 from qobuz_proxy.config import Config, QobuzConfig, SpeakerConfig
 
@@ -391,6 +393,37 @@ class TestWebUICallbacks:
 
 class TestSpeakerEditCallbacks:
     """Tests for runtime add/edit speaker callbacks from the web UI."""
+
+    async def test_start_speakers_cancelled_mid_start_releases_speakers(self):
+        """Cancellation (shutdown, or a login racing the background token validation)
+        must not leave half-started speakers holding their ports."""
+        config = _make_config(
+            _make_speaker_config("Fast", http_port=8689),
+            _make_speaker_config("Slow", http_port=8690),
+        )
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        slow_started = asyncio.Event()
+
+        async def slow_start():
+            slow_started.set()
+            await asyncio.Event().wait()  # never finishes on its own
+
+        fast = _make_mock_speaker("Fast", starts=True)
+        slow = _make_mock_speaker("Slow", starts=True)
+        slow.start = AsyncMock(side_effect=slow_start)
+
+        with patch("qobuz_proxy.app.Speaker", side_effect=[fast, slow]):
+            task = asyncio.create_task(app._start_speakers())
+            await slow_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        fast.stop.assert_awaited_once()
+        slow.stop.assert_awaited_once()
+        assert app._speakers == []
 
     async def test_edit_persists_config_when_restart_fails(self):
         """Edits must be saved even if the speaker can't start (e.g. device offline)."""

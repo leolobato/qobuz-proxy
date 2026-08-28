@@ -604,7 +604,16 @@ class QobuzProxy:
             for sc in configs
         ]
 
-        results = await asyncio.gather(*[s.start() for s in speakers], return_exceptions=True)
+        tasks = [asyncio.ensure_future(s.start()) for s in speakers]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            # Cancelled mid-start (shutdown, or a web UI login/logout racing the
+            # background token validation): let the starts unwind, then release
+            # whatever came up so a later start doesn't find the ports taken.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*[s.stop() for s in speakers], return_exceptions=True)
+            raise
 
         for sc, speaker, result in zip(configs, speakers, results):
             if isinstance(result, BaseException) or result is False:
