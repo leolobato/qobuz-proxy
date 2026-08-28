@@ -161,6 +161,7 @@
     function renderSpeakerCard(s) {
         var state = (s.status || "idle").toLowerCase();
         var np = s.now_playing;
+        var cfg = s.config || {};
         var isActive = np && (state === "playing" || state === "paused");
 
         var html = '<div class="speaker-card">';
@@ -190,7 +191,11 @@
 
             var meta = [];
             if (np.quality) meta.push(escapeHtml(np.quality));
-            if (np.volume !== undefined) meta.push('Vol ' + np.volume + '%');
+            if (cfg.fixed_volume) {
+                meta.push('Fixed volume');
+            } else if (np.volume !== undefined) {
+                meta.push('Vol ' + np.volume + '%');
+            }
             if (meta.length) {
                 html += '<div class="speaker-meta">' + meta.join(' · ') + '</div>';
             }
@@ -204,7 +209,6 @@
             html += '<div style="flex:1;min-width:0;">';
             html += renderSpeakerHeader(s);
 
-            var cfg = s.config || {};
             var idleParts = [];
             if (s.backend === "dlna" && cfg.dlna_ip) {
                 idleParts.push(escapeHtml(cfg.dlna_ip + ':' + (cfg.dlna_port || 1400)));

@@ -135,8 +135,11 @@ class Speaker:
                 "album": meta.get("album", ""),
                 "album_art_url": meta.get("artwork_url", ""),
                 "quality": meta.get("quality_name", ""),
-                "volume": self._player._volume,
             }
+            # With fixed volume the proxy never touches or tracks the renderer's
+            # level, so the cached value is just the initial default — omit it.
+            if not self._config.dlna_fixed_volume:
+                now_playing["volume"] = self._player._volume
 
         # Build config section
         config_dict: dict = {

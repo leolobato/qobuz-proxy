@@ -516,6 +516,39 @@ class TestSpeakerStateReport:
         await speaker._send_state_report(report)
 
 
+class TestNowPlayingStatus:
+    """get_status() must not report a volume the proxy doesn't control."""
+
+    @staticmethod
+    def _playing_speaker(**config_kwargs) -> Speaker:
+        from qobuz_proxy.backends import PlaybackState
+
+        config = _make_speaker_config(**config_kwargs)
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        speaker._is_running = True
+
+        player = MagicMock()
+        player.state = PlaybackState.PLAYING
+        player.current_track.metadata = {"title": "Song", "quality_name": "FLAC Hi-Res"}
+        player._volume = 50  # Initial default — never updated in fixed-volume mode
+        speaker._player = player
+        return speaker
+
+    def test_reports_volume_when_proxy_controls_it(self):
+        speaker = self._playing_speaker(dlna_fixed_volume=False)
+        np = speaker.get_status()["now_playing"]
+
+        assert np["title"] == "Song"
+        assert np["volume"] == 50
+
+    def test_omits_volume_for_fixed_volume_speaker(self):
+        speaker = self._playing_speaker(dlna_fixed_volume=True)
+        status = speaker.get_status()
+
+        assert "volume" not in status["now_playing"]
+        assert status["config"]["fixed_volume"] is True
+
+
 class TestQualitySourceStatus:
     """get_status() must say where the effective quality came from."""
 
