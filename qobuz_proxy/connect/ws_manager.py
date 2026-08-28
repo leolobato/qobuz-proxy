@@ -26,7 +26,9 @@ PING_INTERVAL = 10.0  # seconds
 PONG_TIMEOUT = 30.0  # seconds
 RECV_TIMEOUT = 1.0  # seconds (for periodic checks)
 TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
-TOKEN_REFRESH_IDLE_PERIOD = 60.0  # seconds without a send before a refresh reconnect
+TOKEN_REFRESH_IDLE_PERIOD = (
+    60.0  # seconds of quiet (no send, no command) before a refresh reconnect
+)
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
@@ -85,7 +87,7 @@ class WsManager:
 
         # Serializes encode+send so msgIds hit the wire in increasing order
         self._send_lock = asyncio.Lock()
-        self._last_tx_time = time.monotonic()
+        self._last_activity_time = time.monotonic()
         self._refresh_deferred = False
 
         # Tasks
@@ -229,7 +231,7 @@ class WsManager:
                 return False
             try:
                 await self._ws.send(encode())
-                self._last_tx_time = time.monotonic()
+                self._last_activity_time = time.monotonic()
                 return True
             except Exception as e:
                 logger.error(f"Failed to send message: {e}")
@@ -431,7 +433,7 @@ class WsManager:
 
                 self._is_connected = True
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
-                self._last_tx_time = time.monotonic()
+                self._last_activity_time = time.monotonic()
                 self._refresh_deferred = False
                 logger.info("Connected and authenticated")
 
@@ -511,14 +513,17 @@ class WsManager:
         mid-track. So an expiring token only triggers the reconnect after the
         session has gone quiet, matching the StreamCore32 reference, which
         gates the same reconnect on 60s without a transmission (its player
-        heartbeat keeps sending while a track is loaded). If the session never
-        goes quiet the token lapses and the server closes the connection; the
-        reconnect that follows mints a fresh token.
+        heartbeat keeps sending while a track is loaded). Inbound commands
+        count as activity too: a play command after a quiet spell means the
+        session is about to get busy, and the reconnect must not land while the
+        track is still loading and nothing has been sent yet. If the session
+        never goes quiet the token lapses and the server closes the connection;
+        the reconnect that follows mints a fresh token.
         """
         if not (self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER)):
             return
 
-        if time.monotonic() - self._last_tx_time < TOKEN_REFRESH_IDLE_PERIOD:
+        if time.monotonic() - self._last_activity_time < TOKEN_REFRESH_IDLE_PERIOD:
             if not self._refresh_deferred:
                 logger.info("Token expiring soon, deferring refresh until the session is idle")
                 self._refresh_deferred = True
@@ -554,6 +559,7 @@ class WsManager:
             msg_type = msg.messageType
             handler = self._handlers.get(msg_type)
             if handler:
+                self._last_activity_time = time.monotonic()
                 try:
                     handler(msg_type, msg)
                 except Exception as e:

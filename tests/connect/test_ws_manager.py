@@ -409,7 +409,7 @@ class TestTokenRefreshIdleGate:
     def test_refresh_deferred_while_session_is_active(self, ws_manager: WsManager) -> None:
         """A track still streaming keeps sending state, so the reconnect waits."""
         self._set_expiring_token(ws_manager)
-        ws_manager._last_tx_time = time.monotonic()
+        ws_manager._last_activity_time = time.monotonic()
 
         ws_manager._check_token_refresh()
 
@@ -418,7 +418,7 @@ class TestTokenRefreshIdleGate:
     def test_refresh_triggered_once_session_is_idle(self, ws_manager: WsManager) -> None:
         """With nothing sent for the idle period, the reconnect goes ahead."""
         self._set_expiring_token(ws_manager)
-        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+        ws_manager._last_activity_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
 
         with pytest.raises(TokenRefreshRequired):
             ws_manager._check_token_refresh()
@@ -428,7 +428,7 @@ class TestTokenRefreshIdleGate:
     ) -> None:
         """An idle connection with a token far from expiry is left alone."""
         ws_manager.set_tokens(valid_tokens)
-        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+        ws_manager._last_activity_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
 
         ws_manager._check_token_refresh()
 
@@ -438,7 +438,7 @@ class TestTokenRefreshIdleGate:
     async def test_sending_a_message_restarts_the_idle_clock(self, ws_manager: WsManager) -> None:
         """Any outgoing frame postpones a refresh that was otherwise due."""
         self._set_expiring_token(ws_manager)
-        ws_manager._last_tx_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+        ws_manager._last_activity_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
         ws_manager._ws = AsyncMock()
         ws_manager._is_connected = True
 
@@ -446,12 +446,27 @@ class TestTokenRefreshIdleGate:
 
         ws_manager._check_token_refresh()
 
+    @pytest.mark.asyncio
+    async def test_inbound_command_restarts_the_idle_clock(self, ws_manager: WsManager) -> None:
+        """A play command after a quiet spell means the session is about to get busy;
+        the reconnect must not land while the track is still loading."""
+        self._set_expiring_token(ws_manager)
+        ws_manager._last_activity_time = time.monotonic() - TOKEN_REFRESH_IDLE_PERIOD - 1
+        ws_manager.register_handler(41, MagicMock())  # SET_STATE
+        batch = MagicMock()
+        batch.messages = [MagicMock(messageType=41)]
+        ws_manager._codec.decode_qconnect_batch = MagicMock(return_value=batch)
+
+        await ws_manager._handle_payload(MagicMock(payload=b"frame"))
+
+        ws_manager._check_token_refresh()  # raises TokenRefreshRequired if still idle
+
     def test_deferral_is_logged_only_once(
         self, ws_manager: WsManager, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The check runs every second while waiting; it must not spam the log."""
         self._set_expiring_token(ws_manager)
-        ws_manager._last_tx_time = time.monotonic()
+        ws_manager._last_activity_time = time.monotonic()
 
         with caplog.at_level("INFO", logger="qobuz_proxy.connect.ws_manager"):
             for _ in range(5):
