@@ -1,5 +1,6 @@
 """Integration tests for QobuzProxy OAuth auth startup flow."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 from qobuz_proxy.app import QobuzProxy
@@ -203,6 +204,44 @@ class TestStartupTransientAuthErrors:
                 assert task is not None
 
                 await app._on_auth_token("999", "new_tok")
+
+                assert task.cancelled()
+                assert app._auth_retry_task is None
+                assert app._auth_state["authenticated"] is True
+                assert app._api_client is not None
+                assert app._api_client.user_auth_token == "new_tok"
+                assert mock_login.await_count == 1
+                mock_start.assert_awaited_once()
+            finally:
+                await app.stop()
+
+    async def test_web_ui_login_during_initial_validation_wins(self):
+        """A login submitted while the very first validation is still waiting on
+        Qobuz must not be overwritten when that validation completes later."""
+        app = QobuzProxy(_make_config())
+        validation_started = asyncio.Event()
+
+        async def slow_login(**_kwargs):
+            validation_started.set()
+            await asyncio.Event().wait()  # Qobuz never answers
+
+        load, delays, steady, login = self._start_patches(slow_login)
+        with (
+            load,
+            delays,
+            steady,
+            login as mock_login,
+            patch("qobuz_proxy.app.save_user_token"),
+            patch.object(app, "_start_speakers", new_callable=AsyncMock) as mock_start,
+        ):
+            try:
+                start_task = asyncio.create_task(app.start())
+                await validation_started.wait()
+                task = app._auth_retry_task
+                assert task is not None
+
+                await app._on_auth_token("999", "new_tok")
+                await start_task
 
                 assert task.cancelled()
                 assert app._auth_retry_task is None

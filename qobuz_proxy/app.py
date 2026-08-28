@@ -71,8 +71,8 @@ class QobuzProxy:
         self._api_client: Optional[QobuzAPIClient] = None
         self._app_id: str = ""
         self._app_secret: str = ""
-        # Background task validating the saved token after a transient
-        # failure at startup. Also keeps a strong reference to the task.
+        # Task validating the saved token at startup (first attempt and any
+        # retries). Also keeps a strong reference to the task.
         self._auth_retry_task: Optional[asyncio.Task[None]] = None
 
         # Auth state — shared with the web UI status endpoint via _web_app["auth_state"].
@@ -118,21 +118,14 @@ class QobuzProxy:
             auth_token = token_info["user_auth_token"]
             email = token_info.get("email", "")
 
-            try:
-                valid = await self._authenticate(user_id, auth_token)
-            except TransientAuthError as e:
-                logger.warning(
-                    f"Could not reach Qobuz to validate the saved token ({e}) — "
-                    f"retrying in background, next attempt in {AUTH_RETRY_DELAYS_SECONDS[0]:.0f}s"
-                )
-                self._auth_retry_task = asyncio.create_task(
-                    self._retry_authenticate(user_id, auth_token, email)
-                )
-            else:
-                if valid:
-                    await self._activate_auth(user_id, email)
-                else:
-                    logger.warning("Cached/config token is invalid — waiting for auth via web UI")
+            # Validation runs in a tracked task from the very first attempt so a
+            # web UI login can supersede it at any point (see _cancel_auth_retry).
+            # start() only waits for that first attempt to be handled.
+            first_attempt_done = asyncio.Event()
+            self._auth_retry_task = asyncio.create_task(
+                self._validate_saved_token(user_id, auth_token, email, first_attempt_done)
+            )
+            await first_attempt_done.wait()
 
         if not self._auth_state["authenticated"]:
             port = self._config.server.http_port
@@ -235,13 +228,21 @@ class QobuzProxy:
         self._auth_state["authenticated"] = True
         await self._start_speakers()
 
-    async def _retry_authenticate(self, user_id: str, auth_token: str, email: str) -> None:
-        """Keep validating the saved token with backoff until Qobuz answers.
+    async def _validate_saved_token(
+        self,
+        user_id: str,
+        auth_token: str,
+        email: str,
+        first_attempt_done: asyncio.Event,
+    ) -> None:
+        """Validate the saved token, retrying with backoff while Qobuz is unreachable.
 
-        Runs in the background after a transient failure at startup so the
-        proxy comes up on its own once the network is reachable. Stops on the
-        first definitive answer from Qobuz, or when the user authenticates via
-        the web UI (or logs out) in the meantime.
+        The first attempt runs immediately and `first_attempt_done` is set once
+        its outcome has been handled, so `start()` can return without waiting on
+        retries. Those continue in the background so the proxy comes up on its
+        own once the network is reachable. Stops on the first definitive answer
+        from Qobuz, or when the user authenticates via the web UI (or logs out)
+        in the meantime.
         """
 
         def retry_delay(attempt: int) -> float:
@@ -252,32 +253,37 @@ class QobuzProxy:
         attempt = 0
         try:
             while True:
-                await asyncio.sleep(retry_delay(attempt))
-                attempt += 1
-
                 if self._auth_state["authenticated"]:
                     return  # Web UI login happened in the meantime
 
                 try:
                     valid = await self._authenticate(user_id, auth_token)
                 except TransientAuthError as e:
-                    logger.warning(
-                        f"Still unable to reach Qobuz to validate the saved token "
-                        f"(attempt {attempt}: {e}) — next attempt in {retry_delay(attempt):.0f}s"
-                    )
+                    delay = retry_delay(attempt)
+                    if attempt == 0:
+                        logger.warning(
+                            f"Could not reach Qobuz to validate the saved token ({e}) — "
+                            f"retrying in background, next attempt in {delay:.0f}s"
+                        )
+                    else:
+                        logger.warning(
+                            f"Still unable to reach Qobuz to validate the saved token "
+                            f"(attempt {attempt + 1}: {e}) — next attempt in {delay:.0f}s"
+                        )
+                    first_attempt_done.set()
+                    await asyncio.sleep(delay)
+                    attempt += 1
                     continue
 
                 if valid:
-                    logger.info(f"Saved token validated after {attempt} retry attempt(s)")
+                    if attempt:
+                        logger.info(f"Saved token validated after {attempt} retry attempt(s)")
                     await self._activate_auth(user_id, email)
                 else:
-                    port = self._config.server.http_port
-                    logger.warning(
-                        f"Cached/config token is invalid — visit http://localhost:{port} "
-                        "to authenticate"
-                    )
+                    logger.warning("Cached/config token is invalid — waiting for auth via web UI")
                 return
         finally:
+            first_attempt_done.set()
             if self._auth_retry_task is asyncio.current_task():
                 self._auth_retry_task = None
 
