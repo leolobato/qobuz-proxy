@@ -1,7 +1,9 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from qobuz_proxy.auth.api_client import QobuzAPIClient
+from qobuz_proxy.auth.exceptions import TransientAuthError
 
 
 class TestLoginWithToken:
@@ -57,16 +59,31 @@ class TestLoginWithToken:
         assert result is False
         assert client.user_auth_token is None
 
-    async def test_login_exception_returns_false(self):
+    async def test_login_network_error_raises_transient_auth_error(self):
+        """A timeout/connection error means "unknown", not "bad token" — the
+        caller (QobuzProxy._authenticate) needs to distinguish the two to
+        retry instead of demanding a fresh manual login."""
         client = QobuzAPIClient("app123", "secret456")
 
         with patch(
             "qobuz_proxy.auth.api_client.aiohttp.ClientSession",
             side_effect=Exception("network error"),
         ):
-            result = await client.login_with_token("999", "token")
+            with pytest.raises(TransientAuthError):
+                await client.login_with_token("999", "token")
 
-        assert result is False
+        assert client.user_auth_token is None
+
+    async def test_login_server_error_raises_transient_auth_error(self):
+        client = QobuzAPIClient("app123", "secret456")
+
+        mock_session = _make_mock_session(503, text_body="Service Unavailable")
+
+        with patch("qobuz_proxy.auth.api_client.aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(TransientAuthError):
+                await client.login_with_token("999", "token")
+
+        assert client.user_auth_token is None
 
 
 def _make_mock_session(status: int, json_body: dict | None = None, text_body: str = ""):

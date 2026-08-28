@@ -10,7 +10,7 @@ from .credentials import (
     load_user_token,
     save_user_token,
 )
-from .exceptions import AuthenticationError
+from .exceptions import AuthenticationError, TransientAuthError
 from .tokens import QobuzToken, WSToken
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "QobuzAPIClient",
     "QobuzAPIError",
     "AuthenticationError",
+    "TransientAuthError",
     "QobuzToken",
     "WSToken",
 ]
