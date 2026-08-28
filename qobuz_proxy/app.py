@@ -7,6 +7,7 @@ web UI even before a valid Qobuz token is available.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -42,11 +43,12 @@ logger = logging.getLogger(__name__)
 SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
 SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 
-# Backoff for token validation at startup. Qobuz's login endpoint can be slow
-# or briefly unreachable (e.g. network not fully up yet right after boot);
-# without this a single 10s timeout looked identical to a genuinely bad
-# token and required a manual re-auth via the web UI.
-AUTH_RETRY_DELAYS_SECONDS: tuple[float, ...] = (3.0, 8.0)
+# Backoff for validating the saved token at startup. Qobuz's login endpoint
+# can be slow or unreachable while the network is still coming up (Docker
+# starting before DNS on a NAS/Pi). Retries run in the background so the
+# proxy recovers on its own instead of waiting for a manual re-login.
+AUTH_RETRY_DELAYS_SECONDS: tuple[float, ...] = (3.0, 8.0, 20.0, 40.0, 60.0)
+AUTH_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 
 
 class QobuzProxy:
@@ -69,6 +71,9 @@ class QobuzProxy:
         self._api_client: Optional[QobuzAPIClient] = None
         self._app_id: str = ""
         self._app_secret: str = ""
+        # Background task validating the saved token after a transient
+        # failure at startup. Also keeps a strong reference to the task.
+        self._auth_retry_task: Optional[asyncio.Task[None]] = None
 
         # Auth state — shared with the web UI status endpoint via _web_app["auth_state"].
         # Always the *same* dict object so route handlers see live updates.
@@ -113,17 +118,31 @@ class QobuzProxy:
             auth_token = token_info["user_auth_token"]
             email = token_info.get("email", "")
 
-            if await self._authenticate(user_id, auth_token):
-                self._auth_state["user_id"] = user_id
-                self._auth_state["email"] = email
-                self._auth_state["authenticated"] = True
-                await self._start_speakers()
+            try:
+                valid = await self._authenticate(user_id, auth_token)
+            except TransientAuthError as e:
+                logger.warning(
+                    f"Could not reach Qobuz to validate the saved token ({e}) — "
+                    f"retrying in background, next attempt in {AUTH_RETRY_DELAYS_SECONDS[0]:.0f}s"
+                )
+                self._auth_retry_task = asyncio.create_task(
+                    self._retry_authenticate(user_id, auth_token, email)
+                )
             else:
-                logger.warning("Cached/config token is invalid — waiting for auth via web UI")
+                if valid:
+                    await self._activate_auth(user_id, email)
+                else:
+                    logger.warning("Cached/config token is invalid — waiting for auth via web UI")
 
         if not self._auth_state["authenticated"]:
             port = self._config.server.http_port
-            logger.info(f"No valid credentials — visit http://localhost:{port} to authenticate")
+            if self._auth_retry_task is not None:
+                logger.info(
+                    f"Saved token not validated yet — will keep trying; "
+                    f"or re-authenticate at http://localhost:{port}"
+                )
+            else:
+                logger.info(f"No valid credentials — visit http://localhost:{port} to authenticate")
 
         self._is_running = True
 
@@ -133,6 +152,7 @@ class QobuzProxy:
             return
 
         self._is_running = False
+        await self._cancel_auth_retry()
         await self._stop_speakers()
         await self._stop_web_server()
         logger.info("qobuz-proxy stopped")
@@ -186,35 +206,90 @@ class QobuzProxy:
     # ------------------------------------------------------------------
 
     async def _authenticate(self, user_id: str, auth_token: str) -> bool:
-        """Validate credentials against the Qobuz API. Returns True on success."""
+        """Validate credentials against the Qobuz API.
+
+        Returns True when Qobuz accepted the token (the API client is installed),
+        False when Qobuz rejected it. Raises TransientAuthError when Qobuz could
+        not be reached, so callers can retry instead of treating the token as bad.
+        """
         if not self._app_id:
             logger.error("Cannot authenticate — app credentials not available")
             return False
 
-        self._api_client = QobuzAPIClient(self._app_id, self._app_secret)
+        # Install the client only on success so an in-flight validation can't
+        # clobber a client set up by a concurrent web UI login.
+        client = QobuzAPIClient(self._app_id, self._app_secret)
         logger.info(f"Authenticating user {user_id}...")
+        if await client.login_with_token(user_id=user_id, auth_token=auth_token):
+            logger.info("Authentication successful")
+            self._api_client = client
+            return True
 
-        max_attempts = len(AUTH_RETRY_DELAYS_SECONDS) + 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if await self._api_client.login_with_token(user_id=user_id, auth_token=auth_token):
-                    logger.info("Authentication successful")
-                    return True
-                break  # definitive HTTP 401/403 — retrying won't help
-            except TransientAuthError as e:
-                if attempt == max_attempts:
-                    logger.warning(f"Token validation still failing after {attempt} attempts: {e}")
-                    break
-                delay = AUTH_RETRY_DELAYS_SECONDS[attempt - 1]
-                logger.warning(
-                    f"Token validation attempt {attempt} failed transiently ({e}); "
-                    f"retrying in {delay:.0f}s"
-                )
-                await asyncio.sleep(delay)
-
-        logger.warning("Authentication failed — invalid credentials")
-        self._api_client = None
+        logger.warning("Authentication failed — Qobuz rejected the saved token")
         return False
+
+    async def _activate_auth(self, user_id: str, email: str) -> None:
+        """Publish the validated identity to the web UI and bring the speakers up."""
+        self._auth_state["user_id"] = user_id
+        self._auth_state["email"] = email
+        self._auth_state["authenticated"] = True
+        await self._start_speakers()
+
+    async def _retry_authenticate(self, user_id: str, auth_token: str, email: str) -> None:
+        """Keep validating the saved token with backoff until Qobuz answers.
+
+        Runs in the background after a transient failure at startup so the
+        proxy comes up on its own once the network is reachable. Stops on the
+        first definitive answer from Qobuz, or when the user authenticates via
+        the web UI (or logs out) in the meantime.
+        """
+
+        def retry_delay(attempt: int) -> float:
+            if attempt < len(AUTH_RETRY_DELAYS_SECONDS):
+                return AUTH_RETRY_DELAYS_SECONDS[attempt]
+            return AUTH_RETRY_STEADY_DELAY_SECONDS
+
+        attempt = 0
+        try:
+            while True:
+                await asyncio.sleep(retry_delay(attempt))
+                attempt += 1
+
+                if self._auth_state["authenticated"]:
+                    return  # Web UI login happened in the meantime
+
+                try:
+                    valid = await self._authenticate(user_id, auth_token)
+                except TransientAuthError as e:
+                    logger.warning(
+                        f"Still unable to reach Qobuz to validate the saved token "
+                        f"(attempt {attempt}: {e}) — next attempt in {retry_delay(attempt):.0f}s"
+                    )
+                    continue
+
+                if valid:
+                    logger.info(f"Saved token validated after {attempt} retry attempt(s)")
+                    await self._activate_auth(user_id, email)
+                else:
+                    port = self._config.server.http_port
+                    logger.warning(
+                        f"Cached/config token is invalid — visit http://localhost:{port} "
+                        "to authenticate"
+                    )
+                return
+        finally:
+            if self._auth_retry_task is asyncio.current_task():
+                self._auth_retry_task = None
+
+    async def _cancel_auth_retry(self) -> None:
+        """Stop the background token validation (web UI login, logout, shutdown)."""
+        task = self._auth_retry_task
+        self._auth_retry_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     # ------------------------------------------------------------------
     # Web UI callbacks
@@ -234,6 +309,9 @@ class QobuzProxy:
         """
         if profile is None:
             profile = {}
+
+        # A fresh login supersedes any pending validation of the old saved token
+        await self._cancel_auth_retry()
 
         # Set up API client directly — token is pre-validated by OAuth
         # and scoped to OAUTH_APP_ID which we use for all requests.
@@ -264,6 +342,7 @@ class QobuzProxy:
     async def _on_logout(self) -> None:
         """Called by the web UI when the user requests logout."""
         logger.info("Logout requested — stopping speakers and clearing token")
+        await self._cancel_auth_retry()
         await self._stop_speakers()
 
         self._auth_state["authenticated"] = False

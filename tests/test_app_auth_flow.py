@@ -80,8 +80,8 @@ class TestStartupWithCachedToken:
                 await app.stop()
 
 
-class TestAuthenticateRetriesTransientErrors:
-    """Regression tests for the missing retry on token validation at startup.
+class TestStartupTransientAuthErrors:
+    """Regression tests for startup token validation when Qobuz is unreachable.
 
     Previously, any exception from login_with_token (timeouts included —
     asyncio.TimeoutError stringifies to '') was indistinguishable from a
@@ -89,71 +89,169 @@ class TestAuthenticateRetriesTransientErrors:
     permanently required a manual re-auth via the web UI.
     """
 
-    async def test_retries_and_succeeds_after_transient_errors(self):
-        config = _make_config()
-        app = QobuzProxy(config)
-        # Normally set by start() (step 2, before auto-auth); tests call
-        # _authenticate() directly so it needs setting explicitly.
-        app._app_id = "test_app_id"
-        app._app_secret = "test_app_secret"
-        with (
-            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+    def _start_patches(self, login_side_effect, delays=(0.0,)):
+        return (
             patch(
-                "qobuz_proxy.app.QobuzAPIClient.login_with_token",
-                new_callable=AsyncMock,
-                side_effect=[
-                    TransientAuthError("timeout"),
-                    TransientAuthError("timeout"),
-                    True,
-                ],
+                "qobuz_proxy.app.load_user_token",
+                return_value={"user_id": "999", "user_auth_token": "tok", "email": "a@b.c"},
             ),
-        ):
-            result = await app._authenticate("999", "tok")
-
-        assert result is True
-        assert mock_sleep.await_count == 2
-
-    async def test_gives_up_after_max_attempts_of_transient_errors(self):
-        config = _make_config()
-        app = QobuzProxy(config)
-        app._app_id = "test_app_id"
-        app._app_secret = "test_app_secret"
-        with (
-            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock),
+            patch("qobuz_proxy.app.AUTH_RETRY_DELAYS_SECONDS", delays),
+            patch("qobuz_proxy.app.AUTH_RETRY_STEADY_DELAY_SECONDS", delays[-1]),
             patch(
                 "qobuz_proxy.app.QobuzAPIClient.login_with_token",
                 new_callable=AsyncMock,
-                side_effect=TransientAuthError("timeout"),
-            ) as mock_login,
+                side_effect=login_side_effect,
+            ),
+        )
+
+    async def test_retries_in_background_until_qobuz_answers(self):
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches(
+            [TransientAuthError("timeout"), TransientAuthError("timeout"), True]
+        )
+        with (
+            load,
+            delays,
+            steady,
+            login as mock_login,
+            patch.object(app, "_start_speakers", new_callable=AsyncMock) as mock_start,
         ):
-            result = await app._authenticate("999", "tok")
+            try:
+                await app.start()
 
-        assert result is False
-        assert app._api_client is None
-        assert mock_login.await_count == 3  # 1 initial + 2 retries
+                # Startup completes without blocking on the retries
+                assert app._auth_state["authenticated"] is False
+                assert app._auth_retry_task is not None
+                mock_start.assert_not_awaited()
 
-    async def test_does_not_retry_on_definitive_bad_token(self):
+                await app._auth_retry_task
+
+                assert app._auth_state["authenticated"] is True
+                assert app._auth_state["user_id"] == "999"
+                assert app._auth_state["email"] == "a@b.c"
+                assert app._api_client is not None
+                assert mock_login.await_count == 3
+                mock_start.assert_awaited_once()
+                assert app._auth_retry_task is None
+            finally:
+                await app.stop()
+
+    async def test_background_retry_stops_when_qobuz_rejects_token(self):
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches([TransientAuthError("timeout"), False])
+        with (
+            load,
+            delays,
+            steady,
+            login as mock_login,
+            patch.object(app, "_start_speakers", new_callable=AsyncMock) as mock_start,
+        ):
+            try:
+                await app.start()
+                task = app._auth_retry_task
+                assert task is not None
+                await task
+
+                assert app._auth_state["authenticated"] is False
+                assert app._api_client is None
+                assert app._auth_retry_task is None
+                assert mock_login.await_count == 2
+                mock_start.assert_not_awaited()
+            finally:
+                await app.stop()
+
+    async def test_rejected_token_at_startup_does_not_retry(self):
         """A real 401/403 (login_with_token returns False) should fail fast —
         no point retrying a token that's actually invalid."""
-        config = _make_config()
-        app = QobuzProxy(config)
-        # Normally set by start() (step 2, before auto-auth); tests call
-        # _authenticate() directly so it needs setting explicitly.
-        app._app_id = "test_app_id"
-        app._app_secret = "test_app_secret"
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches([False])
         with (
-            patch("qobuz_proxy.app.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
-            patch(
-                "qobuz_proxy.app.QobuzAPIClient.login_with_token",
-                new_callable=AsyncMock,
-                return_value=False,
-            ) as mock_login,
+            load,
+            delays,
+            steady,
+            login as mock_login,
+            patch.object(app, "_start_speakers", new_callable=AsyncMock),
         ):
-            result = await app._authenticate("999", "bad_tok")
+            try:
+                await app.start()
 
-        assert result is False
-        assert mock_login.await_count == 1
-        mock_sleep.assert_not_awaited()
+                assert app._auth_state["authenticated"] is False
+                assert app._auth_retry_task is None
+                assert app._api_client is None
+                assert mock_login.await_count == 1
+            finally:
+                await app.stop()
+
+    async def test_web_ui_login_cancels_background_retry(self):
+        """A fresh login supersedes the pending validation of the old saved
+        token, so a late result from the retry can't clobber the new client."""
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches(
+            TransientAuthError("timeout"), delays=(60.0,)
+        )
+        with (
+            load,
+            delays,
+            steady,
+            login as mock_login,
+            patch("qobuz_proxy.app.save_user_token"),
+            patch.object(app, "_start_speakers", new_callable=AsyncMock) as mock_start,
+        ):
+            try:
+                await app.start()
+                task = app._auth_retry_task
+                assert task is not None
+
+                await app._on_auth_token("999", "new_tok")
+
+                assert task.cancelled()
+                assert app._auth_retry_task is None
+                assert app._auth_state["authenticated"] is True
+                assert app._api_client is not None
+                assert app._api_client.user_auth_token == "new_tok"
+                assert mock_login.await_count == 1
+                mock_start.assert_awaited_once()
+            finally:
+                await app.stop()
+
+    async def test_logout_cancels_background_retry(self):
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches(
+            TransientAuthError("timeout"), delays=(60.0,)
+        )
+        with (
+            load,
+            delays,
+            steady,
+            login,
+            patch("qobuz_proxy.app.clear_user_token"),
+        ):
+            try:
+                await app.start()
+                task = app._auth_retry_task
+                assert task is not None
+
+                await app._on_logout()
+
+                assert task.cancelled()
+                assert app._auth_retry_task is None
+            finally:
+                await app.stop()
+
+    async def test_stop_cancels_background_retry(self):
+        app = QobuzProxy(_make_config())
+        load, delays, steady, login = self._start_patches(
+            TransientAuthError("timeout"), delays=(60.0,)
+        )
+        with load, delays, steady, login:
+            await app.start()
+            task = app._auth_retry_task
+            assert task is not None
+
+            await app.stop()
+
+            assert task.cancelled()
+            assert app._auth_retry_task is None
 
 
 class TestWebUIAuthCallback:
