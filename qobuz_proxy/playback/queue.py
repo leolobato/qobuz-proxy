@@ -273,7 +273,13 @@ class QobuzQueue:
                 break
 
         if track_index is None:
-            logger.warning(f"Queue item {queue_item_id} not found")
+            if not self._tracks:
+                # Renderers never receive the queue itself — only the current
+                # and next items via SET_STATE — so an empty queue is the
+                # normal case, not a desync worth warning about.
+                logger.debug(f"Queue item {queue_item_id} not found (queue not loaded)")
+            else:
+                logger.warning(f"Queue item {queue_item_id} not found")
             return False
 
         # Find position in shuffled order

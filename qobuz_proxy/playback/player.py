@@ -47,6 +47,12 @@ _PAUSED_STOP_CONFIRMATIONS = 3
 # (renderer ahead of server) at which we suppress.
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 
+# When the track we advance to cannot be played (Qobuz reports it "Not
+# available" in the user's region), we report it as loading and wait for the
+# server's SET_STATE naming the item after it. If that never arrives, stop
+# rather than sit in LOADING forever.
+_UNAVAILABLE_SKIP_TIMEOUT_S = 10.0
+
 
 class QobuzPlayer:
     """
@@ -127,6 +133,11 @@ class QobuzPlayer:
         self._transition_generation: int = 0
         self._gapless_arm_lock: asyncio.Lock = asyncio.Lock()
 
+        # Unplayable-track skip: the track we are waiting to skip past, and the
+        # timeout that gives up if the server never names its successor.
+        self._skip_pending_track: Optional[QueueTrack] = None
+        self._skip_timeout_task: Optional[asyncio.Task] = None
+
         # Callback for next track info changes (from command handler)
         self._on_next_track_changed_callback: Optional[Callable[[], None]] = None
 
@@ -174,6 +185,7 @@ class QobuzPlayer:
     async def stop(self) -> None:
         """Stop the player and clean up."""
         self._is_running = False
+        self._clear_skip_pending()
 
         # Cancel background tasks
         for task in [self._playback_monitor_task, self._state_update_task]:
@@ -336,8 +348,13 @@ class QobuzPlayer:
             True if seek successful, False if rejected (no track loaded)
         """
         # Reject if no track loaded
-        if self._state == PlaybackState.STOPPED or not self._current_track:
+        if not self._current_track:
             logger.warning("Cannot seek: no track loaded")
+            return False
+        if self._state in (PlaybackState.STOPPED, PlaybackState.LOADING):
+            # Nothing is playing on the backend yet; the caller applies the
+            # start position when it issues play.
+            logger.debug(f"Seek to {position_ms}ms ignored: track not started ({self._state.name})")
             return False
 
         # Get track duration
@@ -441,14 +458,37 @@ class QobuzPlayer:
             # state (position or context) with its outdated values.
             stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
 
+            if self._skip_pending_track is not None and track_id is None:
+                logger.debug("Ignoring SET_STATE without a queue item while skipping a track")
+                return
+
             # Load if a track is specified and differs from the loaded one.
             if track_id is not None:
                 cur = self._current_track
+                if cur is not None and cur is self._skip_pending_track and cur.track_id == track_id:
+                    # The server acknowledged the unplayable item we reported as
+                    # current; its nextQueueItem (already stored by the command
+                    # handler) is where playback continues.
+                    await self._skip_past_unplayable_locked()
+                    return
                 if cur is None or cur.track_id != track_id:
                     logger.info(f"Loading new track: {track_id}")
                     if not await self._load_track_locked(
-                        queue_item_id or 0, track_id, context_uuid
+                        queue_item_id or 0,
+                        track_id,
+                        context_uuid,
+                        for_playback=playing_state == 2,
                     ):
+                        failed = self._current_track
+                        if (
+                            playing_state == 2
+                            and failed is not None
+                            and failed.streaming_url is None
+                        ):
+                            # Asked to play a track that cannot be fetched (e.g.
+                            # "Not available" in this region): skip it as the
+                            # official app does.
+                            await self._skip_past_unplayable_locked()
                         return
                 elif (
                     not stale
@@ -721,6 +761,7 @@ class QobuzPlayer:
     async def _stop_playback_locked(self) -> None:
         # Clear gapless state — explicit stop
         self._clear_gapless_state()
+        self._clear_skip_pending()
 
         await self.backend.stop()
 
@@ -762,17 +803,28 @@ class QobuzPlayer:
         queue_item_id: int,
         track_id: str,
         context_uuid: Optional[bytes] = None,
+        *,
+        for_playback: bool = False,
     ) -> bool:
+        """Replace the current track and pre-fetch its URL and metadata.
+
+        ``for_playback`` says the caller starts playback right after. The player
+        then sits in LOADING rather than STOPPED for the load. LOADING is
+        reported as PLAYING + BUFFERING, so a track change never reaches the
+        app as "the renderer stopped" — which the app answered with a PAUSED
+        SET_STATE, leaving a manual skip on a paused track (GitHub #22).
+        """
         logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
+        self._clear_skip_pending()
 
         # Stop current playback if playing
         if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
             await self.backend.stop()
-            self._state = PlaybackState.STOPPED
             # End the outgoing track's play report now that it's being replaced.
             # Pause no longer ends the session, so a load-only track change (no
             # immediate play) would otherwise leave the previous play unreported.
             await self._report_stopped()
+        self._state = PlaybackState.LOADING if for_playback else PlaybackState.STOPPED
 
         # Create track object. The context UUID identifies the album/playlist the
         # track is played from and is required for Qobuz listening history /
@@ -782,6 +834,12 @@ class QobuzPlayer:
             track_id=track_id,
             context_uuid=context_uuid,
         )
+        # A fresh track starts at 0 (callers starting elsewhere set the position
+        # after loading) and its duration is unknown until metadata arrives.
+        # Without this a report sent during the load shows the new item at the
+        # old track's position and length.
+        self._set_position(0)
+        self._current_duration_ms = 0
 
         # Pre-fetch URL and metadata
         try:
@@ -790,6 +848,7 @@ class QobuzPlayer:
                 self._current_track.set_streaming_url(url)
             else:
                 logger.error(f"Failed to get URL for track {track_id}")
+                self._state = PlaybackState.STOPPED
                 return False
 
             meta = await self._get_track_metadata(track_id)
@@ -803,6 +862,7 @@ class QobuzPlayer:
 
         except Exception as e:
             logger.error(f"Failed to load track {track_id}: {e}")
+            self._state = PlaybackState.STOPPED
             return False
 
     async def play_track(
@@ -846,7 +906,9 @@ class QobuzPlayer:
         )
 
         # Load the track first
-        if not await self._load_track_locked(queue_item_id, track_id, context_uuid):
+        if not await self._load_track_locked(
+            queue_item_id, track_id, context_uuid, for_playback=True
+        ):
             return False
 
         # Set starting position
@@ -920,6 +982,7 @@ class QobuzPlayer:
     async def _next_track_locked(self) -> bool:
         # Clear gapless state — explicit skip
         self._clear_gapless_state()
+        self._clear_skip_pending()
 
         logger.debug("Next track command")
 
@@ -968,6 +1031,7 @@ class QobuzPlayer:
     async def _previous_track_locked(self) -> bool:
         # Clear gapless state — explicit navigation
         self._clear_gapless_state()
+        self._clear_skip_pending()
 
         logger.debug("Previous track command")
 
@@ -1233,12 +1297,16 @@ class QobuzPlayer:
                     self._clear_next_track_callback()
 
                 # Load and play the next track
-                await self.play_track(
+                started = await self.play_track(
                     queue_item_id=next_track_info["queueItemId"],
                     track_id=next_track_info["trackId"],
                     position_ms=0,
                     context_uuid=next_track_info.get("contextUuid"),
                 )
+                if not started:
+                    # e.g. "Not available" in this region — skip past it
+                    # instead of leaving the album stopped (GitHub #21).
+                    await self._skip_past_unplayable(next_track_info)
                 return
 
         # No next track available - stop playback
@@ -1277,6 +1345,112 @@ class QobuzPlayer:
         self._current_track.streaming_url = None
         self._set_position(0)
         await self._start_playback()
+
+    # =========================================================================
+    # Unplayable Track Skipping
+    # =========================================================================
+    #
+    # Qobuz albums can contain tracks that are "Not available" in the user's
+    # region: track/get answers 404 and no streaming URL exists. The official
+    # app skips them; so must we, or an album stops dead at the first one.
+    #
+    # A renderer only learns the current and the next queue item (via
+    # SET_STATE), so once the next item turns out to be unplayable we don't know
+    # what follows it. The server does send a SET_STATE with a fresh
+    # nextQueueItem after we report a new current item, so: adopt the unplayable
+    # item as current, report it as loading (PLAYING + BUFFERING on the wire),
+    # and let apply_remote_state() finish the skip when that SET_STATE arrives.
+    # A timeout stops playback if the server never answers.
+
+    def _clear_skip_pending(self) -> None:
+        """Forget a pending unplayable-track skip and cancel its timeout."""
+        self._skip_pending_track = None
+        task = self._skip_timeout_task
+        self._skip_timeout_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _begin_skip_wait_locked(self) -> None:
+        """Report the unplayable current track and wait for the server to name its successor."""
+        track = self._current_track
+        if track is None:
+            return
+        self._clear_skip_pending()
+        self._skip_pending_track = track
+        self._state = PlaybackState.LOADING
+        self._current_duration_ms = 0
+        self._set_position(0)
+        logger.info(
+            f"Track {track.track_id} cannot be played (not available); "
+            "waiting for the next queue item to skip to"
+        )
+        self._skip_timeout_task = asyncio.create_task(self._skip_wait_timeout(track))
+        await self._send_state_update()
+
+    async def _skip_wait_timeout(self, pending: QueueTrack) -> None:
+        await asyncio.sleep(_UNAVAILABLE_SKIP_TIMEOUT_S)
+        async with self._playback_lock:
+            if self._skip_pending_track is not pending:
+                return
+            logger.warning(
+                f"No next track received after unplayable track {pending.track_id}; "
+                "stopping playback"
+            )
+            self._clear_skip_pending()
+            self._state = PlaybackState.STOPPED
+            self._current_track = None
+            self._set_position(0)
+            await self._send_state_update()
+
+    async def _skip_past_unplayable_locked(self) -> bool:
+        """Skip from the unplayable current track to the server-provided next item.
+
+        Returns True if a playable track was started. If the next item is
+        unplayable too, the wait starts over for the item after it; if there is
+        no next item, playback stops at the end of the queue.
+        """
+        self._clear_skip_pending()
+        next_info = self._get_next_track_callback() if self._get_next_track_callback else None
+        if not next_info:
+            logger.info("No playable track follows the unavailable one; playback stopped")
+            self._state = PlaybackState.STOPPED
+            self._current_track = None
+            self._set_position(0)
+            await self._send_state_update()
+            return False
+
+        # Consume the next item like auto-advance does, or the gapless arm would
+        # queue the track we are about to play as its own successor.
+        if self._clear_next_track_callback:
+            self._clear_next_track_callback()
+
+        logger.info(f"Skipping unavailable track; playing next item {next_info['trackId']}")
+        if await self._play_track_locked(
+            next_info["queueItemId"],
+            next_info["trackId"],
+            0,
+            next_info.get("contextUuid"),
+        ):
+            return True
+        failed = self._current_track
+        if failed is not None and failed.streaming_url is None:
+            await self._begin_skip_wait_locked()
+        return False
+
+    async def _skip_past_unplayable(self, failed_info: dict) -> None:
+        """Start the skip flow after an auto-advance into an unplayable track."""
+        async with self._playback_lock:
+            cur = self._current_track
+            if (
+                cur is None
+                or cur.track_id != failed_info["trackId"]
+                or cur.queue_item_id != failed_info["queueItemId"]
+                or cur.streaming_url is not None
+            ):
+                # A user command took over meanwhile, or the failure was in the
+                # backend rather than the track being unavailable.
+                return
+            await self._begin_skip_wait_locked()
 
     def _on_playback_error(self, message: str) -> None:
         """Callback when backend reports playback error."""

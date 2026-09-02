@@ -38,7 +38,7 @@ from qobuz_proxy.playback import (
 )
 from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
-from qobuz_proxy.playback.state_reporter import PlaybackStateReport
+from qobuz_proxy.playback.state_reporter import PlaybackStateReport, wire_playing_state
 from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend, MetadataServiceURLProvider
 
 logger = logging.getLogger(__name__)
@@ -545,11 +545,7 @@ class Speaker:
         if not self._ws_manager:
             return
 
-        playing_state = report.playing_state
-        if playing_state == PlaybackState.LOADING:
-            playing_state = PlaybackState.STOPPED
-        elif playing_state == PlaybackState.ERROR:
-            playing_state = PlaybackState.STOPPED
+        playing_state = wire_playing_state(report.playing_state)
 
         await self._ws_manager.send_state_update(
             playing_state=int(playing_state),

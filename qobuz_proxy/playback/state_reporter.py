@@ -22,6 +22,24 @@ logger = logging.getLogger(__name__)
 STATE_UPDATE_INTERVAL_SECONDS = 5.0
 
 
+def wire_playing_state(state: PlaybackState) -> PlaybackState:
+    """Map an internal player state onto the protocol's STOPPED/PLAYING/PAUSED.
+
+    LOADING goes out as PLAYING (paired with a BUFFERING buffer state by the
+    reporter): the renderer is between tracks, not stopped. It used to go out
+    as STOPPED, which made every track change look to the app like the
+    renderer had stopped. On the local backend the whole file downloads before
+    playback starts, so that window lasts seconds and the app answered it with
+    a PAUSED SET_STATE — a manual skip that landed on a paused track. The C++
+    reference renderer likewise never reports STOPPED while loading.
+    """
+    if state == PlaybackState.LOADING:
+        return PlaybackState.PLAYING
+    if state == PlaybackState.ERROR:
+        return PlaybackState.STOPPED
+    return state
+
+
 @dataclass
 class PlaybackStateReport:
     """
@@ -46,16 +64,8 @@ class PlaybackStateReport:
 
     def to_proto_dict(self) -> dict:
         """Convert to dictionary matching protobuf structure."""
-        # Protocol only supports: 1=STOPPED, 2=PLAYING, 3=PAUSED
-        # Map internal LOADING (4) and ERROR (5) to valid protocol values
-        playing_state = self.playing_state
-        if playing_state == PlaybackState.LOADING:
-            playing_state = PlaybackState.STOPPED  # Loading shown as stopped
-        elif playing_state == PlaybackState.ERROR:
-            playing_state = PlaybackState.STOPPED  # Error shown as stopped
-
         return {
-            "playingState": int(playing_state),
+            "playingState": int(wire_playing_state(self.playing_state)),
             "bufferState": int(self.buffer_state),
             "currentPosition": {
                 "timestamp": self.position_timestamp_ms,
@@ -201,6 +211,11 @@ class StateReporter:
 
         # Get buffer status from backend
         buffer_status = await self._player.backend.get_buffer_status()
+        if self._player.state == PlaybackState.LOADING:
+            # Nothing of the incoming track is buffered yet. LOW encodes as the
+            # protocol's BUFFER_STATE_BUFFERING, which together with PLAYING
+            # (see wire_playing_state) is how a renderer reports "loading".
+            buffer_status = BufferStatus.LOW
 
         return PlaybackStateReport(
             playing_state=self._player.state,

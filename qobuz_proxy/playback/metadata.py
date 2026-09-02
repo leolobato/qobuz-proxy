@@ -120,6 +120,14 @@ class MetadataService:
     # URL TTL estimate (Qobuz URLs expire after ~5 minutes)
     URL_TTL_SECONDS = 5 * 60
 
+    # How long a track that could not be resolved (track/get 404 because it is
+    # "Not available" in the user's region, or no streaming URL at any quality)
+    # is remembered as unavailable. The player re-tries the upcoming track every
+    # poll (~0.5s) while arming gapless, so without this a single unavailable
+    # track hammers the Qobuz API twice a second for the whole preceding track.
+    # Kept short so a transient API/network failure is retried soon.
+    UNAVAILABLE_RETRY_SECONDS = 30.0
+
     def __init__(self, api_client: "QobuzAPIClient", max_quality: int = 27):
         """
         Initialize metadata service.
@@ -131,6 +139,26 @@ class MetadataService:
         self._api = api_client
         self._max_quality = max_quality
         self._cache = MetadataCache()
+        # track_id -> monotonic time until which the track is considered unavailable
+        self._unavailable_until: dict[str, float] = {}
+
+    def _mark_unavailable(self, track_id: str) -> None:
+        now = time.monotonic()
+        # Drop expired entries so the map cannot grow with every failed track.
+        self._unavailable_until = {
+            tid: until for tid, until in self._unavailable_until.items() if until > now
+        }
+        self._unavailable_until[track_id] = now + self.UNAVAILABLE_RETRY_SECONDS
+
+    def is_unavailable(self, track_id: str) -> bool:
+        """Whether a recent lookup found this track unplayable (no metadata or no URL)."""
+        until = self._unavailable_until.get(track_id)
+        if until is None:
+            return False
+        if until <= time.monotonic():
+            del self._unavailable_until[track_id]
+            return False
+        return True
 
     @property
     def max_quality(self) -> int:
@@ -167,6 +195,12 @@ class MetadataService:
         """
         # Check cache
         cached = self._cache.get(track_id)
+        if self.is_unavailable(track_id):
+            # Recently failed to resolve; don't hit the API again yet.
+            if cached and not fetch_url:
+                return cached
+            logger.debug(f"Track {track_id} recently unavailable; not retrying yet")
+            return None
         if cached:
             # If URL requested and cached URL valid, return cached
             if not fetch_url or not cached.is_url_expired():
@@ -199,7 +233,7 @@ class MetadataService:
             Streaming URL or None
         """
         metadata = await self.get_metadata(track_id, fetch_url=True)
-        return metadata.streaming_url if metadata else None
+        return (metadata.streaming_url or None) if metadata else None
 
     def get_track_format(self, track_id: str) -> tuple[int, int, int]:
         """Return (actual_quality, sample_rate_hz, bit_depth) for a cached track, or (0, 0, 0)."""
@@ -262,7 +296,10 @@ class MetadataService:
         try:
             data = await self._api.get_track_metadata(track_id)
             if not data:
+                # Qobuz answers track/get with 404 for tracks that are "Not
+                # available" in the user's region.
                 logger.warning(f"No metadata found for track {track_id}")
+                self._mark_unavailable(track_id)
                 return None
 
             metadata = TrackMetadata(
@@ -279,6 +316,7 @@ class MetadataService:
 
         except Exception as e:
             logger.error(f"Failed to fetch metadata for {track_id}: {e}")
+            self._mark_unavailable(track_id)
             return None
 
     async def _fetch_streaming_url(self, metadata: TrackMetadata) -> None:
@@ -300,6 +338,7 @@ class MetadataService:
                     metadata.sample_rate = int(float(sr) * 1000) if sr else 0
                     metadata.bit_depth = int(result.get("bit_depth", 0))
                     metadata.blob = result.get("blob", "") or ""
+                    self._unavailable_until.pop(metadata.track_id, None)
 
                     if actual_quality != self._max_quality:
                         logger.info(
@@ -311,10 +350,12 @@ class MetadataService:
 
             logger.error(f"No streaming URL available for {metadata.track_id}")
             self._clear_streaming_url(metadata)
+            self._mark_unavailable(metadata.track_id)
 
         except Exception as e:
             logger.error(f"Failed to fetch URL for {metadata.track_id}: {e}")
             self._clear_streaming_url(metadata)
+            self._mark_unavailable(metadata.track_id)
 
     @staticmethod
     def _clear_streaming_url(metadata: TrackMetadata) -> None:

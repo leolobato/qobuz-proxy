@@ -595,3 +595,73 @@ class TestMetadataService:
         assert "Now playing: Test Artist - Test Track" in caplog.text
         assert "[Test Album]" in caplog.text
         assert "FLAC Hi-Res (24-bit/192kHz)" in caplog.text
+
+
+class TestUnavailableTracks:
+    """Tracks Qobuz cannot serve ("Not available" in the region) are remembered.
+
+    The player retries the upcoming track on every gapless-arm poll, so without
+    a negative cache one unavailable track hammers the API twice a second for
+    the whole preceding track (GitHub #21 logs).
+    """
+
+    async def test_missing_metadata_is_not_refetched_within_retry_window(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        mock_api.get_track_metadata.return_value = None
+
+        assert await metadata_service.get_metadata("1") is None
+        assert await metadata_service.get_streaming_url("1") is None
+        assert await metadata_service.get_metadata("1") is None
+
+        assert mock_api.get_track_metadata.await_count == 1
+        assert metadata_service.is_unavailable("1")
+
+    async def test_unavailable_track_is_retried_after_window(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        mock_api.get_track_metadata.return_value = None
+        await metadata_service.get_metadata("1")
+
+        # Expire the mark
+        metadata_service._unavailable_until["1"] = time.monotonic() - 1
+
+        assert not metadata_service.is_unavailable("1")
+        await metadata_service.get_metadata("1")
+        assert mock_api.get_track_metadata.await_count == 2
+
+    async def test_no_streaming_url_marks_unavailable(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        mock_api.get_track_metadata.return_value = {"title": "T", "duration_ms": 1000}
+        mock_api.get_track_url.return_value = None
+
+        assert await metadata_service.get_streaming_url("2") is None
+        calls_after_first = mock_api.get_track_url.await_count
+        assert calls_after_first > 0
+
+        assert await metadata_service.get_streaming_url("2") is None
+        assert mock_api.get_track_url.await_count == calls_after_first
+        assert metadata_service.is_unavailable("2")
+        # Metadata itself stays served from cache
+        cached = await metadata_service.get_metadata("2")
+        assert cached is not None and cached.title == "T"
+
+    async def test_successful_url_clears_unavailable_mark(
+        self, metadata_service: MetadataService, mock_api: MockAPIClient
+    ) -> None:
+        mock_api.get_track_metadata.return_value = {"title": "T", "duration_ms": 1000}
+        mock_api.get_track_url.return_value = None
+        await metadata_service.get_streaming_url("3")
+        assert metadata_service.is_unavailable("3")
+
+        metadata_service._unavailable_until["3"] = time.monotonic() - 1
+        mock_api.get_track_url.return_value = {
+            "url": "https://cdn/3.flac",
+            "format_id": 6,
+            "bit_depth": 16,
+            "sampling_rate": 44.1,
+        }
+
+        assert await metadata_service.get_streaming_url("3") == "https://cdn/3.flac"
+        assert not metadata_service.is_unavailable("3")

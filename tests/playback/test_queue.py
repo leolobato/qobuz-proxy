@@ -591,3 +591,30 @@ class TestQobuzQueue:
 
         await queue.set_shuffle(enabled=True)  # Should not crash
         await queue.set_repeat_mode(RepeatMode.ALL)  # Should not crash
+
+
+class TestMissingQueueItemLogging:
+    """Renderers never receive the queue, so a lookup miss on an empty queue is
+    normal and must not be logged as a warning (it misled GitHub #22)."""
+
+    async def test_empty_queue_miss_logs_at_debug(self, caplog: Any) -> None:
+        import logging
+
+        queue = QobuzQueue()
+        with caplog.at_level(logging.DEBUG, logger="qobuz_proxy.playback.queue"):
+            assert await queue.set_current_by_item_id(68) is False
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "Queue item 68 not found" in caplog.text
+
+    async def test_loaded_queue_miss_still_warns(self, caplog: Any) -> None:
+        import logging
+
+        queue = QobuzQueue()
+        await queue.load_queue(
+            tracks=[{"queueItemId": 1, "trackId": 100}], version=QueueVersion(1, 0)
+        )
+        with caplog.at_level(logging.WARNING, logger="qobuz_proxy.playback.queue"):
+            assert await queue.set_current_by_item_id(68) is False
+
+        assert "Queue item 68 not found" in caplog.text

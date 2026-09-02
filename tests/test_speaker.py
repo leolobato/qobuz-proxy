@@ -462,7 +462,9 @@ class TestSpeakerQualityChange:
 
 
 class TestSpeakerStateReport:
-    async def test_send_state_report_maps_loading_to_stopped(self):
+    async def test_send_state_report_maps_loading_to_playing(self):
+        """A renderer between tracks is loading, not stopped. Reporting STOPPED
+        made the app answer a track change with a PAUSED SET_STATE (GitHub #22)."""
         from qobuz_proxy.backends import PlaybackState
 
         config = _make_speaker_config()
@@ -482,7 +484,7 @@ class TestSpeakerStateReport:
         await speaker._send_state_report(report)
 
         call_kwargs = speaker._ws_manager.send_state_update.call_args.kwargs
-        assert call_kwargs["playing_state"] == int(PlaybackState.STOPPED)
+        assert call_kwargs["playing_state"] == int(PlaybackState.PLAYING)
 
     async def test_send_state_report_maps_error_to_stopped(self):
         from qobuz_proxy.backends import PlaybackState
