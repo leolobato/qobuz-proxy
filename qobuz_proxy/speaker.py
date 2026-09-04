@@ -426,6 +426,9 @@ class Speaker:
                     self._player,
                     on_quality_change=self._on_quality_change,
                 )
+                # Lets the handler hold the server's join snapshot after each
+                # (re)connect until it knows this speaker stays active.
+                self._ws_manager.on_connected(self._playback_handler.note_connected)
                 self._volume_handler = VolumeCommandHandler(self._player)
 
                 # Wire next-track callbacks for auto-advance

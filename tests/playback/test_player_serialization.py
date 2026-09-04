@@ -183,3 +183,33 @@ class TestApplyRemoteStateSerialization:
         assert player.current_track is not None
         assert player.current_track.track_id == "C"
         assert backend.played[-1] == "C"
+
+
+class TestStopDuringLoad:
+    async def test_stop_queued_during_load_prevents_backend_play(self) -> None:
+        """A stop that arrives while SET_STATE is still fetching the track URL
+        (the server deactivating a renderer ~10 ms after its join snapshot)
+        must win: the track never reaches the backend."""
+        player, backend = _make_player()
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
+
+        apply = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="7",
+                queue_item_id=1,
+                position_ms=0,
+                playing_state=2,
+                context_uuid=None,
+            )
+        )
+        await asyncio.sleep(0.01)  # load in progress, holding the lock
+        await player.stop_playback()  # queues behind the lock, bumps generation
+        await apply
+
+        assert backend.played == []
+        assert player.state == PlaybackState.STOPPED

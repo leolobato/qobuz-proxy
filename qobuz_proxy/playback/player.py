@@ -490,6 +490,19 @@ class QobuzPlayer:
                             # official app does.
                             await self._skip_past_unplayable_locked()
                         return
+                    if gen != self._command_generation:
+                        # A stop/next/other SET_STATE queued up while the URL
+                        # and metadata were fetched (e.g. the server deactivated
+                        # this renderer right after its join snapshot). Don't
+                        # push this track to the backend only for the queued
+                        # command to tear it down again.
+                        logger.info(
+                            f"SET_STATE superseded while loading track {track_id}; "
+                            "not starting playback"
+                        )
+                        if self._state == PlaybackState.LOADING:
+                            self._state = PlaybackState.STOPPED
+                        return
                 elif (
                     not stale
                     and queue_item_id
@@ -1492,6 +1505,11 @@ class QobuzPlayer:
         """Arm the next track. Caller must hold `_gapless_arm_lock`."""
         # Re-check after waiting on the lock — a concurrent arm may have won
         if self._gapless_armed or not self._get_next_track_callback:
+            return
+        # Only a playing track has a "next". Arming after a stop landed (e.g.
+        # a deactivation racing a just-started play) would queue a track on an
+        # idle renderer.
+        if self._state != PlaybackState.PLAYING:
             return
 
         next_track_info = self._get_next_track_callback()

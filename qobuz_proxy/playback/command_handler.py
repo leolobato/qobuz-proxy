@@ -4,14 +4,30 @@ Playback command handler for WebSocket integration.
 Processes playback commands from the Qobuz app via WsManager.
 """
 
+import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+
+from ..backends import PlaybackState
 
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
 
 logger = logging.getLogger(__name__)
+
+# When a renderer (re)joins the session while another renderer owns playback,
+# the server replays the live session to the newcomer as SET_ACTIVE(true) →
+# SET_STATE(current item, PLAYING) → SET_ACTIVE(false) about 10 ms later.
+# Applied as-is, that snapshot makes an idle speaker start the other
+# renderer's track (and, on a grouped Sonos, break the group) before the
+# deactivation lands. A PLAYING snapshot that reaches an idle player within
+# JOIN_SNAPSHOT_WINDOW_S of connecting is therefore held for
+# JOIN_SNAPSHOT_GRACE_S: a SET_ACTIVE(false) in that time discards it, otherwise
+# it applies unchanged (a real handoff to this speaker is only delayed).
+JOIN_SNAPSHOT_WINDOW_S = 3.0
+JOIN_SNAPSHOT_GRACE_S = 1.0
 
 # Quality change callback type
 QualityChangeCallback = Callable[[int], Awaitable[None]]
@@ -61,6 +77,19 @@ class PlaybackCommandHandler:
 
         # Callback when next track info changes (for gapless re-arming)
         self._on_next_track_changed: Optional[Callable[[], Awaitable[None]]] = None
+
+        # Join-snapshot hold (see JOIN_SNAPSHOT_WINDOW_S): when the WebSocket
+        # last connected, and the SET_STATE waiting out its grace period.
+        self._connected_at: Optional[float] = None
+        self._held_snapshot: Optional[asyncio.Task[None]] = None
+
+    def note_connected(self) -> None:
+        """Record that the WebSocket just (re)connected.
+
+        Wire this to WsManager.on_connected so SET_STATE can tell a server
+        join-snapshot from a command the user issued.
+        """
+        self._connected_at = time.monotonic()
 
     def get_message_types(self) -> list[int]:
         """Get list of message types this handler processes."""
@@ -114,6 +143,55 @@ class PlaybackCommandHandler:
         state = message.srvrRndrSetState
         logger.debug(f"SET_STATE received: {state}")
 
+        # A newer SET_STATE always supersedes a snapshot still waiting out its
+        # grace period, whether or not this one is held too.
+        self._cancel_held_snapshot()
+
+        if self._is_join_snapshot(state):
+            logger.info(
+                "Holding PLAYING snapshot received %.0f ms after connect for %.1fs: "
+                "the server may deactivate this renderer next",
+                (time.monotonic() - (self._connected_at or 0.0)) * 1000,
+                JOIN_SNAPSHOT_GRACE_S,
+            )
+            self._held_snapshot = asyncio.create_task(self._apply_after_grace(state))
+            return
+
+        await self._apply_set_state(state)
+
+    def _is_join_snapshot(self, state: Any) -> bool:
+        """Is this SET_STATE the server's session replay to a freshly joined idle renderer?"""
+        if not (state.HasField("playingState") and state.playingState == 2):
+            return False
+        if self._connected_at is None:
+            return False
+        if time.monotonic() - self._connected_at > JOIN_SNAPSHOT_WINDOW_S:
+            return False
+        # A speaker already playing (or about to) is the session owner; its own
+        # reconnect snapshot must apply at once (stale-PAUSED detection lives in
+        # the player).
+        return self.player.state not in (PlaybackState.PLAYING, PlaybackState.LOADING)
+
+    async def _apply_after_grace(self, state: Any) -> None:
+        await asyncio.sleep(JOIN_SNAPSHOT_GRACE_S)
+        self._held_snapshot = None
+        logger.info("Renderer stayed active; applying the held PLAYING snapshot")
+        try:
+            await self._apply_set_state(state)
+        except Exception as e:
+            logger.error(f"Error applying held SET_STATE: {e}", exc_info=True)
+
+    def _cancel_held_snapshot(self) -> bool:
+        """Drop a SET_STATE waiting out its grace period. Returns True if one was held."""
+        task = self._held_snapshot
+        self._held_snapshot = None
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    async def _apply_set_state(self, state: Any) -> None:
+        """Apply a decoded SrvrRndrSetState to the queue and player."""
         # Extract current queue item info
         current_item = None
         current_queue_item_id = None
@@ -232,7 +310,11 @@ class PlaybackCommandHandler:
             # an empty volume bar until we re-emit. Push current volume now.
             await self.player.broadcast_current_volume()
         else:
-            # We're no longer the active renderer - stop playback
+            # We're no longer the active renderer. A PLAYING snapshot still in
+            # its grace period was the other renderer's session — drop it so it
+            # never reaches the backend, then stop whatever is playing.
+            if self._cancel_held_snapshot():
+                logger.info("Discarding held PLAYING snapshot: renderer deactivated")
             await self.player.stop_playback()
 
     async def _handle_set_max_audio_quality(self, message: Any) -> None:
