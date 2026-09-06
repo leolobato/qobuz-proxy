@@ -256,6 +256,8 @@ class ProtocolCodec:
         session_uuid: bytes,
         initial_state: Optional[common_pb2.RendererState] = None,
         max_audio_quality: int = 27,
+        *,
+        is_active: bool = False,
     ) -> bytes:
         """
         Encode join session message (sent when connecting).
@@ -266,6 +268,7 @@ class ProtocolCodec:
             session_uuid: 16-byte session UUID to join
             initial_state: Optional initial renderer state
             max_audio_quality: Max quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
+            is_active: Request activation or restore this renderer's session ownership.
 
         Returns:
             Encoded frame bytes
@@ -292,7 +295,7 @@ class ProtocolCodec:
         join.sessionUuid = session_uuid  # Required!
         join.deviceInfo.CopyFrom(device_info)
         join.reason = 1  # Normal join
-        join.isActive = True
+        join.isActive = is_active
 
         if initial_state:
             join.initialState.CopyFrom(initial_state)

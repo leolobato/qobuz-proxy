@@ -122,6 +122,6 @@ class TestSpeakerLocalBackend:
         with patch("qobuz_proxy.speaker.WsManager") as mock_ws_manager_class:
             await speaker._setup_websocket(tokens)
 
-        speaker._ws_manager.set_tokens.assert_called_once_with(tokens)
+        speaker._ws_manager.set_tokens.assert_called_once_with(tokens, activate=True)
         assert speaker._ws_connected_event.is_set() is True
         mock_ws_manager_class.assert_not_called()

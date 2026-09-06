@@ -125,6 +125,11 @@ class TestEncoding:
         assert isinstance(frame, bytes)
         assert len(frame) > 0
         assert frame[0] == MessageType.PAYLOAD
+        decoded = codec.decode_frame(frame)
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        join = batch.messages[0].rndrSrvrJoinSession
+        assert join.HasField("isActive")
+        assert join.isActive is False
 
     def test_encode_join_session_with_quality(
         self, codec: ProtocolCodec, device_uuid: bytes

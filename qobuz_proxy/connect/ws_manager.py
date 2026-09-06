@@ -16,7 +16,7 @@ from websockets import ClientConnection
 from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
 
-from .protocol import DecodedMessage, MessageType, ProtocolCodec
+from .protocol import DecodedMessage, MessageType, ProtocolCodec, QConnectMessageType
 from .types import ConnectTokens
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ RECONNECT_BACKOFF_MULTIPLIER = 2.0
 TOKEN_MINT_RETRY_DELAY = 30.0  # seconds between self-mint attempts
 
 # Message handler callback type
-MessageHandler = Callable[[int, Any], None]
+MessageHandler = Callable[[int, Any], Optional[asyncio.Task[None]]]
 
 # Async callback that mints a fresh WS token (returns None on failure)
 TokenRefresher = Callable[[], Awaitable[Optional[WSToken]]]
@@ -74,6 +74,14 @@ class WsManager:
         self._is_connected = False
         self._should_run = False
 
+        # Session ownership is independent of PLAYING/PAUSED/STOPPED. Retain
+        # the server's last decision across transport reconnects, but require
+        # confirmation on the new connection before sending playback reports.
+        self._renderer_active = False
+        self._active_confirmed = False
+        self._ownership_generation = 0
+        self._activation_request: Optional[object] = None
+
         # Reconnection state
         self._reconnect_delay = INITIAL_RECONNECT_DELAY
 
@@ -100,12 +108,14 @@ class WsManager:
         # Quality setting for join session message
         self._max_audio_quality: int = 27  # Default to Hi-Res 192k
 
-    def set_tokens(self, tokens: ConnectTokens) -> None:
+    def set_tokens(self, tokens: ConnectTokens, *, activate: bool = False) -> None:
         """
         Set connection tokens from discovery service.
 
         Args:
             tokens: Tokens received from Qobuz app
+            activate: An explicit discovery connect request selected this speaker.
+                Token maintenance alone must not request activation.
         """
         previous_token = self._ws_token
         previous_session_uuid = self._session_uuid
@@ -117,6 +127,9 @@ class WsManager:
                 endpoint=tokens.ws_token.endpoint,
             )
         self._session_uuid = self._uuid_to_bytes(tokens.session_id)
+        if previous_session_uuid != self._session_uuid:
+            self._renderer_active = False
+            self._activation_request = None
         self._token_version += 1
         self._token_update_event.set()
 
@@ -126,8 +139,16 @@ class WsManager:
         tokens_changed = (
             previous_token != self._ws_token or previous_session_uuid != self._session_uuid
         )
-        if tokens_changed and self._ws and self._should_run:
-            logger.info("Received refreshed WebSocket tokens, reconnecting")
+        reconnect = tokens_changed or (activate and not self._renderer_active)
+        if activate and (reconnect or not self._is_connected):
+            self._activation_request = object()
+        if reconnect and self._ws and self._should_run:
+            self._invalidate_connection()
+            logger.info(
+                "[%s] Reconnecting after app request (activate=%s)",
+                self.config.device.name,
+                activate,
+            )
             asyncio.create_task(self._close_for_token_refresh())
 
     def set_token_refresher(self, refresher: TokenRefresher) -> None:
@@ -184,6 +205,8 @@ class WsManager:
     async def stop(self) -> None:
         """Stop WebSocket connection."""
         self._should_run = False
+        self._invalidate_connection()
+        self._activation_request = None
         if self._ws:
             await self._ws.close()
         if self._receive_task:
@@ -199,6 +222,18 @@ class WsManager:
         """Check if currently connected."""
         return self._is_connected
 
+    @property
+    def is_renderer_active(self) -> bool:
+        """Whether this connection has confirmed ownership of playback."""
+        return self._is_connected and self._active_confirmed and self._renderer_active
+
+    def _invalidate_connection(self) -> None:
+        self._is_connected = False
+        self._active_confirmed = False
+        self._ownership_generation += 1
+        if self._on_disconnected:
+            self._on_disconnected()
+
     async def send_message(self, data: bytes) -> bool:
         """
         Send a pre-encoded message.
@@ -211,7 +246,9 @@ class WsManager:
         """
         return await self._encode_and_send(lambda: data)
 
-    async def _encode_and_send(self, encode: Callable[[], bytes]) -> bool:
+    async def _encode_and_send(
+        self, encode: Callable[[], bytes], *, allowed: Optional[Callable[[], bool]] = None
+    ) -> bool:
         """
         Encode and transmit a message atomically.
 
@@ -228,6 +265,8 @@ class WsManager:
         """
         async with self._send_lock:
             if not (self._ws and self._is_connected):
+                return False
+            if allowed is not None and not allowed():
                 return False
             try:
                 await self._ws.send(encode())
@@ -254,6 +293,7 @@ class WsManager:
         Returns:
             True if sent successfully
         """
+        generation = self._ownership_generation
         return await self._encode_and_send(
             lambda: self._codec.encode_state_update(
                 playing_state=playing_state,
@@ -264,7 +304,8 @@ class WsManager:
                 queue_version_major=queue_version_major,
                 queue_version_minor=queue_version_minor,
                 position_timestamp_ms=position_timestamp_ms,
-            )
+            ),
+            allowed=lambda: self.is_renderer_active and generation == self._ownership_generation,
         )
 
     async def send_volume_changed(self, volume: int) -> bool:
@@ -386,10 +427,6 @@ class WsManager:
             if not self._should_run:
                 break
 
-            # Notify disconnection
-            if self._on_disconnected:
-                self._on_disconnected()
-
             if not should_backoff:
                 continue
 
@@ -408,7 +445,8 @@ class WsManager:
 
         assert self._ws_token is not None
         endpoint = self._ws_token.endpoint
-        logger.info(f"Connecting to {endpoint[:50]}...")
+        token_version = self._token_version
+        logger.info("[%s] Connecting to %s...", self.config.device.name, endpoint[:50])
 
         try:
             async with websockets.connect(
@@ -428,14 +466,20 @@ class WsManager:
                 if not await self._subscribe():
                     return
 
+                if token_version != self._token_version:
+                    raise TokenRefreshRequired()
+
                 # Send join session message
                 await self._send_join_session()
+
+                if token_version != self._token_version:
+                    raise TokenRefreshRequired()
 
                 self._is_connected = True
                 self._reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff
                 self._last_activity_time = time.monotonic()
                 self._refresh_deferred = False
-                logger.info("Connected and authenticated")
+                logger.info("[%s] Connected and authenticated", self.config.device.name)
 
                 # Notify connected callback
                 if self._on_connected:
@@ -451,7 +495,7 @@ class WsManager:
         except Exception as e:
             logger.error(f"Connection failed: {e}")
         finally:
-            self._is_connected = False
+            self._invalidate_connection()
             self._ws = None
 
     async def _authenticate(self) -> bool:
@@ -480,14 +524,26 @@ class WsManager:
             logger.error("No session UUID for join session")
             return
 
+        activation_request = self._activation_request
+        is_active = activation_request is not None or self._renderer_active
+        self._active_confirmed = False
         join_frame = self._codec.encode_join_session(
             device_uuid=self._device_uuid,
             friendly_name=self.config.device.name,
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
+            is_active=is_active,
         )
         await self._ws.send(join_frame)
-        logger.debug(f"Sent JOIN_SESSION with max_quality={self._max_audio_quality}")
+        if self._activation_request is activation_request:
+            self._activation_request = None
+        logger.info(
+            "[%s] Sent JOIN_SESSION: isActive=%s, cause=%s, max_quality=%s",
+            self.config.device.name,
+            is_active,
+            "app selection" if activation_request is not None else "reconnect",
+            self._max_audio_quality,
+        )
 
     async def _receive_loop(self) -> None:
         """Receive and dispatch messages."""
@@ -529,7 +585,7 @@ class WsManager:
                 self._refresh_deferred = True
             return
 
-        logger.warning("Token expiring soon, need refresh")
+        logger.warning("[%s] Token expiring soon, need refresh", self.config.device.name)
         raise TokenRefreshRequired()
 
     async def _handle_message(self, data: bytes) -> None:
@@ -548,7 +604,7 @@ class WsManager:
 
     async def _handle_payload(self, decoded: DecodedMessage) -> None:
         """Handle PAYLOAD message by routing to registered handlers."""
-        if not decoded.payload:
+        if not self._is_connected or not decoded.payload:
             return
 
         batch = self._codec.decode_qconnect_batch(decoded.payload)
@@ -557,6 +613,19 @@ class WsManager:
 
         for msg in batch.messages:
             msg_type = msg.messageType
+            if (
+                msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE
+                and msg.HasField("srvrRndrSetActive")
+                and msg.srvrRndrSetActive.HasField("active")
+            ):
+                # Do this synchronously, before any handler task can await a
+                # slow backend or send a final STOPPED report after deactivation.
+                self._renderer_active = msg.srvrRndrSetActive.active
+                self._active_confirmed = True
+                self._ownership_generation += 1
+                logger.info(
+                    "[%s] Renderer set active: %s", self.config.device.name, self._renderer_active
+                )
             handler = self._handlers.get(msg_type)
             if handler:
                 self._last_activity_time = time.monotonic()

@@ -11,7 +11,6 @@ import asyncio
 import pytest
 
 from qobuz_proxy.backends import PlaybackState
-from qobuz_proxy.playback import command_handler as ch
 from qobuz_proxy.playback.command_handler import PlaybackCommandHandler
 from qobuz_proxy.proto import qconnect_payload_pb2 as pb
 
@@ -51,6 +50,7 @@ class TestSetStateHandling:
         player, backend = _make_player()
         queue = QobuzQueue()
         handler = PlaybackCommandHandler(player, queue=queue)
+        await handler._handle_set_active(_set_active_msg(True))
 
         await queue.load_queue(
             tracks=[
@@ -72,6 +72,7 @@ class TestSetStateHandling:
     async def test_single_set_state_loads_and_plays(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=5))
 
@@ -85,6 +86,7 @@ class TestSetStateHandling:
         the play report (listening history / scrobble) carries it."""
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         ctx = bytes(range(16))
         await handler._handle_set_state(
@@ -98,6 +100,7 @@ class TestSetStateHandling:
         """A context-less resend of the same nextQueueItem must keep the context."""
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
         ctx = bytes(range(16))
 
         first = _set_state_msg(track_id=1, queue_item_id=1)
@@ -121,6 +124,7 @@ class TestSetStateHandling:
         the exact path that previously left playback on a stale track."""
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         older = _set_state_msg(track_id=1001, queue_item_id=1)
         newer = _set_state_msg(track_id=1002, queue_item_id=2)
@@ -146,6 +150,7 @@ class TestNextTrackSentinel:
     async def test_sentinel_next_item_is_not_stored(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         msg = _set_state_msg(track_id=1001, queue_item_id=1)
         msg.srvrRndrSetState.nextQueueItem.queueItemId = 0xFFFFFFFFFFFFFFFF
@@ -157,6 +162,7 @@ class TestNextTrackSentinel:
     async def test_sentinel_track_id_alone_is_not_stored(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         msg = _set_state_msg(track_id=1001, queue_item_id=1)
         msg.srvrRndrSetState.nextQueueItem.queueItemId = 2
@@ -170,6 +176,7 @@ class TestNextTrackSentinel:
         change callback so a stale gapless arm is torn down."""
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
 
         changed = 0
 
@@ -200,6 +207,7 @@ class TestNextTrackSentinel:
         player, backend = _make_player()
         player.queue = QobuzQueue()  # real queue: track-end path awaits get_state()
         handler = PlaybackCommandHandler(player, queue=player.queue)
+        await handler._handle_set_active(_set_active_msg(True))
         player.set_next_track_callbacks(
             get_callback=handler.get_next_track_info,
             clear_callback=handler.clear_next_track_info,
@@ -224,105 +232,160 @@ def _set_active_msg(active: bool):
     return msg
 
 
-class TestJoinSnapshotHold:
-    """When a speaker (re)joins while another renderer owns the session, the
-    server replays SET_ACTIVE(true) → SET_STATE(PLAYING) → SET_ACTIVE(false)
-    within ~10 ms. An idle speaker must not start the other renderer's track."""
-
-    @pytest.fixture(autouse=True)
-    def _short_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ch, "JOIN_SNAPSHOT_GRACE_S", 0.05)
-
-    async def test_snapshot_dropped_when_renderer_deactivated(self) -> None:
+class TestRendererOwnership:
+    async def test_snapshot_requires_explicit_activation(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
         handler.note_connected()
-
         await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-        assert handler._held_snapshot is not None
+        # No timer can eventually commit this unowned snapshot.
+        await asyncio.sleep(0)
+        assert backend.played == []
         assert player.current_track is None
 
-        await handler._handle_set_active(_set_active_msg(False))
-        await asyncio.sleep(0.1)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=2002, queue_item_id=2))
+        assert backend.played == ["2002"]
 
+    async def test_same_batch_deactivation_discards_queued_snapshot(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        tasks = [
+            handler.dispatch_message(43, _set_active_msg(True)),
+            handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1)),
+            handler.dispatch_message(43, _set_active_msg(False)),
+        ]
+        await asyncio.gather(*tasks)
         assert backend.played == []
         assert player.current_track is None
         assert player.state == PlaybackState.STOPPED
-        assert handler._held_snapshot is None
 
-    async def test_snapshot_applies_when_renderer_stays_active(self) -> None:
+    async def test_reactivation_cannot_revive_old_snapshot(self) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
-        handler.note_connected()
-
-        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-        assert backend.played == []
-
-        await asyncio.sleep(0.1)
-
-        assert backend.played == ["2001"]
-        assert player.state == PlaybackState.PLAYING
-        assert handler._held_snapshot is None
-
-    async def test_snapshot_not_held_while_playing(self) -> None:
-        """The session owner's own reconnect snapshot must apply at once."""
-        player, backend = _make_player()
-        handler = PlaybackCommandHandler(player)
-        await player.play_track(queue_item_id=1, track_id="2001")
-        handler.note_connected()
-
-        await handler._handle_set_state(_set_state_msg(track_id=2002, queue_item_id=2))
-
-        assert handler._held_snapshot is None
-        assert backend.played == ["2001", "2002"]
-
-    async def test_paused_snapshot_not_held(self) -> None:
-        player, backend = _make_player()
-        handler = PlaybackCommandHandler(player)
-        handler.note_connected()
-
-        await handler._handle_set_state(
-            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=3)
-        )
-
-        assert handler._held_snapshot is None
-        assert player.current_track is not None
-        assert player.current_track.track_id == "2001"
-        assert backend.played == []
-
-    async def test_set_state_outside_connect_window_applies_immediately(self) -> None:
-        player, backend = _make_player()
-        handler = PlaybackCommandHandler(player)
-        handler.note_connected()
-        assert handler._connected_at is not None
-        handler._connected_at -= ch.JOIN_SNAPSHOT_WINDOW_S + 1
-
-        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-
-        assert handler._held_snapshot is None
-        assert backend.played == ["2001"]
-
-    async def test_no_connect_notice_means_no_hold(self) -> None:
-        player, backend = _make_player()
-        handler = PlaybackCommandHandler(player)
-
-        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-
-        assert handler._held_snapshot is None
-        assert backend.played == ["2001"]
-
-    async def test_newer_set_state_supersedes_held_snapshot(self) -> None:
-        player, backend = _make_player()
-        handler = PlaybackCommandHandler(player)
-        handler.note_connected()
-
-        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-        first = handler._held_snapshot
-        await handler._handle_set_state(_set_state_msg(track_id=2002, queue_item_id=2))
-        assert first is not None
-        await asyncio.sleep(0)
-        assert first.cancelled()
-
-        await asyncio.sleep(0.1)
-
+        tasks = [
+            handler.dispatch_message(43, _set_active_msg(True)),
+            handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1)),
+            handler.dispatch_message(43, _set_active_msg(False)),
+            handler.dispatch_message(43, _set_active_msg(True)),
+            handler.dispatch_message(41, _set_state_msg(track_id=2002, queue_item_id=2)),
+        ]
+        await asyncio.gather(*tasks)
         assert backend.played == ["2002"]
+        assert player.state == PlaybackState.PLAYING
+
+    async def test_disconnect_discards_queued_snapshot(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        task = handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1))
+        handler.note_disconnected()
+        handler.note_connected()
+        await handler._handle_set_active(_set_active_msg(True))
+        await task
+        assert backend.played == []
+
+    @pytest.mark.parametrize("disconnect", [False, True])
+    async def test_revocation_during_metadata_load_prevents_playback(self, disconnect) -> None:
+        from unittest.mock import AsyncMock
+
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_load = player._load_track_locked
+
+        async def slow_load(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original_load(*args, **kwargs)
+
+        player._load_track_locked = AsyncMock(side_effect=slow_load)
+        task = handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1))
+        await entered.wait()
+        if disconnect:
+            handler.note_disconnected()
+            stop = None
+        else:
+            stop = handler.dispatch_message(43, _set_active_msg(False))
+        release.set()
+        await task
+        if stop:
+            await stop
+        assert backend.played == []
+
+    async def test_revocation_while_waiting_for_queue_prevents_playback(self) -> None:
+        from unittest.mock import AsyncMock
+
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_queue_update(*args):
+            entered.set()
+            await release.wait()
+
+        handler.queue.set_current_by_item_id = AsyncMock(side_effect=slow_queue_update)
+        task = handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1))
+        await entered.wait()
+        await handler._handle_set_active(_set_active_msg(False))
+        release.set()
+        await task
+        assert backend.played == []
+
+    async def test_deactivation_during_seek_cannot_resume_playback(self) -> None:
+        from unittest.mock import AsyncMock
+
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        await player.pause()
+        player._current_duration_ms = 60000
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_seek(position_ms):
+            entered.set()
+            await release.wait()
+
+        backend.seek = AsyncMock(side_effect=slow_seek)
+        backend.resume = AsyncMock(return_value=True)
+        task = handler.dispatch_message(
+            41,
+            _set_state_msg(
+                track_id=2001,
+                queue_item_id=1,
+                playing_state=2,
+                position_ms=1000,
+            ),
+        )
+        await entered.wait()
+        stop = handler.dispatch_message(43, _set_active_msg(False))
+        release.set()
+        await asyncio.gather(task, stop)
+        backend.resume.assert_not_awaited()
+        assert player.state == PlaybackState.STOPPED
+
+    async def test_disconnect_cannot_discard_a_received_deactivation(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        stop = handler.dispatch_message(43, _set_active_msg(False))
+        handler.note_disconnected()
+        await stop
+        assert player.state == PlaybackState.STOPPED
+
+    async def test_new_activation_revokes_old_stop_even_if_connection_then_drops(self) -> None:
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        stop = handler.dispatch_message(43, _set_active_msg(False))
+        await handler._handle_set_active(_set_active_msg(True))
+        handler.note_disconnected()
+        await stop
+        assert player.state == PlaybackState.PLAYING

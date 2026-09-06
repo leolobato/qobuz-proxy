@@ -6,28 +6,13 @@ Processes playback commands from the Qobuz app via WsManager.
 
 import asyncio
 import logging
-import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
-
-from ..backends import PlaybackState
 
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
 
 logger = logging.getLogger(__name__)
-
-# When a renderer (re)joins the session while another renderer owns playback,
-# the server replays the live session to the newcomer as SET_ACTIVE(true) →
-# SET_STATE(current item, PLAYING) → SET_ACTIVE(false) about 10 ms later.
-# Applied as-is, that snapshot makes an idle speaker start the other
-# renderer's track (and, on a grouped Sonos, break the group) before the
-# deactivation lands. A PLAYING snapshot that reaches an idle player within
-# JOIN_SNAPSHOT_WINDOW_S of connecting is therefore held for
-# JOIN_SNAPSHOT_GRACE_S: a SET_ACTIVE(false) in that time discards it, otherwise
-# it applies unchanged (a real handoff to this speaker is only delayed).
-JOIN_SNAPSHOT_WINDOW_S = 3.0
-JOIN_SNAPSHOT_GRACE_S = 1.0
 
 # Quality change callback type
 QualityChangeCallback = Callable[[int], Awaitable[None]]
@@ -59,6 +44,7 @@ class PlaybackCommandHandler:
         player: "QobuzPlayer",
         queue: Optional["QobuzQueue"] = None,
         on_quality_change: Optional[QualityChangeCallback] = None,
+        speaker_name: str = "renderer",
     ):
         """
         Initialize command handler.
@@ -67,10 +53,12 @@ class PlaybackCommandHandler:
             player: QobuzPlayer instance
             queue: Optional QobuzQueue (defaults to player.queue)
             on_quality_change: Optional callback for quality change events
+            speaker_name: Speaker identity for diagnostic logs.
         """
         self.player = player
         self.queue = queue or player.queue
         self._on_quality_change = on_quality_change
+        self._speaker_name = speaker_name
 
         # Store next track info for auto-advance (from SET_STATE nextQueueItem)
         self._next_track_info: Optional[dict] = None
@@ -78,18 +66,40 @@ class PlaybackCommandHandler:
         # Callback when next track info changes (for gapless re-arming)
         self._on_next_track_changed: Optional[Callable[[], Awaitable[None]]] = None
 
-        # Join-snapshot hold (see JOIN_SNAPSHOT_WINDOW_S): when the WebSocket
-        # last connected, and the SET_STATE waiting out its grace period.
-        self._connected_at: Optional[float] = None
-        self._held_snapshot: Optional[asyncio.Task[None]] = None
+        self._active = False
+        self._generation = 0
+        self._deactivation_generation: Optional[int] = None
 
     def note_connected(self) -> None:
-        """Record that the WebSocket just (re)connected.
+        """Wait for explicit server activation on each new connection."""
+        self.note_disconnected()
 
-        Wire this to WsManager.on_connected so SET_STATE can tell a server
-        join-snapshot from a command the user issued.
-        """
-        self._connected_at = time.monotonic()
+    def note_disconnected(self) -> None:
+        """Invalidate commands from the old connection without stopping current audio."""
+        self._active = False
+        self._generation += 1
+        self.player.invalidate_pending_commands()
+
+    def _note_active(self, active: bool) -> None:
+        if active != self._active:
+            self._active = active
+            self._generation += 1
+            self.player.invalidate_pending_commands()
+        if active:
+            self._deactivation_generation = None
+        else:
+            self._deactivation_generation = self._generation
+            self._next_track_info = None
+
+    def dispatch_message(self, msg_type: int, message: Any) -> asyncio.Task[None]:
+        """Record ownership in wire order before scheduling asynchronous backend work."""
+        if (
+            msg_type == MSG_TYPE_SET_ACTIVE
+            and message.HasField("srvrRndrSetActive")
+            and message.srvrRndrSetActive.HasField("active")
+        ):
+            self._note_active(message.srvrRndrSetActive.active)
+        return asyncio.create_task(self.handle_message(msg_type, message, self._generation))
 
     def get_message_types(self) -> list[int]:
         """Get list of message types this handler processes."""
@@ -102,8 +112,24 @@ class PlaybackCommandHandler:
             MSG_TYPE_SET_AUTOPLAY_MODE,
         ]
 
-    async def handle_message(self, msg_type: int, message: Any) -> None:
+    async def handle_message(
+        self, msg_type: int, message: Any, generation: Optional[int] = None
+    ) -> None:
         """Handle a playback command message."""
+        if generation is not None and generation != self._generation:
+            # A received deactivation still needs to stop audio if the socket
+            # closes before its task runs. Only a later activation can revoke
+            # that stop; stale playback commands always remain invalid.
+            pending_stop = (
+                msg_type == MSG_TYPE_SET_ACTIVE
+                and message.HasField("srvrRndrSetActive")
+                and message.srvrRndrSetActive.HasField("active")
+                and not message.srvrRndrSetActive.active
+                and not self._active
+                and generation == self._deactivation_generation
+            )
+            if not pending_stop:
+                return
         try:
             if msg_type == MSG_TYPE_SET_STATE:
                 await self._handle_set_state(message)
@@ -143,55 +169,13 @@ class PlaybackCommandHandler:
         state = message.srvrRndrSetState
         logger.debug(f"SET_STATE received: {state}")
 
-        # A newer SET_STATE always supersedes a snapshot still waiting out its
-        # grace period, whether or not this one is held too.
-        self._cancel_held_snapshot()
-
-        if self._is_join_snapshot(state):
-            logger.info(
-                "Holding PLAYING snapshot received %.0f ms after connect for %.1fs: "
-                "the server may deactivate this renderer next",
-                (time.monotonic() - (self._connected_at or 0.0)) * 1000,
-                JOIN_SNAPSHOT_GRACE_S,
-            )
-            self._held_snapshot = asyncio.create_task(self._apply_after_grace(state))
+        if not self._active:
+            logger.debug("[%s] Ignoring SET_STATE: renderer is not active", self._speaker_name)
             return
+        await self._apply_set_state(state, self._generation)
 
-        await self._apply_set_state(state)
-
-    def _is_join_snapshot(self, state: Any) -> bool:
-        """Is this SET_STATE the server's session replay to a freshly joined idle renderer?"""
-        if not (state.HasField("playingState") and state.playingState == 2):
-            return False
-        if self._connected_at is None:
-            return False
-        if time.monotonic() - self._connected_at > JOIN_SNAPSHOT_WINDOW_S:
-            return False
-        # A speaker already playing (or about to) is the session owner; its own
-        # reconnect snapshot must apply at once (stale-PAUSED detection lives in
-        # the player).
-        return self.player.state not in (PlaybackState.PLAYING, PlaybackState.LOADING)
-
-    async def _apply_after_grace(self, state: Any) -> None:
-        await asyncio.sleep(JOIN_SNAPSHOT_GRACE_S)
-        self._held_snapshot = None
-        logger.info("Renderer stayed active; applying the held PLAYING snapshot")
-        try:
-            await self._apply_set_state(state)
-        except Exception as e:
-            logger.error(f"Error applying held SET_STATE: {e}", exc_info=True)
-
-    def _cancel_held_snapshot(self) -> bool:
-        """Drop a SET_STATE waiting out its grace period. Returns True if one was held."""
-        task = self._held_snapshot
-        self._held_snapshot = None
-        if task is None or task.done():
-            return False
-        task.cancel()
-        return True
-
-    async def _apply_set_state(self, state: Any) -> None:
-        """Apply a decoded SrvrRndrSetState to the queue and player."""
+    async def _apply_set_state(self, state: Any, generation: int) -> None:
+        """Apply a decoded SrvrRndrSetState while this renderer still owns playback."""
         # Extract current queue item info
         current_item = None
         current_queue_item_id = None
@@ -260,6 +244,11 @@ class PlaybackCommandHandler:
         if current_queue_item_id is not None:
             await self.queue.set_current_by_item_id(current_queue_item_id)
 
+        # Queue synchronization can yield. A deactivation/disconnect must win
+        # before this command can register a new player command generation.
+        if not self._active or generation != self._generation:
+            return
+
         # Apply the desired remote state as a single atomic unit. A SET_STATE is
         # a multi-step intent (load this track, seek here, then play/pause/stop)
         # and each SET_STATE message runs in its own task, so applying the steps
@@ -276,7 +265,12 @@ class PlaybackCommandHandler:
         )
 
         # Notify gapless system about next track change (after state handling)
-        if next_track_changed and self._on_next_track_changed:
+        if (
+            self._active
+            and generation == self._generation
+            and next_track_changed
+            and self._on_next_track_changed
+        ):
             await self._on_next_track_changed()
 
     def get_next_track_info(self) -> Optional[dict]:
@@ -297,12 +291,14 @@ class PlaybackCommandHandler:
 
         This tells the renderer if it's the currently active playback device.
         """
-        if not message.HasField("srvrRndrSetActive"):
+        if not (
+            message.HasField("srvrRndrSetActive") and message.srvrRndrSetActive.HasField("active")
+        ):
             logger.debug("SET_ACTIVE message missing srvrRndrSetActive field")
             return
 
         active = message.srvrRndrSetActive.active
-        logger.info(f"Renderer set active: {active}")
+        self._note_active(active)
 
         if active:
             # A controller just attached. The Qobuz cloud does not seem to replay
@@ -310,11 +306,7 @@ class PlaybackCommandHandler:
             # an empty volume bar until we re-emit. Push current volume now.
             await self.player.broadcast_current_volume()
         else:
-            # We're no longer the active renderer. A PLAYING snapshot still in
-            # its grace period was the other renderer's session — drop it so it
-            # never reaches the backend, then stop whatever is playing.
-            if self._cancel_held_snapshot():
-                logger.info("Discarding held PLAYING snapshot: renderer deactivated")
+            # Ownership was revoked before this backend stop can yield.
             await self.player.stop_playback()
 
     async def _handle_set_max_audio_quality(self, message: Any) -> None:

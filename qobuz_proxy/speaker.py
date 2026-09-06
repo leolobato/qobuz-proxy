@@ -340,6 +340,9 @@ class Speaker:
         logger.info(f"[{self.name}] Stopping speaker...")
         self._is_running = False
 
+        if self._playback_handler:
+            self._playback_handler.note_disconnected()
+
         # 1. Stop state reporter
         if self._state_reporter:
             try:
@@ -405,8 +408,9 @@ class Speaker:
         async with self._ws_setup_lock:
             try:
                 if self._ws_manager is not None:
-                    # Already connected — just refresh the tokens
-                    self._ws_manager.set_tokens(tokens)
+                    # A discovery connect is an explicit selection, even when
+                    # the same speaker already has an idle WebSocket.
+                    self._ws_manager.set_tokens(tokens, activate=True)
                     logger.info(f"[{self.name}] Refreshed WebSocket tokens from Qobuz app")
                     self._ws_connected_event.set()
                     return
@@ -416,7 +420,7 @@ class Speaker:
 
                 # Create WebSocket manager
                 self._ws_manager = WsManager(config=component_config)
-                self._ws_manager.set_tokens(tokens)
+                self._ws_manager.set_tokens(tokens, activate=True)
                 self._ws_manager.set_token_refresher(self._api_client.get_ws_token)
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
 
@@ -425,10 +429,11 @@ class Speaker:
                 self._playback_handler = PlaybackCommandHandler(
                     self._player,
                     on_quality_change=self._on_quality_change,
+                    speaker_name=self.name,
                 )
-                # Lets the handler hold the server's join snapshot after each
-                # (re)connect until it knows this speaker stays active.
+                # Commands require activation confirmed on the current connection.
                 self._ws_manager.on_connected(self._playback_handler.note_connected)
+                self._ws_manager.on_disconnected(self._playback_handler.note_disconnected)
                 self._volume_handler = VolumeCommandHandler(self._player)
 
                 # Wire next-track callbacks for auto-advance
@@ -456,9 +461,7 @@ class Speaker:
                 for msg_type in self._playback_handler.get_message_types():
                     self._ws_manager.register_handler(
                         msg_type,
-                        lambda mt, msg, h=self._playback_handler: asyncio.create_task(
-                            h.handle_message(mt, msg)
-                        ),
+                        self._playback_handler.dispatch_message,
                     )
 
                 for msg_type in self._volume_handler.get_message_types():

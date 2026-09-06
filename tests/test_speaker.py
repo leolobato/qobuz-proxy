@@ -378,8 +378,7 @@ class TestSpeakerWebSocket:
         assert speaker._playback_handler._on_next_track_changed is player.on_next_track_info_changed
 
     async def test_setup_websocket_wires_connect_notice_to_playback_handler(self):
-        """The handler must learn about each (re)connect to hold the server's
-        join snapshot until it knows this speaker stays the active renderer."""
+        """The handler must invalidate commands on each connection change."""
         config = _make_speaker_config()
         speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
         speaker._queue = MagicMock()
@@ -410,6 +409,11 @@ class TestSpeakerWebSocket:
 
         assert speaker._playback_handler is not None
         mock_ws.on_connected.assert_called_once_with(speaker._playback_handler.note_connected)
+        mock_ws.on_disconnected.assert_called_once_with(speaker._playback_handler.note_disconnected)
+        for msg_type in speaker._playback_handler.get_message_types():
+            mock_ws.register_handler.assert_any_call(
+                msg_type, speaker._playback_handler.dispatch_message
+            )
 
     async def test_setup_websocket_refreshes_existing_manager(self):
         """If ws_manager already exists, _setup_websocket should only refresh tokens."""
@@ -432,7 +436,7 @@ class TestSpeakerWebSocket:
             await speaker._setup_websocket(tokens)
 
         # Should refresh tokens on existing manager, not create a new one
-        speaker._ws_manager.set_tokens.assert_called_once_with(tokens)
+        speaker._ws_manager.set_tokens.assert_called_once_with(tokens, activate=True)
         mock_ws_cls.assert_not_called()
         assert speaker._ws_connected_event.is_set() is True
 

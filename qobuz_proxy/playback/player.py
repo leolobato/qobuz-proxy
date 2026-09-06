@@ -418,6 +418,10 @@ class QobuzPlayer:
         self._command_generation += 1
         return self._command_generation
 
+    def invalidate_pending_commands(self) -> None:
+        """Revoke queued/in-flight playback intents without interrupting current audio."""
+        self._next_generation()
+
     async def apply_remote_state(
         self,
         *,
@@ -545,6 +549,9 @@ class QobuzPlayer:
                 await self.seek(position_ms)
 
             if playing_state is not None and not stale:
+                if gen != self._command_generation:
+                    logger.debug("SET_STATE superseded before applying playback state; skipping")
+                    return
                 # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
                 if playing_state == 2:
                     await self._play_locked(position_ms or 0)
