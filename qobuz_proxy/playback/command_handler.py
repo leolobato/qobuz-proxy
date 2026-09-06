@@ -8,6 +8,8 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+from .queue import QueueVersion
+
 if TYPE_CHECKING:
     from .player import QobuzPlayer
     from .queue import QobuzQueue
@@ -176,6 +178,15 @@ class PlaybackCommandHandler:
 
     async def _apply_set_state(self, state: Any, generation: int) -> None:
         """Apply a decoded SrvrRndrSetState while this renderer still owns playback."""
+        # Renderer-only connections do not receive controller queue snapshots.
+        # Their reports must echo the version supplied in SET_STATE; otherwise
+        # the server may ignore a newly reported current item as stale.
+        if state.HasField("queueVersion"):
+            await self.queue.set_version(
+                QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
+            )
+            if not self._active or generation != self._generation:
+                return
         # Extract current queue item info
         current_item = None
         current_queue_item_id = None

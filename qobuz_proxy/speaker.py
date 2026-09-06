@@ -441,6 +441,7 @@ class Speaker:
                     get_callback=self._playback_handler.get_next_track_info,
                     clear_callback=self._playback_handler.clear_next_track_info,
                 )
+                self._player.set_next_track_request_callback(self._ws_manager.request_next_track)
 
                 # Re-arm gapless when the app changes the next queue item mid-track
                 # (e.g. "play next" insertions), otherwise the stale armed track

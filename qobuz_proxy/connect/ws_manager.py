@@ -326,6 +326,18 @@ class WsManager:
         """
         return await self._encode_and_send(lambda: self._codec.encode_volume_changed(volume))
 
+    async def request_next_track(self, still_needed: Callable[[], bool]) -> bool:
+        """Advance the server queue only while the originating playback intent is valid."""
+        generation = self._ownership_generation
+        return await self._encode_and_send(
+            self._codec.encode_next_track,
+            allowed=lambda: (
+                self.is_renderer_active
+                and generation == self._ownership_generation
+                and still_needed()
+            ),
+        )
+
     async def send_file_audio_quality_changed(
         self,
         quality: int,

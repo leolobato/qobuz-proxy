@@ -7,7 +7,7 @@ Core playback controller that orchestrates queue, metadata, and audio backend.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -48,10 +48,10 @@ _PAUSED_STOP_CONFIRMATIONS = 3
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
 
 # When the track we advance to cannot be played (Qobuz reports it "Not
-# available" in the user's region), we report it as loading and wait for the
-# server's SET_STATE naming the item after it. If that never arrives, stop
-# rather than sit in LOADING forever.
+# available" in the user's region), ask the server to advance the queue.
+# If it never acknowledges the NEXT action, stop rather than wait forever.
 _UNAVAILABLE_SKIP_TIMEOUT_S = 10.0
+_MAX_UNAVAILABLE_SKIPS = 20
 
 
 class QobuzPlayer:
@@ -136,6 +136,8 @@ class QobuzPlayer:
         # Unplayable-track skip: the track we are waiting to skip past, and the
         # timeout that gives up if the server never names its successor.
         self._skip_pending_track: Optional[QueueTrack] = None
+        self._request_next_track: Optional[Callable[[Callable[[], bool]], Awaitable[bool]]] = None
+        self._unavailable_skip_count = 0
         self._skip_timeout_task: Optional[asyncio.Task] = None
 
         # Callback for next track info changes (from command handler)
@@ -421,6 +423,13 @@ class QobuzPlayer:
     def invalidate_pending_commands(self) -> None:
         """Revoke queued/in-flight playback intents without interrupting current audio."""
         self._next_generation()
+        self._clear_skip_pending()
+
+    def set_next_track_request_callback(
+        self, callback: Callable[[Callable[[], bool]], Awaitable[bool]]
+    ) -> None:
+        """Wire the renderer NEXT action, with a guard checked immediately before sending."""
+        self._request_next_track = callback
 
     async def apply_remote_state(
         self,
@@ -450,6 +459,22 @@ class QobuzPlayer:
             context_uuid: Album/playlist context bytes for the target track, used
                 for play reporting (listening history / scrobbles).
         """
+        # A replay of the failed current item is not a new playback intent.
+        # In particular it must not invalidate a NEXT waiting for the send lock.
+        pending = self._skip_pending_track
+        if (
+            self._request_next_track
+            and pending is not None
+            and playing_state not in (1, 3)
+            and (
+                track_id is None
+                or (
+                    track_id == pending.track_id
+                    and (queue_item_id is None or queue_item_id == pending.queue_item_id)
+                )
+            )
+        ):
+            return
         gen = self._next_generation()
         async with self._playback_lock:
             if gen != self._command_generation:
@@ -462,6 +487,30 @@ class QobuzPlayer:
             # state (position or context) with its outdated values.
             stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
 
+            if (
+                self._skip_pending_track is not None
+                and playing_state in (1, 3)
+                and (
+                    playing_state == 1
+                    or track_id is None
+                    or (
+                        track_id == self._skip_pending_track.track_id
+                        and (
+                            queue_item_id is None
+                            or queue_item_id == self._skip_pending_track.queue_item_id
+                        )
+                    )
+                )
+            ):
+                # A user stop/pause wins over a pending automatic skip, even
+                # when the app sends it without a current queue item.
+                self._clear_skip_pending()
+                self._unavailable_skip_count = 0
+                await self.backend.stop()
+                self._state = PlaybackState.STOPPED if playing_state == 1 else PlaybackState.PAUSED
+                await self._send_state_update()
+                return
+
             if self._skip_pending_track is not None and track_id is None:
                 logger.debug("Ignoring SET_STATE without a queue item while skipping a track")
                 return
@@ -469,18 +518,41 @@ class QobuzPlayer:
             # Load if a track is specified and differs from the loaded one.
             if track_id is not None:
                 cur = self._current_track
-                if cur is not None and cur is self._skip_pending_track and cur.track_id == track_id:
+                if (
+                    cur is not None
+                    and cur is self._skip_pending_track
+                    and cur.track_id == track_id
+                    and (queue_item_id is None or cur.queue_item_id == queue_item_id)
+                ):
+                    if self._request_next_track:
+                        # NEXT is already in flight. An echo of the unavailable
+                        # current item is not its acknowledgement: wait for a
+                        # new current item instead of issuing a second skip.
+                        return
                     # The server acknowledged the unplayable item we reported as
                     # current; its nextQueueItem (already stored by the command
                     # handler) is where playback continues.
                     await self._skip_past_unplayable_locked()
                     return
-                if cur is None or cur.track_id != track_id:
+                if (
+                    cur is None
+                    or cur.track_id != track_id
+                    or cur is self._skip_pending_track
+                    or (playing_state == 2 and cur.streaming_url is None)
+                ):
                     logger.info(f"Loading new track: {track_id}")
+                    load_context = context_uuid
+                    if (
+                        load_context is None
+                        and cur is not None
+                        and cur.track_id == track_id
+                        and (queue_item_id is None or cur.queue_item_id == queue_item_id)
+                    ):
+                        load_context = cur.context_uuid
                     if not await self._load_track_locked(
                         queue_item_id or 0,
                         track_id,
-                        context_uuid,
+                        load_context,
                         for_playback=playing_state == 2,
                     ):
                         failed = self._current_track
@@ -492,7 +564,12 @@ class QobuzPlayer:
                             # Asked to play a track that cannot be fetched (e.g.
                             # "Not available" in this region): skip it as the
                             # official app does.
-                            await self._skip_past_unplayable_locked()
+                            if gen != self._command_generation:
+                                return
+                            if self._request_next_track:
+                                await self._begin_skip_wait_locked()
+                            else:
+                                await self._skip_past_unplayable_locked()
                         return
                     if gen != self._command_generation:
                         # A stop/next/other SET_STATE queued up while the URL
@@ -782,6 +859,7 @@ class QobuzPlayer:
         # Clear gapless state — explicit stop
         self._clear_gapless_state()
         self._clear_skip_pending()
+        self._unavailable_skip_count = 0
 
         await self.backend.stop()
 
@@ -920,6 +998,7 @@ class QobuzPlayer:
     ) -> bool:
         # Clear gapless state — explicit track change
         self._clear_gapless_state()
+        generation = self._command_generation
 
         logger.info(
             f"Play track requested: track_id={track_id}, queue_item_id={queue_item_id}, pos={position_ms}ms"
@@ -929,6 +1008,9 @@ class QobuzPlayer:
         if not await self._load_track_locked(
             queue_item_id, track_id, context_uuid, for_playback=True
         ):
+            return False
+
+        if generation != self._command_generation:
             return False
 
         # Set starting position
@@ -1177,6 +1259,7 @@ class QobuzPlayer:
             # app's progress bar snap to 0:00 until the next heartbeat.
             self._state = PlaybackState.PLAYING
             self._current_duration_ms = track.duration_ms
+            self._unavailable_skip_count = 0
             self._position_value_ms = start_position_ms
             self._position_timestamp_ms = int(time.time() * 1000)
 
@@ -1288,6 +1371,7 @@ class QobuzPlayer:
         ``ended_track`` is the track that was playing when the backend reported
         the end, used to detect a user command that superseded the restart.
         """
+        generation = self._command_generation
         # Clear gapless state — prevents stale gapless callbacks from racing
         self._transition_generation += 1
         self._gapless_armed = False
@@ -1300,6 +1384,8 @@ class QobuzPlayer:
 
         # Get queue state to check repeat mode
         queue_state = await self.queue.get_state()
+        if generation != self._command_generation or ended_track is not self._current_track:
+            return
 
         if queue_state.repeat_mode == RepeatMode.ONE and ended_track is not None:
             # Restart the current track from the beginning under repeat-one,
@@ -1317,6 +1403,7 @@ class QobuzPlayer:
                     self._clear_next_track_callback()
 
                 # Load and play the next track
+                advance_generation = self._command_generation + 1
                 started = await self.play_track(
                     queue_item_id=next_track_info["queueItemId"],
                     track_id=next_track_info["trackId"],
@@ -1326,7 +1413,7 @@ class QobuzPlayer:
                 if not started:
                     # e.g. "Not available" in this region — skip past it
                     # instead of leaving the album stopped (GitHub #21).
-                    await self._skip_past_unplayable(next_track_info)
+                    await self._skip_past_unplayable(next_track_info, advance_generation)
                 return
 
         # No next track available - stop playback
@@ -1376,11 +1463,10 @@ class QobuzPlayer:
     #
     # A renderer only learns the current and the next queue item (via
     # SET_STATE), so once the next item turns out to be unplayable we don't know
-    # what follows it. The server does send a SET_STATE with a fresh
-    # nextQueueItem after we report a new current item, so: adopt the unplayable
-    # item as current, report it as loading (PLAYING + BUFFERING on the wire),
-    # and let apply_remote_state() finish the skip when that SET_STATE arrives.
-    # A timeout stops playback if the server never answers.
+    # what follows it. Reporting a new current item does not guarantee a
+    # SET_STATE response (#21). Echo the current queue version with the failed
+    # item, then explicitly request NEXT and wait for the server's selected
+    # current item. This preserves shuffle/repeat/queue-context ordering.
 
     def _clear_skip_pending(self) -> None:
         """Forget a pending unplayable-track skip and cancel its timeout."""
@@ -1395,6 +1481,13 @@ class QobuzPlayer:
         track = self._current_track
         if track is None:
             return
+        generation = self._command_generation
+        if self._request_next_track:
+            self._unavailable_skip_count += 1
+            if self._unavailable_skip_count > _MAX_UNAVAILABLE_SKIPS:
+                logger.warning("Too many consecutive unavailable tracks; stopping playback")
+                await self._stop_playback_locked()
+                return
         self._clear_skip_pending()
         self._skip_pending_track = track
         self._state = PlaybackState.LOADING
@@ -1406,6 +1499,11 @@ class QobuzPlayer:
         )
         self._skip_timeout_task = asyncio.create_task(self._skip_wait_timeout(track))
         await self._send_state_update()
+        if self._request_next_track:
+            sent = await self._request_next_track(
+                lambda: self._skip_pending_track is track and generation == self._command_generation
+            )
+            logger.info("Requested NEXT for unavailable track %s: sent=%s", track.track_id, sent)
 
     async def _skip_wait_timeout(self, pending: QueueTrack) -> None:
         await asyncio.sleep(_UNAVAILABLE_SKIP_TIMEOUT_S)
@@ -1457,12 +1555,13 @@ class QobuzPlayer:
             await self._begin_skip_wait_locked()
         return False
 
-    async def _skip_past_unplayable(self, failed_info: dict) -> None:
+    async def _skip_past_unplayable(self, failed_info: dict, generation: int) -> None:
         """Start the skip flow after an auto-advance into an unplayable track."""
         async with self._playback_lock:
             cur = self._current_track
             if (
-                cur is None
+                generation != self._command_generation
+                or cur is None
                 or cur.track_id != failed_info["trackId"]
                 or cur.queue_item_id != failed_info["queueItemId"]
                 or cur.streaming_url is not None

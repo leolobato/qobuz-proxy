@@ -96,7 +96,7 @@ message QConnectMessage {
   optional RndrSrvrJoinSession               rndrSrvrJoinSession               = 21;
   optional RndrSrvrDeviceInfoUpdated         rndrSrvrDeviceInfoUpdated         = 22;
   optional RndrSrvrStateUpdated              rndrSrvrStateUpdated              = 23;
-  optional RndrSrvrRendererAction            rndrSrvrRendererAction            = 30;
+  optional RndrSrvrRendererAction            rndrSrvrRendererAction            = 24;
   optional RndrSrvrVolumeChanged             rndrSrvrVolumeChanged             = 25;
   optional RndrSrvrFileAudioQualityChanged   rndrSrvrFileAudioQualityChanged   = 26;
   optional RndrSrvrDeviceAudioQualityChanged rndrSrvrDeviceAudioQualityChanged = 27;
@@ -173,7 +173,11 @@ message RndrSrvrJoinSession { // On
 
 message RndrSrvrDeviceInfoUpdated { optional DeviceInfo   deviceInfo = 1; }
 message RndrSrvrStateUpdated      { optional QueueRendererState state = 1; }
-message RndrSrvrRendererAction    { optional int32 action = 1; } // enum numeric
+// Matches the official web client (8.2.0-b034): NEXT=2, action field=2.
+message RndrSrvrRendererAction {
+  optional uint32 seekPosition = 1;
+  optional int32 action = 2;
+}
 message RndrSrvrVolumeChanged     { optional uint32 volume = 1; }
 message RndrSrvrVolumeMuted       { optional bool   value  = 1; }
 message RndrSrvrFileAudioQualityChanged {

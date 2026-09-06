@@ -346,6 +346,17 @@ class ProtocolCodec:
 
         return self.encode_payload(batch.SerializeToString())
 
+    def encode_next_track(self) -> bytes:
+        """Request the server's next queue item using renderer action NEXT=2."""
+        message = payload_pb2.QConnectMessage()
+        message.messageType = QConnectMessageType.RNDR_SRVR_RENDERER_ACTION
+        message.rndrSrvrRendererAction.action = 2
+        batch = payload_pb2.QConnectBatch()
+        batch.messagesTime = self._now_ms()
+        batch.messagesId = self._next_batch_id()
+        batch.messages.append(message)
+        return self.encode_payload(batch.SerializeToString())
+
     def encode_file_audio_quality_changed(
         self,
         quality: int,

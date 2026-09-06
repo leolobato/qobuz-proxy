@@ -753,3 +753,22 @@ class TestSessionOwnership:
             assert ws_manager.is_renderer_active is False
         assert joins == [True, False]
         assert disconnected.call_count == 2
+
+    @pytest.mark.parametrize("deactivate", [False, True])
+    async def test_next_waiting_for_send_lock_is_revocable(self, ws_manager, deactivate):
+        ws_manager._ws = AsyncMock()
+        ws_manager._is_connected = True
+        await _deliver_active(ws_manager, True)
+        needed = True
+        await ws_manager._send_lock.acquire()
+        task = asyncio.create_task(ws_manager.request_next_track(lambda: needed))
+        await asyncio.sleep(0)
+        if deactivate:
+            await _deliver_active(ws_manager, False)
+        else:
+            needed = False  # A new user command superseded the skip.
+        counter = ws_manager._codec._msg_counter
+        ws_manager._send_lock.release()
+        assert await task is False
+        ws_manager._ws.send.assert_not_awaited()
+        assert ws_manager._codec._msg_counter == counter

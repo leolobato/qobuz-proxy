@@ -376,6 +376,7 @@ class TestSpeakerWebSocket:
 
         assert speaker._playback_handler is not None
         assert speaker._playback_handler._on_next_track_changed is player.on_next_track_info_changed
+        player.set_next_track_request_callback.assert_called_once_with(mock_ws.request_next_track)
 
     async def test_setup_websocket_wires_connect_notice_to_playback_handler(self):
         """The handler must invalidate commands on each connection change."""

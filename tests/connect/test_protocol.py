@@ -364,3 +364,15 @@ class TestMessageTypes:
         # Server -> Renderer messages
         assert QConnectMessageType.SRVR_RNDR_SET_STATE == 41
         assert QConnectMessageType.SRVR_RNDR_SET_VOLUME == 42
+
+
+class TestRendererNextAction:
+    def test_next_matches_official_client_wire_format(self, codec):
+        """Independent golden bytes: type 24, union field 24, action field 2 = NEXT (2).
+
+        Verified against play.qobuz.com/resources/8.2.0-b034/bundle.js.
+        A round-trip alone would miss incorrect field numbers in our schema.
+        """
+        decoded = codec.decode_frame(codec.encode_next_track())
+        batch = codec.decode_qconnect_batch(decoded.payload)
+        assert batch.messages[0].SerializeToString() == bytes.fromhex("08 18 c2 01 02 10 02")
