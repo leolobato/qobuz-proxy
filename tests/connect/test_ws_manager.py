@@ -514,6 +514,7 @@ class TestSessionOwnership:
             manager._ws = AsyncMock()
             await manager._send_join_session()
             assert _last_join(manager).isActive is True
+            assert _last_join(manager).reason == 1
             manager._is_connected = True
             await _deliver_active(manager, True)
 
@@ -536,6 +537,7 @@ class TestSessionOwnership:
             assert await manager._wait_for_valid_token(buffer_s=60)
             await manager._send_join_session()
             assert _last_join(manager).isActive is (index == 1)
+            assert _last_join(manager).reason == 2
             # A join request itself is not confirmation to send playback state.
             manager._is_connected = True
             assert await _send_report(manager) is False

@@ -61,6 +61,13 @@ class QConnectMessageType(IntEnum):
     SRVR_CTRL_QUEUE_TRACKS_LOADED = 91
 
 
+class JoinSessionReason(IntEnum):
+    """Join reasons used by the Qobuz client (web bundle 8.2.0-b034)."""
+
+    CONTROLLER_REQUEST = 1
+    RECONNECTION = 2
+
+
 @dataclass
 class DecodedMessage:
     """Decoded WebSocket message."""
@@ -258,6 +265,7 @@ class ProtocolCodec:
         max_audio_quality: int = 27,
         *,
         is_active: bool = False,
+        reason: JoinSessionReason = JoinSessionReason.RECONNECTION,
     ) -> bytes:
         """
         Encode join session message (sent when connecting).
@@ -269,6 +277,7 @@ class ProtocolCodec:
             initial_state: Optional initial renderer state
             max_audio_quality: Max quality ID (5=MP3, 6=CD, 7=Hi-Res 96k, 27=Hi-Res 192k)
             is_active: Request activation or restore this renderer's session ownership.
+            reason: Distinguish explicit selection from transport reconnection.
 
         Returns:
             Encoded frame bytes
@@ -294,7 +303,7 @@ class ProtocolCodec:
         join = payload_pb2.RndrSrvrJoinSession()
         join.sessionUuid = session_uuid  # Required!
         join.deviceInfo.CopyFrom(device_info)
-        join.reason = 1  # Normal join
+        join.reason = reason
         join.isActive = is_active
 
         if initial_state:

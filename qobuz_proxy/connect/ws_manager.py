@@ -16,7 +16,13 @@ from websockets import ClientConnection
 from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
 
-from .protocol import DecodedMessage, MessageType, ProtocolCodec, QConnectMessageType
+from .protocol import (
+    DecodedMessage,
+    JoinSessionReason,
+    MessageType,
+    ProtocolCodec,
+    QConnectMessageType,
+)
 from .types import ConnectTokens
 
 logger = logging.getLogger(__name__)
@@ -533,6 +539,11 @@ class WsManager:
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
             is_active=is_active,
+            reason=(
+                JoinSessionReason.CONTROLLER_REQUEST
+                if activation_request is not None
+                else JoinSessionReason.RECONNECTION
+            ),
         )
         await self._ws.send(join_frame)
         if self._activation_request is activation_request:

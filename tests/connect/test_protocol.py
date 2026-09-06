@@ -130,6 +130,7 @@ class TestEncoding:
         join = batch.messages[0].rndrSrvrJoinSession
         assert join.HasField("isActive")
         assert join.isActive is False
+        assert join.reason == 2
 
     def test_encode_join_session_with_quality(
         self, codec: ProtocolCodec, device_uuid: bytes
