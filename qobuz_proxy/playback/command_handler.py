@@ -95,11 +95,7 @@ class PlaybackCommandHandler:
 
     def dispatch_message(self, msg_type: int, message: Any) -> asyncio.Task[None]:
         """Record ownership in wire order before scheduling asynchronous backend work."""
-        if (
-            msg_type == MSG_TYPE_SET_ACTIVE
-            and message.HasField("srvrRndrSetActive")
-            and message.srvrRndrSetActive.HasField("active")
-        ):
+        if msg_type == MSG_TYPE_SET_ACTIVE and message.HasField("srvrRndrSetActive"):
             self._note_active(message.srvrRndrSetActive.active)
         return asyncio.create_task(self.handle_message(msg_type, message, self._generation))
 
@@ -125,7 +121,6 @@ class PlaybackCommandHandler:
             pending_stop = (
                 msg_type == MSG_TYPE_SET_ACTIVE
                 and message.HasField("srvrRndrSetActive")
-                and message.srvrRndrSetActive.HasField("active")
                 and not message.srvrRndrSetActive.active
                 and not self._active
                 and generation == self._deactivation_generation
@@ -302,9 +297,7 @@ class PlaybackCommandHandler:
 
         This tells the renderer if it's the currently active playback device.
         """
-        if not (
-            message.HasField("srvrRndrSetActive") and message.srvrRndrSetActive.HasField("active")
-        ):
+        if not message.HasField("srvrRndrSetActive"):
             logger.debug("SET_ACTIVE message missing srvrRndrSetActive field")
             return
 

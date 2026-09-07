@@ -62,7 +62,29 @@ For #21:
 
 Combined case: while B is waiting to skip an unavailable item, refresh inactive A and C. B must retain ownership and advance exactly once. Then deactivate B during a delayed NEXT; its request and pending timeout must be invalidated.
 
-## 3. Live local confirmation with Qobuz and real renderers — not yet run
+## 3. Live local confirmation with Qobuz and real renderers — in progress
+
+On 2026-09-07, the deployed source matched the three fixes through `10e9d10`.
+Kitchen completed approximately 62 minutes of playback with 15 gapless transitions
+and no ERROR records. At 09:18:20 Europe/Berlin, after the album ended, it refreshed
+its token with `isActive=True, cause=reconnect` and remained stopped. This verifies
+an owner reconnect after playback ends, not an inactive-speaker reconnect or #21.
+
+Living Room was selected at 09:58:45 and paused at 09:58:58. Kitchen was activated
+at 10:00:03 and started a playlist at 10:00:26, with volume set to zero. No Living
+Room deactivation was logged. Inspection revealed a local regression: requiring
+`HasField("active")` discards a present SET_ACTIVE payload whose boolean is omitted
+and therefore defaults to false. The INFO logs do not expose the received payload,
+so this is a possible explanation for the missing deactivation, not a confirmed
+capture of the live message.
+
+Three new regression variants failed against `10e9d10`: an inactive reconnect
+claimed ownership, queued playback survived deactivation, and a disconnect lost a
+pending stop. Removing the boolean-presence requirement fixes all three while
+still requiring the SET_ACTIVE payload. The connect/playback/integration suites
+pass (271 tests). This follow-up was tested locally; the running instance was
+left unchanged. Live verification must record deployment of this follow-up and
+confirm the inactive speaker's deactivation and subsequent passive reconnect.
 
 Use a separate test instance/configuration, with DEBUG logging and disposable device names. Capture sanitized protobuf fields and renderer HTTP requests; omit authentication tokens and signed streaming URLs.
 

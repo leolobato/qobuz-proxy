@@ -3,6 +3,8 @@
 import uuid
 from unittest.mock import AsyncMock
 
+import pytest
+
 from qobuz_proxy.config import Config
 from qobuz_proxy.connect.protocol import DecodedMessage, MessageType
 from qobuz_proxy.connect.types import ConnectTokens
@@ -10,14 +12,21 @@ from qobuz_proxy.connect.ws_manager import WsManager
 from qobuz_proxy.proto import qconnect_payload_pb2 as pb
 
 
-async def test_inactive_rejoin_does_not_request_session_ownership():
+@pytest.mark.parametrize("omit_false", [False, True])
+async def test_inactive_rejoin_does_not_request_session_ownership(omit_false):
     manager = WsManager(Config())
     manager.set_tokens(ConnectTokens(session_id=str(uuid.uuid4())))
     manager._ws = AsyncMock()
     manager._is_connected = True
     batch = pb.QConnectBatch()
     message = batch.messages.add(messageType=43)
+    message.srvrRndrSetActive.active = True
+    await manager._handle_payload(
+        DecodedMessage(msg_type=MessageType.PAYLOAD, payload=batch.SerializeToString())
+    )
     message.srvrRndrSetActive.active = False
+    if omit_false:
+        message.srvrRndrSetActive.ClearField("active")
     await manager._handle_payload(
         DecodedMessage(
             msg_type=MessageType.PAYLOAD,

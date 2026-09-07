@@ -636,11 +636,11 @@ class WsManager:
 
         for msg in batch.messages:
             msg_type = msg.messageType
-            if (
-                msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE
-                and msg.HasField("srvrRndrSetActive")
-                and msg.srvrRndrSetActive.HasField("active")
+            if msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE and msg.HasField(
+                "srvrRndrSetActive"
             ):
+                # A present SET_ACTIVE payload with an omitted boolean means
+                # false. Requiring field presence would lose deactivation.
                 # Do this synchronously, before any handler task can await a
                 # slow backend or send a final STOPPED report after deactivation.
                 self._renderer_active = msg.srvrRndrSetActive.active

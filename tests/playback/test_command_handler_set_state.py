@@ -224,11 +224,14 @@ class TestNextTrackSentinel:
         assert "4294967295" not in backend.played
 
 
-def _set_active_msg(active: bool):
+def _set_active_msg(active: bool, *, omit_false: bool = False):
     """Build a server->renderer SET_ACTIVE (type 43) protobuf message."""
     msg = pb.QConnectMessage()
     msg.messageType = 43
     msg.srvrRndrSetActive.active = active
+    if omit_false:
+        assert active is False
+        msg.srvrRndrSetActive.ClearField("active")
     return msg
 
 
@@ -247,13 +250,14 @@ class TestRendererOwnership:
         await handler._handle_set_state(_set_state_msg(track_id=2002, queue_item_id=2))
         assert backend.played == ["2002"]
 
-    async def test_same_batch_deactivation_discards_queued_snapshot(self) -> None:
+    @pytest.mark.parametrize("omit_false", [False, True])
+    async def test_same_batch_deactivation_discards_queued_snapshot(self, omit_false) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
         tasks = [
             handler.dispatch_message(43, _set_active_msg(True)),
             handler.dispatch_message(41, _set_state_msg(track_id=2001, queue_item_id=1)),
-            handler.dispatch_message(43, _set_active_msg(False)),
+            handler.dispatch_message(43, _set_active_msg(False, omit_false=omit_false)),
         ]
         await asyncio.gather(*tasks)
         assert backend.played == []
@@ -369,12 +373,13 @@ class TestRendererOwnership:
         backend.resume.assert_not_awaited()
         assert player.state == PlaybackState.STOPPED
 
-    async def test_disconnect_cannot_discard_a_received_deactivation(self) -> None:
+    @pytest.mark.parametrize("omit_false", [False, True])
+    async def test_disconnect_cannot_discard_a_received_deactivation(self, omit_false) -> None:
         player, backend = _make_player()
         handler = PlaybackCommandHandler(player)
         await handler._handle_set_active(_set_active_msg(True))
         await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
-        stop = handler.dispatch_message(43, _set_active_msg(False))
+        stop = handler.dispatch_message(43, _set_active_msg(False, omit_false=omit_false))
         handler.note_disconnected()
         await stop
         assert player.state == PlaybackState.STOPPED
