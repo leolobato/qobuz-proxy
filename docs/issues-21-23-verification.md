@@ -62,7 +62,7 @@ For #21:
 
 Combined case: while B is waiting to skip an unavailable item, refresh inactive A and C. B must retain ownership and advance exactly once. Then deactivate B during a delayed NEXT; its request and pending timeout must be invalidated.
 
-## 3. Live local confirmation with Qobuz and real renderers — in progress
+## 3. Live local confirmation with Qobuz and real renderers
 
 On 2026-09-07, the deployed source matched the three fixes through `10e9d10`.
 Kitchen completed approximately 62 minutes of playback with 15 gapless transitions
@@ -82,9 +82,37 @@ Three new regression variants failed against `10e9d10`: an inactive reconnect
 claimed ownership, queued playback survived deactivation, and a disconnect lost a
 pending stop. Removing the boolean-presence requirement fixes all three while
 still requiring the SET_ACTIVE payload. The connect/playback/integration suites
-pass (271 tests). This follow-up was tested locally; the running instance was
-left unchanged. Live verification must record deployment of this follow-up and
-confirm the inactive speaker's deactivation and subsequent passive reconnect.
+pass (271 tests). The follow-up was deployed as `4e1bbfd` at 10:49:49 Europe/Berlin;
+the running module's SHA-256 matched the local source.
+
+### Completed live results (2026-09-07, Europe/Berlin)
+
+- **#23 passed:** at 10:51:51, Living Room received `active=False` and Kitchen
+  received `active=True`. At 11:50:18, Living Room naturally refreshed its token
+  and rejoined with `isActive=False, cause=reconnect`. Kitchen continued through
+  subsequent tracks with no ownership loss, logged pauses/stops, or errors.
+  At 11:55, direct Sonos queries confirmed Kitchen PLAYING and Living Room STOPPED.
+  Living Room made no audio requests after the handoff; the container had no restarts.
+- **#21 first skip passed:** on the reported album and matching track IDs,
+  track 5 (`234375468`) returned metadata 404s. After track 4 ended naturally,
+  the proxy sent `NEXT` at 12:14:01.548. Qobuz selected track 6 (`234375469`),
+  and "Rough Rider" began at 12:14:02.003, without the former ten-second timeout.
+- **#21 second unavailable item passed after manual advancement:** the user
+  redeployed at 12:17:16, then resumed Kitchen and advanced through track 7.
+  Track 8 (`234375471`) returned 404; `NEXT` was sent at 12:17:47.224 and track 9
+  (`234375472`), "Big Shot", started at 12:17:47.623. This is a second real
+  unavailable-item recovery, not a natural-end 7-to-9 transition.
+
+Release validation for v1.7.1: 697 tests passed; Ruff passed. Mypy remains
+non-clean with the previously observed 70 errors in 13 files.
+
+These observations verify the real Qobuz service with Sonos DLNA playback.
+They do not cover every app/region/backend combination; MPD, local audio,
+consecutive unavailable tracks, and combined failure scenarios remain covered by
+automated tests or the additional live exercises below. Continuous Docker logs
+were copied off the server, including across redeployment, to preserve evidence.
+
+### Additional live coverage
 
 Use a separate test instance/configuration, with DEBUG logging and disposable device names. Capture sanitized protobuf fields and renderer HTTP requests; omit authentication tokens and signed streaming URLs.
 
