@@ -84,6 +84,7 @@ class WsManager:
         # the server's last decision across transport reconnects, but require
         # confirmation on the new connection before sending playback reports.
         self._renderer_active = False
+        self._external_playback = False
         self._active_confirmed = False
         self._ownership_generation = 0
         self._activation_request: Optional[object] = None
@@ -125,6 +126,8 @@ class WsManager:
         """
         previous_token = self._ws_token
         previous_session_uuid = self._session_uuid
+        if activate:
+            self._external_playback = False
 
         if tokens.ws_token:
             self._ws_token = WSToken.from_connect_token(
@@ -232,6 +235,16 @@ class WsManager:
     def is_renderer_active(self) -> bool:
         """Whether this connection has confirmed ownership of playback."""
         return self._is_connected and self._active_confirmed and self._renderer_active
+
+    def release_external_playback(self) -> None:
+        """Remain passive until discovery receives an explicit Qobuz selection."""
+        self._external_playback = True
+        self._renderer_active = False
+        self._active_confirmed = False
+        self._activation_request = None
+        self._ownership_generation += 1
+        if self._on_disconnected:
+            self._on_disconnected()
 
     def _invalidate_connection(self) -> None:
         self._is_connected = False
@@ -636,6 +649,9 @@ class WsManager:
 
         for msg in batch.messages:
             msg_type = msg.messageType
+            if self._external_playback:
+                # Stale cloud activation/snapshots cannot reclaim an external source.
+                continue
             if msg_type == QConnectMessageType.SRVR_RNDR_SET_ACTIVE and msg.HasField(
                 "srvrRndrSetActive"
             ):

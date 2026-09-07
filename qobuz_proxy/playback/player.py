@@ -110,6 +110,7 @@ class QobuzPlayer:
         # the lock (latest-command-wins).
         self._playback_lock = asyncio.Lock()
         self._command_generation = 0
+        self._playback_permission_check: Optional[Callable[[], Awaitable[bool]]] = None
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -425,6 +426,23 @@ class QobuzPlayer:
         self._next_generation()
         self._clear_skip_pending()
 
+    def set_playback_permission_check(self, check: Callable[[], Awaitable[bool]]) -> None:
+        """Check renderer ownership before applying a remote session snapshot."""
+        self._playback_permission_check = check
+
+    async def release_external_playback(self) -> None:
+        """Forget live playback without sending commands to another source."""
+        self.invalidate_pending_commands()
+        self._transition_generation += 1
+        self._gapless_armed = False
+        self._pending_next_track = None
+        if self._clear_next_track_callback:
+            self._clear_next_track_callback()
+        self._state = PlaybackState.STOPPED
+        self._set_position(0)
+        self._report_paused()
+        await self._report_stopped()
+
     def set_next_track_request_callback(
         self, callback: Callable[[Callable[[], bool]], Awaitable[bool]]
     ) -> None:
@@ -479,6 +497,11 @@ class QobuzPlayer:
         async with self._playback_lock:
             if gen != self._command_generation:
                 logger.debug("SET_STATE superseded by newer command; skipping")
+                return
+
+            if self._playback_permission_check and not await self._playback_permission_check():
+                return
+            if gen != self._command_generation:
                 return
 
             # Detect a stale session-restore snapshot (server replays an old
@@ -1785,6 +1808,8 @@ class QobuzPlayer:
                     self._paused_stop_polls = 0
                     # Poll backend state
                     backend_state = await self.backend.get_state()
+                    if self._state != PlaybackState.PLAYING:
+                        continue
 
                     if backend_state == PlaybackState.STOPPED:
                         # Track finished naturally (handled by callback)
@@ -1799,6 +1824,8 @@ class QobuzPlayer:
 
                     # Update position from backend
                     position = await self.backend.get_position()
+                    if self._state != PlaybackState.PLAYING:
+                        continue
                     self._set_position(position)
 
                     # Try to arm gapless if not already armed

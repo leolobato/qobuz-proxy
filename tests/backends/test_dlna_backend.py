@@ -120,6 +120,8 @@ class TestSonosGaplessQueue:
         client = MagicMock()
         client.add_uri_to_queue = AsyncMock(return_value=7)
         client.remove_track_from_queue = AsyncMock(return_value=True)
+        backend._current_proxy_url = "http://proxy/audio/current.flac"
+        client.get_track_uri = AsyncMock(return_value=backend._current_proxy_url)
         backend._client = client
         return backend, client
 

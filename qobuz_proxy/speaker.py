@@ -301,6 +301,8 @@ class Speaker:
             )
             if isinstance(backend, DLNABackend):
                 self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
+                self._player.set_playback_permission_check(backend.can_apply_remote_state)
+                backend.on_external_playback(self._on_external_playback)
 
             # 7. Create and start discovery service
             logger.debug(f"[{self.name}] Starting discovery service...")
@@ -400,6 +402,13 @@ class Speaker:
         logger.info(f"[{self.name}] Qobuz app connected, setting up WebSocket...")
         asyncio.create_task(self._setup_websocket(tokens))
 
+    async def _on_external_playback(self) -> None:
+        """Release cloud ownership before ending the old Qobuz listening session."""
+        if self._ws_manager:
+            self._ws_manager.release_external_playback()
+        if self._player:
+            await self._player.release_external_playback()
+
     async def _setup_websocket(self, tokens: ConnectTokens) -> None:
         """Set up (or refresh) the WebSocket connection after receiving tokens."""
         assert self._queue is not None
@@ -407,6 +416,9 @@ class Speaker:
 
         async with self._ws_setup_lock:
             try:
+                if isinstance(self._backend, DLNABackend):
+                    await self._backend.check_external_playback()
+                    self._backend.prepare_for_selection()
                 if self._ws_manager is not None:
                     # A discovery connect is an explicit selection, even when
                     # the same speaker already has an idle WebSocket.
