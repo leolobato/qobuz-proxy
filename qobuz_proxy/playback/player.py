@@ -139,6 +139,7 @@ class QobuzPlayer:
         # track while an earlier command is still loading.
         self._report_queue_item_override: Optional[int] = None
         self._skipped_from_track_id: Optional[str] = None
+        self._skip_in_flight_track_id: Optional[str] = None
 
         # Unplayable-track skip: the track we are waiting to skip past, and the
         # timeout that gives up if the server never names its successor.
@@ -433,6 +434,7 @@ class QobuzPlayer:
         self._clear_skip_pending()
         self._report_queue_item_override = None
         self._skipped_from_track_id = None
+        self._skip_in_flight_track_id = None
 
     def set_playback_permission_check(self, check: Callable[[], Awaitable[bool]]) -> None:
         """Check renderer ownership before applying a remote session snapshot."""
@@ -505,19 +507,22 @@ class QobuzPlayer:
             )
         ):
             return
-        if self._is_outgoing_track_echo(track_id, playing_state):
+        if self._is_stale_skip_followup(track_id, playing_state):
             logger.info(
-                "Ignoring SET_STATE for outgoing track %s after skip to %s",
+                "Ignoring SET_STATE follow-up during skip to %s (incoming=%s, playing_state=%s)",
+                self._skip_in_flight_track_id
+                or (self._current_track.track_id if self._current_track else "?"),
                 track_id,
-                self._current_track.track_id if self._current_track else "?",
+                playing_state,
             )
             return
         gen = self._next_generation()
         if self._is_play_skip_intent(track_id, playing_state):
-            # Publish the new item before waiting on the lock. A SET_STATE
-            # already in-flight can hold that lock for a URL fetch; without
-            # this the next heartbeat still names the outgoing track and the
-            # Qobuz app snaps back to it.
+            # Mark the skip before waiting on the lock so a PAUSED echo or
+            # outgoing-track SET_STATE cannot bump generation and abort it.
+            # The Qobuz app is source of truth for which song plays; those
+            # follow-ups are the app reacting to buffering, not a user pause.
+            self._skip_in_flight_track_id = track_id
             self._report_queue_item_override = queue_item_id or 0
             await self._send_state_update()
         async with self._playback_lock:
@@ -705,6 +710,41 @@ class QobuzPlayer:
             return False
         cur = self._current_track
         return cur is None or cur.track_id != track_id
+
+    def _is_stale_skip_followup(
+        self, track_id: Optional[str], playing_state: Optional[int]
+    ) -> bool:
+        """Whether this SET_STATE would abort an in-flight skip.
+
+        After skip the app often sends PAUSED (it saw buffering) or another
+        SET_STATE still naming the outgoing track. If those bump generation,
+        the skip never reaches backend.play() — the speaker keeps the old
+        song and the app shows paused.
+        """
+        target = self._skip_in_flight_track_id
+        if target:
+            if playing_state == 1:
+                return False
+            if playing_state == 2 and track_id and track_id != target:
+                outgoing = self._skipped_from_track_id
+                if outgoing is None and self._current_track is not None:
+                    outgoing = self._current_track.track_id
+                if track_id == outgoing:
+                    return True
+                return False
+            if playing_state == 3:
+                return True
+            if track_id and track_id != target:
+                return True
+            return False
+        return self._is_outgoing_track_echo(track_id, playing_state) or (
+            playing_state == 3
+            and self._state == PlaybackState.LOADING
+            and (
+                track_id is None
+                or (self._current_track is not None and self._current_track.track_id == track_id)
+            )
+        )
 
     def _is_outgoing_track_echo(
         self, track_id: Optional[str], playing_state: Optional[int]
@@ -910,6 +950,12 @@ class QobuzPlayer:
             return await self._pause_locked()
 
     async def _pause_locked(self) -> bool:
+        if self._skip_in_flight_track_id is not None:
+            logger.info(
+                "Ignoring pause while skip to %s is in flight",
+                self._skip_in_flight_track_id,
+            )
+            return False
         if self._state != PlaybackState.PLAYING:
             logger.debug(f"Cannot pause in state {self._state}")
             return False
@@ -955,6 +1001,7 @@ class QobuzPlayer:
         self._state = PlaybackState.STOPPED
         self._report_queue_item_override = None
         self._skipped_from_track_id = None
+        self._skip_in_flight_track_id = None
         self._position_value_ms = 0
         self._position_timestamp_ms = int(time.time() * 1000)
 
@@ -1039,12 +1086,14 @@ class QobuzPlayer:
             track = self._current_track
             if track is None:
                 self._state = PlaybackState.STOPPED
+                self._skip_in_flight_track_id = None
                 return False
             if url:
                 track.set_streaming_url(url)
             else:
                 logger.error(f"Failed to get URL for track {track_id}")
                 self._state = PlaybackState.STOPPED
+                self._skip_in_flight_track_id = None
                 return False
 
             meta = await self._get_track_metadata(track_id)
@@ -1061,6 +1110,7 @@ class QobuzPlayer:
                 url_task.cancel()
             logger.error(f"Failed to load track {track_id}: {e}")
             self._state = PlaybackState.STOPPED
+            self._skip_in_flight_track_id = None
             return False
 
     async def play_track(
@@ -1318,6 +1368,7 @@ class QobuzPlayer:
                 if not url:
                     logger.error(f"Failed to get URL for track {track.track_id}")
                     self._state = PlaybackState.ERROR
+                    self._skip_in_flight_track_id = None
                     await self._send_state_update()
                     return False
                 track.set_streaming_url(url)
@@ -1370,6 +1421,7 @@ class QobuzPlayer:
             # app's progress bar snap to 0:00 until the next heartbeat.
             self._state = PlaybackState.PLAYING
             self._skipped_from_track_id = None
+            self._skip_in_flight_track_id = None
             self._current_duration_ms = track.duration_ms
             self._unavailable_skip_count = 0
             self._position_value_ms = start_position_ms
@@ -1382,6 +1434,7 @@ class QobuzPlayer:
         except Exception as e:
             logger.error(f"Failed to start playback: {e}", exc_info=True)
             self._state = PlaybackState.ERROR
+            self._skip_in_flight_track_id = None
             await self._send_state_update()
             return False
 
@@ -2118,6 +2171,21 @@ class QobuzPlayer:
         if self._report_queue_item_override is not None:
             return self._report_queue_item_override
         return self._current_track.queue_item_id if self._current_track else 0
+
+    @property
+    def reporting_state(self) -> PlaybackState:
+        """State to put on the wire.
+
+        A skip in flight is LOADING until that track is actually playing, even
+        if the speaker is still on the outgoing song. Reporting PLAYING for the
+        new item at the old position makes the app send PAUSED and abort the skip.
+        """
+        target = self._skip_in_flight_track_id
+        if target is not None:
+            cur = self._current_track
+            if self._state != PlaybackState.PLAYING or cur is None or cur.track_id != target:
+                return PlaybackState.LOADING
+        return self._state
 
     @property
     def duration_ms(self) -> int:

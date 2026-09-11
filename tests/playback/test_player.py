@@ -544,6 +544,56 @@ class TestSkipAcknowledgesImmediately:
         backend.play.assert_awaited_once()
         player.metadata.get_streaming_url.assert_not_awaited()
 
+    async def test_pause_followup_does_not_abort_skip(self):
+        """The app answers a skip's LOADING report with PAUSED; that must not
+        leave the speaker on the previous song."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+
+        async def slow_play(*args, **kwargs):
+            await asyncio.sleep(0.05)
+
+        backend.play = AsyncMock(side_effect=slow_play)
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "url": "http://prefetch/222.flac",
+            "metadata": {"title": "Next", "duration_ms": 180000},
+            "backend_meta": None,
+        }
+
+        skip = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        for _ in range(50):
+            if player._skip_in_flight_track_id == "222":
+                break
+            await asyncio.sleep(0.001)
+        pause = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=3,  # PAUSED
+            )
+        )
+        await asyncio.gather(skip, pause)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "222"
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited_once()
+        backend.stop.assert_not_awaited()
+
 
 class TestNextAtEndOfQueue:
     """Skipping past the end of the queue must still report the finished play."""
