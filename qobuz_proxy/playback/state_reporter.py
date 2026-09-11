@@ -161,7 +161,7 @@ class StateReporter:
                 # LOADING window used to go silent; the app then treated the
                 # last PLAYING report (old queue item) as authority and snapped
                 # the UI back to the speaker's previous track.
-                if self._player.state in (PlaybackState.PLAYING, PlaybackState.LOADING):
+                if self._player.reporting_state in (PlaybackState.PLAYING, PlaybackState.LOADING):
                     await self._send_state_update()
 
             except asyncio.CancelledError:
@@ -189,13 +189,14 @@ class StateReporter:
 
         # Prefer a skip's advertised item over the still-playing outgoing track.
         queue_item_id = self._player.reported_queue_item_id
+        report_state = self._player.reporting_state
 
         # Get position with current timestamp
         now_ms = int(time.time() * 1000)
 
         # For playing state, use timestamp-based position
         # For paused/stopped/loading, freeze at the last committed value
-        if self._player.state == PlaybackState.PLAYING:
+        if report_state == PlaybackState.PLAYING:
             position_timestamp = self._player._position_timestamp_ms
             position_value = self._player._position_value_ms
             logger.debug(
@@ -206,22 +207,23 @@ class StateReporter:
             # LOADING is frozen at 0 after a skip so the app does not
             # interpolate the outgoing track's position onto the new item.
             position_timestamp = now_ms
-            position_value = self._player.current_position_ms
+            position_value = (
+                0 if report_state == PlaybackState.LOADING else self._player.current_position_ms
+            )
             logger.debug(
-                f"Building report ({self._player.state.name}): "
-                f"player.current_position_ms={position_value}"
+                f"Building report ({report_state.name}): position_value_ms={position_value}"
             )
 
         # Get buffer status from backend
         buffer_status = await self._player.backend.get_buffer_status()
-        if self._player.state == PlaybackState.LOADING:
+        if report_state == PlaybackState.LOADING:
             # Nothing of the incoming track is buffered yet. LOW encodes as the
             # protocol's BUFFER_STATE_BUFFERING, which together with PLAYING
             # (see wire_playing_state) is how a renderer reports "loading".
             buffer_status = BufferStatus.LOW
 
         return PlaybackStateReport(
-            playing_state=self._player.state,
+            playing_state=report_state,
             buffer_state=buffer_status,
             position_timestamp_ms=position_timestamp,
             position_value_ms=position_value,

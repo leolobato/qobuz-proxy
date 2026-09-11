@@ -9,6 +9,7 @@ from qobuz_proxy.playback.state_reporter import StateReporter, wire_playing_stat
 def _reporter(player_state: PlaybackState):
     player = MagicMock()
     player.state = player_state
+    player.reporting_state = player_state
     player.current_track = None
     player.reported_queue_item_id = 0
     player.current_position_ms = 0
@@ -79,6 +80,7 @@ class TestHeartbeatDuringSkip:
 
         reporter, sent = _reporter(PlaybackState.LOADING)
         reporter._player.reported_queue_item_id = 42
+        reporter._player.reporting_state = PlaybackState.LOADING
 
         original = state_reporter_module.STATE_UPDATE_INTERVAL_SECONDS
         state_reporter_module.STATE_UPDATE_INTERVAL_SECONDS = 0.01
