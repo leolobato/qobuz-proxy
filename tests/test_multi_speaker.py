@@ -616,3 +616,70 @@ class TestSpeakerEditCallbacks:
 
         with pytest.raises(KeyError):
             await app._on_remove_speaker("nope")
+
+
+class TestSpeakersApiListsConfig:
+    def test_lists_configured_speakers_that_are_not_running(self):
+        """After a restart, config-backed speakers must still appear in the API."""
+        config = _make_config(
+            _make_speaker_config(name="Living Room", http_port=8689),
+            _make_speaker_config(name="Kitchen", http_port=8690),
+        )
+        running = MagicMock()
+        running.name = "Kitchen"
+        running.get_status.return_value = {
+            "id": "kitchen",
+            "name": "Kitchen",
+            "backend": "dlna",
+            "status": "idle",
+            "config": {},
+            "now_playing": None,
+        }
+
+        app = QobuzProxy(config)
+        app._speakers = [running]
+
+        speakers = app._speakers_for_api()
+        by_id = {s["id"]: s for s in speakers}
+        assert set(by_id) == {"living-room", "kitchen"}
+        assert by_id["living-room"]["status"] == "disconnected"
+        assert by_id["living-room"]["name"] == "Living Room"
+        assert by_id["kitchen"]["status"] == "idle"
+
+    def test_retrying_speaker_is_listed_as_starting(self):
+        config = _make_config(_make_speaker_config(name="Office"))
+        app = QobuzProxy(config)
+        app._speakers = []
+        app._speaker_retry_tasks["office"] = MagicMock()
+        app._speaker_retry_tasks["office"].done.return_value = False
+
+        speakers = app._speakers_for_api()
+        assert speakers[0]["id"] == "office"
+        assert speakers[0]["status"] == "starting"
+
+    async def test_add_persists_when_start_fails(self):
+        """A failed start must still write the speaker so a reboot can retry it."""
+        config = _make_config()
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        speaker = MagicMock()
+        speaker.start = AsyncMock(return_value=False)
+        speaker.get_status.return_value = {"id": "patio", "status": "disconnected"}
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=speaker),
+            patch.object(app, "_save_config") as mock_save,
+            patch.object(app, "_schedule_speaker_retry") as mock_retry,
+        ):
+            result = await app._on_add_speaker(
+                {"name": "Patio", "backend": "dlna", "dlna_ip": "192.168.1.80"}
+            )
+
+        assert [sc.name for sc in config.speakers] == ["Patio"]
+        assert config.speakers[0].uuid
+        mock_save.assert_called_once()
+        mock_retry.assert_called_once()
+        assert app._speakers == []
+        assert result["status"] == "starting"
+        assert "warning" in result

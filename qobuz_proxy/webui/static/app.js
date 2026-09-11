@@ -128,6 +128,9 @@
         if (state === "disconnected") {
             badgeClass = "badge-disconnected";
             badgeLabel = "Disconnected";
+        } else if (state === "starting") {
+            badgeClass = "badge-starting";
+            badgeLabel = "Starting";
         } else if (state === "playing") {
             badgeClass = "badge-playing";
             badgeLabel = "Playing";

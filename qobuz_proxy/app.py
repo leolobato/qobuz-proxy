@@ -38,6 +38,30 @@ from qobuz_proxy.webui.routes import register_routes
 
 logger = logging.getLogger(__name__)
 
+
+def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
+    """API status for a config entry that is not currently running."""
+    config_dict: dict = {
+        "max_quality": "auto" if sc.max_quality == AUTO_QUALITY else sc.max_quality,
+    }
+    if sc.backend_type == "dlna":
+        config_dict["dlna_ip"] = sc.dlna_ip
+        config_dict["dlna_port"] = sc.dlna_port
+        config_dict["description_url"] = sc.dlna_description_url
+        config_dict["fixed_volume"] = sc.dlna_fixed_volume
+    elif sc.backend_type == "local":
+        config_dict["audio_device"] = sc.audio_device
+        config_dict["buffer_size"] = sc.audio_buffer_size
+    return {
+        "id": slugify_name(sc.name),
+        "name": sc.name,
+        "backend": sc.backend_type,
+        "status": status,
+        "config": config_dict,
+        "now_playing": None,
+    }
+
+
 # Backoff schedule for speakers that fail to start (renderer offline, boot
 # races between containers). After the ramp, keep trying at a steady pace.
 SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
@@ -394,25 +418,29 @@ class QobuzProxy:
             audio_buffer_size=int(body.get("buffer_size", 2048)),
         )
 
-        # Assign ports and UUID
-        all_configs = [s._config for s in self._speakers] + [sc]
+        assert self._api_client is not None
+
+        # Assign ports against every configured speaker, including ones that
+        # failed to start — otherwise a hot-add can collide with their ports.
+        all_configs = list(self._config.speakers) + [sc]
         _assign_ports(all_configs, webui_port=self._config.server.http_port)
         _generate_uuids([sc])
 
-        # Create and start speaker
-        assert self._api_client is not None
-        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
-        started = await speaker.start()
-        if not started:
-            raise ValueError(f"Speaker '{name}' failed to start")
-
-        self._speakers.append(speaker)
-
-        # Update config and persist
+        # Persist first so a restart still has this speaker even if start fails.
         self._config.speakers.append(sc)
         self._save_config()
 
-        return speaker.get_status()
+        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
+        started = await speaker.start()
+        if started:
+            self._speakers.append(speaker)
+            return speaker.get_status()
+
+        logger.warning(f"Speaker '{name}' saved but failed to start — retrying in background")
+        self._schedule_speaker_retry(sc)
+        status = _configured_speaker_status(sc, "starting")
+        status["warning"] = "Configuration saved, but the speaker failed to start"
+        return status
 
     async def _on_edit_speaker(self, speaker_id: str, body: dict) -> dict:
         """Edit a speaker at runtime (stop, reconfigure, restart).
@@ -529,6 +557,29 @@ class QobuzProxy:
             except Exception as e:
                 logger.error(f"Failed to save config: {e}")
 
+    def _speakers_for_api(self) -> list[dict]:
+        """Return every configured speaker, with live status when running.
+
+        The web UI used to list only ``_speakers`` (successfully started
+        instances). After a restart, config-backed speakers that had not yet
+        come up looked deleted — while re-adding the same name failed because
+        they were still in ``_config.speakers``.
+        """
+        running = {slugify_name(s.name): s.get_status() for s in self._speakers}
+        retrying = {
+            sid for sid, task in self._speaker_retry_tasks.items() if task and not task.done()
+        }
+        result: list[dict] = []
+        for sc in self._config.speakers:
+            sid = slugify_name(sc.name)
+            if sid in running:
+                result.append(running[sid])
+            elif sid in retrying:
+                result.append(_configured_speaker_status(sc, "starting"))
+            else:
+                result.append(_configured_speaker_status(sc, "disconnected"))
+        return result
+
     # ------------------------------------------------------------------
     # Web server
     # ------------------------------------------------------------------
@@ -539,7 +590,7 @@ class QobuzProxy:
 
         # Expose state for route handlers
         self._web_app["auth_state"] = self._auth_state
-        self._web_app["get_speakers"] = lambda: [s.get_status() for s in self._speakers]
+        self._web_app["get_speakers"] = self._speakers_for_api
         self._web_app["version"] = __version__
         self._web_app["commit"] = __commit__
         self._web_app["http_port"] = self._config.server.http_port
