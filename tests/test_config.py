@@ -215,10 +215,10 @@ class TestSpeakerConfigToDict:
         assert d["dlna_port"] == 1400
         assert d["dlna_fixed_volume"] is False
 
-    def test_dlna_speaker_omits_uuid_and_ports(self) -> None:
+    def test_dlna_speaker_persists_uuid_and_omits_ports(self) -> None:
         sc = self._make_dlna_speaker()
         d = speaker_config_to_dict(sc)
-        assert "uuid" not in d
+        assert d["uuid"] == "abc-123"
         assert "http_port" not in d
         assert "proxy_port" not in d
 
@@ -260,3 +260,10 @@ class TestSpeakerConfigToDict:
         d = speaker_config_to_dict(sc)
         assert d["max_quality"] == 6
         assert isinstance(d["max_quality"], int)
+
+    def test_uuid_round_trips_through_serialized_dict(self) -> None:
+        from qobuz_proxy.config import Config, _parse_yaml_speakers
+
+        sc = self._make_dlna_speaker(uuid="stable-uuid")
+        loaded = _parse_yaml_speakers([speaker_config_to_dict(sc)], Config())
+        assert loaded[0].uuid == "stable-uuid"

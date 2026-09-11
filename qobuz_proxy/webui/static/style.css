@@ -401,6 +401,11 @@ p {
     color: #bf6f6f;
 }
 
+.badge-starting {
+    background: #3a3a1b;
+    color: #bfbf6f;
+}
+
 .badge-dlna {
     background: #1a2a3a;
     color: #6fa8dc;
