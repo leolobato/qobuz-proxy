@@ -365,3 +365,98 @@ class TestGaplessStateClearing:
         assert backend._state == PlaybackState.STOPPED
 
         await backend.disconnect()
+
+
+class TestManualSkip:
+    async def test_cancelled_decode_falls_back(self):
+        backend = LocalAudioBackend()
+        backend._download = AsyncMock(return_value=b"audio")
+        decode_started = asyncio.Event()
+
+        async def decode(data):
+            decode_started.set()
+            await asyncio.Event().wait()
+
+        backend._decode = decode
+        await backend.set_next_track("http://example.com/track2", _make_metadata("2"))
+        consumer = asyncio.create_task(backend._take_next_track_audio())
+        try:
+            await asyncio.wait_for(decode_started.wait(), timeout=2)
+            backend._next_decode_task.cancel()
+            assert await asyncio.wait_for(consumer, timeout=2) is None
+            assert backend._next_decode_task is None
+            assert backend._next_track_meta is None
+        finally:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            await backend.stop()
+
+    @pytest.mark.parametrize("failure", ["download", "decode", "cancelled", "stalled"])
+    async def test_unusable_prefetch_retries_normal_play(self, failure, monkeypatch):
+        backend = await _create_playing_backend(audio=np.zeros((44100 * 20, 2)))
+        backend._download_and_decode = AsyncMock(return_value=(AUDIO_TRACK2, 44100))
+        _arm_next_track(backend)
+        if failure == "download":
+            backend._download.side_effect = aiohttp.ClientError("download failed")
+        elif failure == "decode":
+            backend._decode.side_effect = ValueError("invalid audio")
+        elif failure == "stalled":
+
+            async def stalled(url):
+                await asyncio.Event().wait()
+
+            backend._download = AsyncMock(side_effect=stalled)
+            monkeypatch.setattr(local_backend_module, "NEXT_TRACK_GRACE_SECONDS", 0)
+        try:
+            await backend.set_next_track("http://example.com/old-url", _make_metadata("2"))
+            task = backend._next_prefetch_task
+            if failure == "cancelled":
+                task.cancel()
+            await backend.stop(next_track_id="2")
+            await backend.play("http://example.com/fresh-url", _make_metadata("2"))
+
+            backend._download_and_decode.assert_awaited_once_with("http://example.com/fresh-url")
+            assert backend._state == PlaybackState.PLAYING
+            assert backend._next_prefetch_task is None
+            assert backend._next_decode_task is None
+        finally:
+            await backend.stop()
+
+    @pytest.mark.parametrize("change", ["track", "sample_rate", "bit_depth"])
+    async def test_unrelated_prefetch_is_discarded(self, change):
+        backend = await _create_playing_backend(audio=np.zeros((44100 * 20, 2)))
+        backend._download_and_decode = AsyncMock(return_value=(AUDIO_TRACK2, 44100))
+        _arm_next_track(backend)
+        target = _make_metadata("2")
+        if change == "track":
+            target.track_id = "3"
+        elif change == "sample_rate":
+            target.sample_rate = 96000
+        else:
+            target.bit_depth = 24
+        try:
+            await backend.set_next_track("http://example.com/track2", _make_metadata("2"))
+            await backend._next_prefetch_task
+            await backend.stop(next_track_id=target.track_id)
+            await backend.play("http://example.com/target", target)
+
+            backend._download_and_decode.assert_awaited_once_with("http://example.com/target")
+            backend._decode.assert_not_awaited()
+            assert backend._next_track_meta is None
+        finally:
+            await backend.stop()
+
+    async def test_explicit_stop_discards_retained_decode(self):
+        backend = await _create_playing_backend()
+        _arm_next_track(backend)
+        try:
+            await backend.set_next_track("http://example.com/track2", _make_metadata("2"))
+            await _wait_until(lambda: backend._transition_pending)
+            await backend.stop(next_track_id="2")
+            assert backend._next_decode_task is not None
+
+            await backend.stop()
+            assert backend._next_decode_task is None
+            assert backend._next_track_meta is None
+        finally:
+            await backend.stop()

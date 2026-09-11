@@ -937,10 +937,11 @@ class QobuzPlayer:
         """
         logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
         self._clear_skip_pending()
+        self._clear_gapless_state()
 
         # Stop current playback if playing
         if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
+            await self.backend.stop(next_track_id=track_id)
             # End the outgoing track's play report now that it's being replaced.
             # Pause no longer ends the session, so a load-only track change (no
             # immediate play) would otherwise leave the previous play unreported.
@@ -1111,12 +1112,12 @@ class QobuzPlayer:
 
         logger.debug("Next track command")
 
-        # Stop current playback
-        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
-
         # Get next track from queue
         track = await self.queue.advance_to_next()
+
+        # Stop after resolving the target so local audio can retain its prefetch.
+        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            await self.backend.stop(next_track_id=track.track_id if track else None)
 
         if not track:
             # End of queue

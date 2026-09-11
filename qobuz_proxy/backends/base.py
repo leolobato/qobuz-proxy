@@ -80,8 +80,11 @@ class AudioBackend(ABC):
         ...
 
     @abstractmethod
-    async def stop(self) -> None:
-        """Stop playback completely."""
+    async def stop(self, *, next_track_id: Optional[str] = None) -> None:
+        """Stop playback, optionally retaining prefetched audio for the target track.
+
+        Backends may ignore the hint. Without it, all prepared audio is discarded.
+        """
         pass
 
     # =========================================================================

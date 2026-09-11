@@ -405,7 +405,7 @@ class DLNABackend(AudioBackend):
             return True
         return False
 
-    async def stop(self) -> None:
+    async def stop(self, *, next_track_id: Optional[str] = None) -> None:
         """Stop playback."""
         owns_transport = await self._owns_transport()
         # Clear gapless state

@@ -68,6 +68,7 @@ class LocalAudioBackend(AudioBackend):
         # Gapless: prefetched next track (compressed bytes; decoded at transition)
         self._next_track_meta: Optional[BackendTrackMetadata] = None
         self._next_prefetch_task: Optional["asyncio.Task[bytes]"] = None
+        self._next_decode_task: Optional["asyncio.Task[tuple[np.ndarray, int]]"] = None
 
         # Gapless: audio data has been swapped to the next track but the old
         # track's tail is still draining from the ring buffer
@@ -78,9 +79,19 @@ class LocalAudioBackend(AudioBackend):
         """Download FLAC, decode, and start playback."""
         await self._cancel_feeding()
 
-        # An explicit play supersedes any armed gapless transition
+        # A manual skip can use the download (or decode) already in progress.
         self._transition_pending = False
-        await self.clear_next_track()
+        next_meta = self._next_track_meta
+        # Signed URLs may change, but a different requested audio format
+        # must never reuse the old quality's bytes.
+        reuse_next = (
+            next_meta is not None
+            and next_meta.track_id == metadata.track_id
+            and (next_meta.sample_rate, next_meta.bit_depth)
+            == (metadata.sample_rate, metadata.bit_depth)
+        )
+        if not reuse_next:
+            await self.clear_next_track()
 
         # Silence the previous track immediately. Without this the callback
         # keeps draining up to BUFFER_SECONDS of old audio through the whole
@@ -93,7 +104,13 @@ class LocalAudioBackend(AudioBackend):
         self._notify_state_change(PlaybackState.LOADING)
 
         try:
-            audio_data, sample_rate = await self._download_and_decode(url)
+            next_audio = await self._take_next_track_audio() if reuse_next else None
+            await self.clear_next_track()
+            if next_audio is not None:
+                audio_data, sample_rate = next_audio
+                logger.info(f"Reusing prefetched audio for track {metadata.track_id}")
+            else:
+                audio_data, sample_rate = await self._download_and_decode(url)
             self._audio_data = audio_data
             self._sample_rate = sample_rate
             self._total_frames = len(audio_data)
@@ -269,19 +286,21 @@ class LocalAudioBackend(AudioBackend):
 
     async def clear_next_track(self) -> None:
         """Cancel and discard the prefetched next track."""
-        task = self._next_prefetch_task
+        tasks = (self._next_prefetch_task, self._next_decode_task)
         self._next_prefetch_task = None
+        self._next_decode_task = None
         self._next_track_meta = None
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"Discarding failed next-track prefetch: {e}")
+        for task in tasks:
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Discarding failed next-track prefetch: {e}")
 
     def _next_track_armed(self) -> bool:
         """Whether a next track is currently prefetching or prefetched."""
@@ -302,24 +321,45 @@ class LocalAudioBackend(AudioBackend):
         # cancelling the prefetch must not cancel the feeding loop with it,
         # and a re-arm mid-wait should be picked up seamlessly.
         while True:
+            if self._next_decode_task is not None:
+                # Cancelling the old feeder on a manual skip must not discard
+                # a decode running in a worker thread. The new play awaits it.
+                decode_task = self._next_decode_task
+                try:
+                    audio = await asyncio.shield(decode_task)
+                except asyncio.CancelledError:
+                    if decode_task.cancelled():
+                        if self._next_decode_task is not decode_task:
+                            continue  # clear_next_track() may have armed a replacement.
+                        await self.clear_next_track()
+                        return None
+                    raise
+                except Exception as e:
+                    if self._next_decode_task is not decode_task:
+                        continue
+                    logger.warning(f"Gapless: next track decode failed: {e}")
+                    await self.clear_next_track()
+                    return None
+                if self._next_decode_task is not decode_task:
+                    continue  # A queue edit replaced this prefetch during decoding.
+                self._next_prefetch_task = None
+                return audio
+
             task = self._next_prefetch_task
             if task is None:
                 return None
 
             if task.done():
-                self._next_prefetch_task = None
-                self._next_track_meta = None
                 if task.cancelled():
+                    await self.clear_next_track()
                     return None
                 exc = task.exception()
                 if exc is not None:
                     logger.warning(f"Gapless: next track download failed: {exc}")
+                    await self.clear_next_track()
                     return None
-                try:
-                    return await self._decode(task.result())
-                except Exception as e:
-                    logger.warning(f"Gapless: next track decode failed: {e}")
-                    return None
+                self._next_decode_task = asyncio.create_task(self._decode(task.result()))
+                continue
 
             # Still downloading. The unplayed buffer tail is the time cushion;
             # give up shortly after it runs dry so playback doesn't hang silent.
@@ -344,6 +384,8 @@ class LocalAudioBackend(AudioBackend):
 
         Returns True when the swap happened and feeding should continue.
         """
+        if not self._next_track_armed():
+            return False
         next_audio = await self._take_next_track_audio()
         if next_audio is None:
             return False
@@ -383,6 +425,7 @@ class LocalAudioBackend(AudioBackend):
                 self._stream.open(sample_rate, channels)
                 self._stream.start()
             self._transition_pending = False
+            self._forget_consumed_next_track()
             logger.info("Gapless: transitioned to next track (format change)")
             self._notify_next_track_started()
 
@@ -400,8 +443,15 @@ class LocalAudioBackend(AudioBackend):
         available = self._ring_buffer.available() if self._ring_buffer else 0
         if self._frames_fed >= available:
             self._transition_pending = False
+            self._forget_consumed_next_track()
             logger.info("Gapless: transitioned to next track")
             self._notify_next_track_started()
+
+    def _forget_consumed_next_track(self) -> None:
+        """Release retained decoding once the audible track boundary is crossed."""
+        if self._next_prefetch_task is None:
+            self._next_decode_task = None
+            self._next_track_meta = None
 
     def _playback_position_ms(self) -> int:
         """Current position accounting for buffer latency and, mid-transition,
@@ -435,10 +485,11 @@ class LocalAudioBackend(AudioBackend):
         self._notify_state_change(PlaybackState.PLAYING)
         return True
 
-    async def stop(self) -> None:
+    async def stop(self, *, next_track_id: Optional[str] = None) -> None:
         await self._cancel_feeding()
         self._transition_pending = False
-        await self.clear_next_track()
+        if self._next_track_meta is None or self._next_track_meta.track_id != next_track_id:
+            await self.clear_next_track()
         if self._ring_buffer:
             self._ring_buffer.clear()
         if self._stream:
