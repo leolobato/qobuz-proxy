@@ -11,7 +11,7 @@ import socket
 from typing import Any, Callable, Optional
 
 from aiohttp import web
-from zeroconf import ServiceInfo, Zeroconf
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from qobuz_proxy.config import Config
 
@@ -291,7 +291,17 @@ class DiscoveryService:
             properties=properties,
         )
 
-        self._zeroconf = Zeroconf()
+        # Advertise only on the LAN address the phone can reach. Zeroconf()
+        # otherwise joins every interface (VPN utun, AWDL, …) and the Qobuz
+        # app on Wi-Fi never sees the speaker even though the Web UI at this IP
+        # loads fine.
+        try:
+            self._zeroconf = Zeroconf(interfaces=[local_ip], ip_version=IPVersion.V4Only)
+        except Exception:
+            logger.warning(
+                "mDNS could not bind to %s; advertising on all interfaces", local_ip
+            )
+            self._zeroconf = Zeroconf()
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, self._zeroconf.register_service, self._service_info)
@@ -318,16 +328,19 @@ class DiscoveryService:
             logger.debug("Unregistered mDNS service")
 
     def _get_local_ip(self) -> Optional[str]:
-        """
-        Get the local IP address.
+        """IPv4 the Qobuz app on Wi-Fi can reach.
 
-        Uses a dummy socket connection to determine the outbound IP.
+        Prefer a real LAN NIC over the default-route address: a VPN makes
+        the 8.8.8.8 trick return a utun IP the phone cannot use, while the
+        Web UI is still opened at the Wi-Fi address.
         """
+        lan = _lan_ipv4()
+        if lan:
+            return lan
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0)
             try:
-                # Doesn't actually connect, just determines route
                 s.connect(("8.8.8.8", 80))
                 ip = s.getsockname()[0]
             finally:
@@ -336,3 +349,26 @@ class DiscoveryService:
         except Exception as e:
             logger.error(f"Failed to determine local IP: {e}")
             return None
+
+
+_SKIP_IFACE_PREFIXES = ("lo", "utun", "awdl", "llw", "bridge", "anpi", "ap", "gif", "stf", "vmnet")
+
+
+def _lan_ipv4() -> Optional[str]:
+    """First non-loopback IPv4 on a broadcast NIC (en0/eth0), not VPN."""
+    try:
+        import ifaddr
+    except ImportError:
+        return None
+    for adapter in ifaddr.get_adapters():
+        name = (adapter.nice_name or adapter.name or "").lower()
+        if name.startswith(_SKIP_IFACE_PREFIXES):
+            continue
+        for ip in adapter.ips:
+            addr = ip.ip if isinstance(ip.ip, str) else None
+            if not addr or "." not in addr:
+                continue
+            if addr.startswith("127.") or addr.startswith("169.254."):
+                continue
+            return addr
+    return None
