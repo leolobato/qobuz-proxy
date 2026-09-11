@@ -335,3 +335,53 @@ class TestPositionUpdates:
 
         await backend.stop()
         await backend.disconnect()
+
+
+class TestSeekDuringDrain:
+    async def test_seek_backward_while_buffer_draining(self) -> None:
+        """Once the track is fully fed, scrubbing must restart feeding, not go silent."""
+        backend = await _create_connected_backend()
+        ended: list[bool] = []
+        positions: list[int] = []
+        backend.on_track_ended(lambda: ended.append(True))
+        backend.on_position_update(lambda p: positions.append(p))
+        # 1s track: feeder finishes immediately and sits in the drain loop.
+        await _start_playback(backend, total_frames=44100, sample_rate=44100)
+        await asyncio.sleep(0.05)
+        assert backend._frames_fed >= 44100
+        assert backend._feeding_task is not None
+        assert not backend._feeding_task.done()
+
+        positions.clear()
+        await backend.seek(500)
+        await asyncio.sleep(0.2)
+
+        assert ended == []
+        assert backend._state == PlaybackState.PLAYING
+        assert backend._feeding_task is not None
+        assert not backend._feeding_task.done()
+        assert any(400 <= p <= 700 for p in positions)
+
+        await backend.stop()
+        await backend.disconnect()
+
+    async def test_seek_after_feeder_exits_restarts_playback(self) -> None:
+        """Natural end must still allow a scrub back into the decoded track."""
+        backend = await _create_connected_backend()
+        await _start_playback(backend, total_frames=100, sample_rate=44100)
+        await asyncio.sleep(0.05)
+        if backend._ring_buffer:
+            backend._ring_buffer.read(backend._ring_buffer.available())
+        await asyncio.sleep(0.2)
+        assert backend._state == PlaybackState.STOPPED
+        assert backend._audio_data is not None
+
+        await backend.seek(0)
+        await asyncio.sleep(0.05)
+
+        assert backend._state == PlaybackState.PLAYING
+        assert backend._feeding_task is not None
+        assert not backend._feeding_task.done()
+
+        await backend.stop()
+        await backend.disconnect()

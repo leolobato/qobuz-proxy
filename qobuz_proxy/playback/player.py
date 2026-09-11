@@ -134,6 +134,12 @@ class QobuzPlayer:
         self._transition_generation: int = 0
         self._gapless_arm_lock: asyncio.Lock = asyncio.Lock()
 
+        # Latest skip's queue item, advertised before the playback lock is
+        # acquired so a heartbeat cannot keep the Qobuz app on the outgoing
+        # track while an earlier command is still loading.
+        self._report_queue_item_override: Optional[int] = None
+        self._skipped_from_track_id: Optional[str] = None
+
         # Unplayable-track skip: the track we are waiting to skip past, and the
         # timeout that gives up if the server never names its successor.
         self._skip_pending_track: Optional[QueueTrack] = None
@@ -425,6 +431,8 @@ class QobuzPlayer:
         """Revoke queued/in-flight playback intents without interrupting current audio."""
         self._next_generation()
         self._clear_skip_pending()
+        self._report_queue_item_override = None
+        self._skipped_from_track_id = None
 
     def set_playback_permission_check(self, check: Callable[[], Awaitable[bool]]) -> None:
         """Check renderer ownership before applying a remote session snapshot."""
@@ -468,6 +476,10 @@ class QobuzPlayer:
         single lock acquisition and a single generation check makes the newest
         SET_STATE win as a unit, with no interleaving.
 
+        A skip is reported as soon as it is accepted (new currentQueueItemId,
+        LOADING → PLAYING+BUFFERING on the wire) so the controlling app does
+        not snap back to the speaker's outgoing track while stop/URL I/O runs.
+
         Args:
             track_id: Target track id, or None if the message had no currentQueueItem.
             queue_item_id: Queue item id for the target track (if any).
@@ -493,7 +505,21 @@ class QobuzPlayer:
             )
         ):
             return
+        if self._is_outgoing_track_echo(track_id, playing_state):
+            logger.info(
+                "Ignoring SET_STATE for outgoing track %s after skip to %s",
+                track_id,
+                self._current_track.track_id if self._current_track else "?",
+            )
+            return
         gen = self._next_generation()
+        if self._is_play_skip_intent(track_id, playing_state):
+            # Publish the new item before waiting on the lock. A SET_STATE
+            # already in-flight can hold that lock for a URL fetch; without
+            # this the next heartbeat still names the outgoing track and the
+            # Qobuz app snaps back to it.
+            self._report_queue_item_override = queue_item_id or 0
+            await self._send_state_update()
         async with self._playback_lock:
             if gen != self._command_generation:
                 logger.debug("SET_STATE superseded by newer command; skipping")
@@ -539,6 +565,7 @@ class QobuzPlayer:
                 return
 
             # Load if a track is specified and differs from the loaded one.
+            loaded_new = False
             if track_id is not None:
                 cur = self._current_track
                 if (
@@ -563,7 +590,10 @@ class QobuzPlayer:
                     or cur is self._skip_pending_track
                     or (playing_state == 2 and cur.streaming_url is None)
                 ):
-                    logger.info(f"Loading new track: {track_id}")
+                    if self._armed_next_matches(track_id, queue_item_id or 0):
+                        logger.info(f"Skipping to armed next track: {track_id}")
+                    else:
+                        logger.info(f"Loading new track: {track_id}")
                     load_context = context_uuid
                     if (
                         load_context is None
@@ -572,6 +602,7 @@ class QobuzPlayer:
                         and (queue_item_id is None or cur.queue_item_id == queue_item_id)
                     ):
                         load_context = cur.context_uuid
+                    loaded_new = True
                     if not await self._load_track_locked(
                         queue_item_id or 0,
                         track_id,
@@ -604,8 +635,9 @@ class QobuzPlayer:
                             f"SET_STATE superseded while loading track {track_id}; "
                             "not starting playback"
                         )
-                        if self._state == PlaybackState.LOADING:
-                            self._state = PlaybackState.STOPPED
+                        # Leave LOADING so a stale follow-up cannot make the
+                        # skip look like the renderer stopped (GitHub #22).
+                        # The newer command applies the real state.
                         return
                 elif (
                     not stale
@@ -645,7 +677,10 @@ class QobuzPlayer:
                             )
 
             # Position, then play/pause/stop — same order as the app expects.
-            if position_ms is not None and not stale:
+            # A newly loaded track is not on the backend yet; seeking now would
+            # hit the previous track (and, for an armed skip, restart it).
+            # _play_locked applies the position after playback starts.
+            if position_ms is not None and not stale and not loaded_new:
                 await self.seek(position_ms)
 
             if playing_state is not None and not stale:
@@ -659,6 +694,37 @@ class QobuzPlayer:
                     await self._pause_locked()
                 elif playing_state == 1:
                     await self._stop_playback_locked()
+
+    def _is_play_skip_intent(self, track_id: Optional[str], playing_state: Optional[int]) -> bool:
+        """Whether this SET_STATE is asking to play a different track.
+
+        Used to advertise the new queue item before the playback lock so the
+        Qobuz app does not snap back to the outgoing song.
+        """
+        if playing_state != 2 or not track_id:
+            return False
+        cur = self._current_track
+        return cur is None or cur.track_id != track_id
+
+    def _is_outgoing_track_echo(
+        self, track_id: Optional[str], playing_state: Optional[int]
+    ) -> bool:
+        """Whether this SET_STATE is a stale echo of the track we just skipped.
+
+        After a skip the app may still send the outgoing item (position/play
+        of the speaker's previous song). That must not bump the command
+        generation or undo the skip.
+        """
+        if playing_state == 1:
+            return False
+        if self._state != PlaybackState.LOADING:
+            return False
+        if not track_id or not self._skipped_from_track_id:
+            return False
+        cur = self._current_track
+        if cur is None or cur.track_id == track_id:
+            return False
+        return track_id == self._skipped_from_track_id
 
     def _is_stale_pause_snapshot_locked(
         self,
@@ -887,6 +953,8 @@ class QobuzPlayer:
         await self.backend.stop()
 
         self._state = PlaybackState.STOPPED
+        self._report_queue_item_override = None
+        self._skipped_from_track_id = None
         self._position_value_ms = 0
         self._position_timestamp_ms = int(time.time() * 1000)
 
@@ -935,38 +1003,45 @@ class QobuzPlayer:
         app as "the renderer stopped" — which the app answered with a PAUSED
         SET_STATE, leaving a manual skip on a paused track (GitHub #22).
         """
-        logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
         self._clear_skip_pending()
 
-        # Stop current playback if playing
-        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
-            # End the outgoing track's play report now that it's being replaced.
-            # Pause no longer ends the session, so a load-only track change (no
-            # immediate play) would otherwise leave the previous play unreported.
-            await self._report_stopped()
-        self._state = PlaybackState.LOADING if for_playback else PlaybackState.STOPPED
+        if self._armed_next_matches(track_id, queue_item_id):
+            return await self._adopt_armed_next_locked(
+                queue_item_id, track_id, context_uuid, for_playback=for_playback
+            )
 
-        # Create track object. The context UUID identifies the album/playlist the
-        # track is played from and is required for Qobuz listening history /
-        # Last.fm scrobbles, so it must be carried onto the QueueTrack.
-        self._current_track = QueueTrack(
-            queue_item_id=queue_item_id,
-            track_id=track_id,
-            context_uuid=context_uuid,
+        logger.info(f"Loading track: track_id={track_id}, queue_item_id={queue_item_id}")
+
+        # Point reports at the new item before any stop/URL I/O. The Qobuz app
+        # treats renderer currentQueueItemId as authority: leaving the outgoing
+        # track in place while backend.stop() (DLNA SOAP) or a URL fetch runs
+        # makes a heartbeat snap the app back to the speaker's old song.
+        was_active = self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+        self._clear_gapless_state()
+        self._commit_track_identity_locked(
+            queue_item_id,
+            track_id,
+            context_uuid,
+            for_playback=for_playback,
         )
-        # A fresh track starts at 0 (callers starting elsewhere set the position
-        # after loading) and its duration is unknown until metadata arrives.
-        # Without this a report sent during the load shows the new item at the
-        # old track's position and length.
-        self._set_position(0)
-        self._current_duration_ms = 0
+        await self._send_state_update()
 
-        # Pre-fetch URL and metadata
+        url_task = asyncio.create_task(self._get_track_url(track_id))
         try:
-            url = await self._get_track_url(track_id)
+            if was_active:
+                await self.backend.stop()
+                # End the outgoing track's play report now that it's replaced.
+                # Pause no longer ends the session, so a load-only track change
+                # would otherwise leave the previous play unreported.
+                await self._report_stopped()
+
+            url = await url_task
+            track = self._current_track
+            if track is None:
+                self._state = PlaybackState.STOPPED
+                return False
             if url:
-                self._current_track.set_streaming_url(url)
+                track.set_streaming_url(url)
             else:
                 logger.error(f"Failed to get URL for track {track_id}")
                 self._state = PlaybackState.STOPPED
@@ -974,14 +1049,16 @@ class QobuzPlayer:
 
             meta = await self._get_track_metadata(track_id)
             if meta:
-                self._current_track.metadata = meta
-                self._current_track.duration_ms = meta.get("duration_ms", 0)
-                self._current_duration_ms = self._current_track.duration_ms
+                track.metadata = meta
+                track.duration_ms = meta.get("duration_ms", 0)
+                self._current_duration_ms = track.duration_ms
 
             logger.info(f"Track loaded: {track_id}")
             return True
 
         except Exception as e:
+            if not url_task.done():
+                url_task.cancel()
             logger.error(f"Failed to load track {track_id}: {e}")
             self._state = PlaybackState.STOPPED
             return False
@@ -1019,8 +1096,6 @@ class QobuzPlayer:
         position_ms: int = 0,
         context_uuid: Optional[bytes] = None,
     ) -> bool:
-        # Clear gapless state — explicit track change
-        self._clear_gapless_state()
         generation = self._command_generation
 
         logger.info(
@@ -1105,20 +1180,18 @@ class QobuzPlayer:
             return await self._next_track_locked()
 
     async def _next_track_locked(self) -> bool:
-        # Clear gapless state — explicit skip
-        self._clear_gapless_state()
         self._clear_skip_pending()
 
         logger.debug("Next track command")
 
-        # Stop current playback
-        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-            await self.backend.stop()
-
-        # Get next track from queue
+        # Get next track from queue before tearing anything down, so a skip
+        # onto the already-armed track can keep the backend prefetch.
         track = await self.queue.advance_to_next()
 
         if not track:
+            self._clear_gapless_state()
+            if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+                await self.backend.stop()
             # End of queue
             self._state = PlaybackState.STOPPED
             self._current_track = None
@@ -1130,6 +1203,21 @@ class QobuzPlayer:
             await self._report_stopped()
             logger.info("End of queue - playback stopped")
             return False
+
+        if self._armed_next_matches(track.track_id, track.queue_item_id):
+            if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+                await self._report_stopped()
+            self._adopt_armed_metadata(track)
+            self._current_track = track
+            self._clear_gapless_state()
+            await self._start_playback()
+            return True
+
+        self._clear_gapless_state()
+
+        # Stop current playback
+        if self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            await self.backend.stop()
 
         # Start playing next track
         self._current_track = track
@@ -1281,6 +1369,7 @@ class QobuzPlayer:
             # seeks the backend right after, and reporting 0 first makes the
             # app's progress bar snap to 0:00 until the next heartbeat.
             self._state = PlaybackState.PLAYING
+            self._skipped_from_track_id = None
             self._current_duration_ms = track.duration_ms
             self._unavailable_skip_count = 0
             self._position_value_ms = start_position_ms
@@ -1614,6 +1703,110 @@ class QobuzPlayer:
         self._gapless_armed = False
         self._pending_next_track = None
 
+    def _armed_next_matches(self, track_id: str, queue_item_id: int = 0) -> bool:
+        """Whether ``track_id`` is the currently armed gapless next track."""
+        pending = self._pending_next_track
+        if not self._gapless_armed or pending is None:
+            return False
+        if str(pending.get("trackId")) != str(track_id):
+            return False
+        pending_qid = pending.get("queueItemId")
+        if queue_item_id and pending_qid and int(pending_qid) != int(queue_item_id):
+            return False
+        return True
+
+    def _adopt_armed_metadata(self, track: QueueTrack) -> None:
+        """Copy URL/metadata from the armed next track onto ``track``."""
+        pending = self._pending_next_track
+        if not pending:
+            return
+        url = pending.get("url")
+        if url:
+            track.set_streaming_url(url)
+        meta = pending.get("metadata")
+        if meta:
+            track.metadata = meta
+            track.duration_ms = meta.get("duration_ms", 0) or track.duration_ms
+        if track.context_uuid is None:
+            track.context_uuid = pending.get("contextUuid")
+
+    async def _adopt_armed_next_locked(
+        self,
+        queue_item_id: int,
+        track_id: str,
+        context_uuid: Optional[bytes],
+        *,
+        for_playback: bool,
+    ) -> bool:
+        """Make the armed next track current without discarding its prefetch.
+
+        ``backend.stop()`` / ``backend.play()`` of a different URL would cancel
+        the already-downloaded bytes. Keep the backend armed; ``play()`` of this
+        same track id reuses them.
+        """
+        pending = self._pending_next_track or {}
+        logger.info(f"Reusing armed next track: track_id={track_id}, queue_item_id={queue_item_id}")
+
+        was_active = self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+        meta = pending.get("metadata") or {}
+        ctx = context_uuid if context_uuid is not None else pending.get("contextUuid")
+        duration_ms = meta.get("duration_ms", 0) if isinstance(meta, dict) else 0
+        self._commit_track_identity_locked(
+            queue_item_id,
+            track_id,
+            ctx,
+            for_playback=for_playback,
+            metadata=meta if isinstance(meta, dict) else {},
+            duration_ms=duration_ms,
+        )
+        self._adopt_armed_metadata(self._current_track)
+        if context_uuid is not None:
+            self._current_track.context_uuid = context_uuid
+        self._current_duration_ms = self._current_track.duration_ms
+
+        # Do not await network here. A SET_STATE echo of the outgoing track
+        # arriving during send/scrobble used to supersede this skip before
+        # backend.play() ran, so the app snapped back to the previous song.
+        if was_active and not for_playback:
+            await self._report_stopped()
+
+        # Player no longer treats this id as "next"; the backend prefetch stays
+        # until play() consumes it.
+        self._clear_gapless_state()
+        return True
+
+    def _commit_track_identity_locked(
+        self,
+        queue_item_id: int,
+        track_id: str,
+        context_uuid: Optional[bytes],
+        *,
+        for_playback: bool,
+        metadata: Optional[dict] = None,
+        duration_ms: int = 0,
+    ) -> QueueTrack:
+        """Switch the reported current item before stop/URL work.
+
+        Must not await: heartbeats read these fields without the playback lock.
+        """
+        outgoing = self._current_track
+        if outgoing is not None and outgoing.track_id != track_id:
+            self._skipped_from_track_id = outgoing.track_id
+        track = QueueTrack(
+            queue_item_id=queue_item_id,
+            track_id=track_id,
+            context_uuid=context_uuid,
+            metadata=metadata or {},
+            duration_ms=duration_ms,
+        )
+        self._current_track = track
+        self._set_position(0)
+        self._current_duration_ms = duration_ms
+        self._state = PlaybackState.LOADING if for_playback else PlaybackState.STOPPED
+        if self._report_queue_item_override == queue_item_id:
+            self._report_queue_item_override = None
+        return track
+
     async def _prepare_next_track_for_gapless(self) -> None:
         """Prepare the next track for gapless playback on the backend.
 
@@ -1874,7 +2067,7 @@ class QobuzPlayer:
                 if self._state_reporter:
                     continue
 
-                if self._state == PlaybackState.PLAYING:
+                if self._state in (PlaybackState.PLAYING, PlaybackState.LOADING):
                     await self._send_state_update()
 
             except asyncio.CancelledError:
@@ -1914,6 +2107,17 @@ class QobuzPlayer:
     def current_track(self) -> Optional[QueueTrack]:
         """Get current track."""
         return self._current_track
+
+    @property
+    def reported_queue_item_id(self) -> int:
+        """Queue item id the Qobuz app should display.
+
+        A skip advertises its target before the player has finished loading
+        it; that override wins until the current track catches up.
+        """
+        if self._report_queue_item_override is not None:
+            return self._report_queue_item_override
+        return self._current_track.queue_item_id if self._current_track else 0
 
     @property
     def duration_ms(self) -> int:

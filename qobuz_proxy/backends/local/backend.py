@@ -74,55 +74,141 @@ class LocalAudioBackend(AudioBackend):
         self._transition_pending: bool = False
         self._prev_total_frames: int = 0
 
+        # Current-track cache: decoded PCM kept after stop() so a scrub or
+        # replay of the same song does not re-download. Distinct from
+        # `_audio_data`, which stop() clears so resume() cannot go PLAYING
+        # over silence (BUG-25).
+        self._current_track_id: Optional[str] = None
+        self._cached_audio: Optional[np.ndarray] = None
+        self._cached_audio_rate: int = 0
+        self._cached_audio_track_id: Optional[str] = None
+        self._cached_bytes: Optional[bytes] = None
+        self._cached_bytes_track_id: Optional[str] = None
+
     async def play(self, url: str, metadata: BackendTrackMetadata) -> None:
-        """Download FLAC, decode, and start playback."""
+        """Start playback, reusing cached/prefetched audio when available."""
         await self._cancel_feeding()
 
-        # An explicit play supersedes any armed gapless transition
+        # An explicit play of a different track supersedes any armed gapless
+        # transition. The same track (manual skip to the already-armed next,
+        # or a scrub that re-issues play) keeps the in-flight/completed
+        # download and any already-decoded current-track PCM.
         self._transition_pending = False
-        await self.clear_next_track()
+        track_id = str(metadata.track_id)
+        prefetch_task = self._take_prefetch_if_matches(track_id)
+        reuse_current = prefetch_task is None and self._has_cached_track(track_id)
+        if prefetch_task is None and not reuse_current:
+            await self.clear_next_track()
 
-        # Silence the previous track immediately. Without this the callback
-        # keeps draining up to BUFFER_SECONDS of old audio through the whole
-        # download/decode, then cuts mid-note when the buffers are swapped.
-        if self._ring_buffer:
-            self._ring_buffer.clear()
-            if self._stream:
-                self._stream.pause()  # stream.start() below unpauses for the new track
-
-        self._notify_state_change(PlaybackState.LOADING)
+        # Silence the previous track immediately when we still have to wait on
+        # a download/decode. Reusing cached PCM is instant — don't pause the
+        # stream for a fetch that isn't happening (that was the silent-scrub
+        # failure: play() muted output, then never restarted the feeder).
+        if not reuse_current:
+            if self._ring_buffer:
+                self._ring_buffer.clear()
+                if self._stream:
+                    self._stream.pause()
+            self._notify_state_change(PlaybackState.LOADING)
 
         try:
-            audio_data, sample_rate = await self._download_and_decode(url)
-            self._audio_data = audio_data
-            self._sample_rate = sample_rate
-            self._total_frames = len(audio_data)
-            self._frames_fed = 0
-            self._seek_target = None
-
-            # Create ring buffer for this track's sample rate
-            buffer_frames = int(sample_rate * BUFFER_SECONDS)
-            channels = audio_data.shape[1] if audio_data.ndim > 1 else 1
-            self._ring_buffer = RingBuffer(buffer_frames, channels)
-
-            # Update stream's ring buffer and open/reconfigure
-            self._stream.set_ring_buffer(self._ring_buffer)
-            self._stream.open(sample_rate, channels)
-            self._stream.start()
-
-            # Start feeding loop
-            self._feeding_task = asyncio.create_task(self._feeding_loop())
-            self._notify_state_change(PlaybackState.PLAYING)
-
-            logger.info(
-                f"Playing: {metadata.artist} - {metadata.title} "
-                f"({sample_rate}Hz, {self._total_frames} frames)"
+            audio_data, sample_rate = await self._audio_from_prefetch_or_url(
+                url, prefetch_task, track_id
             )
+            self._begin_decoded_playback(audio_data, sample_rate, metadata)
 
         except Exception as e:
             logger.error(f"Playback error: {e}")
             self._notify_state_change(PlaybackState.ERROR)
             self._notify_playback_error(str(e))
+
+    def _take_prefetch_if_matches(self, track_id: str) -> Optional["asyncio.Task[bytes]"]:
+        """Detach the armed prefetch when it is the track about to play."""
+        task = self._next_prefetch_task
+        meta = self._next_track_meta
+        if task is None or meta is None or str(meta.track_id) != str(track_id):
+            return None
+        self._next_prefetch_task = None
+        self._next_track_meta = None
+        return task
+
+    def _has_cached_track(self, track_id: str) -> bool:
+        """Whether we already have decoded PCM or compressed bytes for ``track_id``."""
+        tid = str(track_id)
+        if self._cached_audio is not None and self._cached_audio_track_id == tid:
+            return True
+        return self._cached_bytes is not None and self._cached_bytes_track_id == tid
+
+    def _decoded_cache_for(self, track_id: str) -> Optional[tuple[np.ndarray, int]]:
+        if self._cached_audio is not None and self._cached_audio_track_id == str(track_id):
+            return self._cached_audio, self._cached_audio_rate
+        return None
+
+    async def _audio_from_prefetch_or_url(
+        self,
+        url: str,
+        prefetch_task: Optional["asyncio.Task[bytes]"],
+        track_id: str,
+    ) -> tuple[np.ndarray, int]:
+        """Prefer armed prefetch, then the current-track cache, then a download."""
+        if prefetch_task is not None:
+            try:
+                data = await prefetch_task
+                self._cached_bytes = data
+                self._cached_bytes_track_id = str(track_id)
+                logger.info("Reusing prefetched audio bytes")
+                return await self._decode(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Prefetched next track unusable ({e}); downloading again")
+
+        cached = self._decoded_cache_for(track_id)
+        if cached is not None:
+            logger.info(f"Reusing cached audio for track {track_id}")
+            return cached
+
+        if self._cached_bytes is not None and self._cached_bytes_track_id == str(track_id):
+            logger.info(f"Re-decoding cached bytes for track {track_id}")
+            return await self._decode(self._cached_bytes)
+
+        return await self._download_and_decode(url)
+
+    def _begin_decoded_playback(
+        self,
+        audio_data: np.ndarray,
+        sample_rate: int,
+        metadata: BackendTrackMetadata,
+    ) -> None:
+        """Swap in decoded audio and start the feeding loop."""
+        self._audio_data = audio_data
+        self._sample_rate = sample_rate
+        self._total_frames = len(audio_data)
+        self._frames_fed = 0
+        self._seek_target = None
+        self._current_track_id = str(metadata.track_id)
+        self._cached_audio = audio_data
+        self._cached_audio_rate = sample_rate
+        self._cached_audio_track_id = str(metadata.track_id)
+
+        # Create ring buffer for this track's sample rate
+        buffer_frames = int(sample_rate * BUFFER_SECONDS)
+        channels = audio_data.shape[1] if audio_data.ndim > 1 else 1
+        self._ring_buffer = RingBuffer(buffer_frames, channels)
+
+        # Update stream's ring buffer and open/reconfigure
+        self._stream.set_ring_buffer(self._ring_buffer)
+        self._stream.open(sample_rate, channels)
+        self._stream.start()
+
+        # Start feeding loop
+        self._feeding_task = asyncio.create_task(self._feeding_loop())
+        self._notify_state_change(PlaybackState.PLAYING)
+
+        logger.info(
+            f"Playing: {metadata.artist} - {metadata.title} "
+            f"({sample_rate}Hz, {self._total_frames} frames)"
+        )
 
     async def _download(self, url: str) -> bytes:
         """Download the audio file bytes."""
@@ -168,17 +254,22 @@ class LocalAudioBackend(AudioBackend):
                 if await self._transition_to_next_track():
                     continue
 
-                # No next track. Drain the tail, watching for a transition that
-                # completes mid-drain (next track shorter than the buffer) and
-                # for a late arm from the player after that callback fires.
+                # No next track. Drain the tail, watching for a seek that
+                # jumps back into the current track, a transition that
+                # completes mid-drain (next track shorter than the buffer),
+                # and a late arm from the player after that callback fires.
+                sought = False
                 while self._ring_buffer.available() > 0:
                     if self._state == PlaybackState.STOPPED:
                         return
+                    if self._apply_pending_seek():
+                        sought = True
+                        break
                     self._maybe_complete_transition()
                     if self._next_track_armed():
                         break
-                    await asyncio.sleep(0.1)
-                if self._next_track_armed():
+                    await asyncio.sleep(0.05)
+                if sought or self._apply_pending_seek() or self._next_track_armed():
                     continue
                 self._maybe_complete_transition()
 
@@ -197,18 +288,9 @@ class LocalAudioBackend(AudioBackend):
     async def _feed_current_track(self) -> None:
         """Feed the current track's remaining frames into the ring buffer."""
         while self._frames_fed < self._total_frames:
-            # Handle seek
             if self._seek_target is not None:
-                target = self._seek_target
-                self._seek_target = None
-                self._ring_buffer.clear()
-                self._frames_fed = min(target, self._total_frames)
-                logger.debug(f"Seek applied: jumping to frame {self._frames_fed}")
-                if self._frames_fed >= self._total_frames:
+                if not self._apply_pending_seek():
                     break
-                # Notify position immediately after seek
-                position_ms = int(self._frames_fed / self._sample_rate * 1000)
-                self._notify_position_update(position_ms)
                 continue
 
             self._maybe_complete_transition()
@@ -447,9 +529,40 @@ class LocalAudioBackend(AudioBackend):
         self._audio_data = None
         self._notify_state_change(PlaybackState.STOPPED)
 
+    def _apply_pending_seek(self) -> bool:
+        """Apply a queued seek onto the decoded current track.
+
+        Returns True when feeding should continue from the new position.
+        Returns False when there was no seek, or the seek landed at/past the
+        end of the track (caller should treat that as track end).
+        """
+        if self._seek_target is None:
+            return False
+        target = self._seek_target
+        self._seek_target = None
+        if self._ring_buffer:
+            self._ring_buffer.clear()
+        self._frames_fed = min(max(0, target), self._total_frames)
+        self._transition_pending = False
+        logger.debug(f"Seek applied: jumping to frame {self._frames_fed}")
+        if self._frames_fed >= self._total_frames:
+            return False
+        if self._sample_rate:
+            self._notify_position_update(int(self._frames_fed / self._sample_rate * 1000))
+        return True
+
     async def seek(self, position_ms: int) -> None:
-        """Seek to position in current track."""
+        """Seek to position in current track.
+
+        Uses the already-decoded PCM; never starts a new download. If the
+        feeding loop has already finished this track (last ~buffer-seconds,
+        or after a natural end the player has not yet processed), the feeder
+        is restarted so the new position actually plays instead of going silent.
+        """
         if self._sample_rate == 0 or self._audio_data is None:
+            # After stop() `_audio_data` is cleared, but a same-track replay
+            # can restore from cache via play(). A seek with no loaded audio
+            # is a no-op; the caller issues play() then seek.
             return
 
         target_frame = int(position_ms / 1000 * self._sample_rate)
@@ -471,12 +584,21 @@ class LocalAudioBackend(AudioBackend):
         logger.debug(f"Seek to {position_ms}ms (frame {target_frame})")
         self._seek_target = target_frame
 
-        # If no feeding loop is running (e.g., paused after track end),
-        # update position directly
-        if self._feeding_task is None or self._feeding_task.done():
-            if self._ring_buffer:
-                self._ring_buffer.clear()
-            self._frames_fed = target_frame
+        feeding_live = self._feeding_task is not None and not self._feeding_task.done()
+        if feeding_live:
+            return
+
+        # Feeder already finished this track (drain completed / natural end).
+        # Apply the seek now and start feeding again so scrubbing isn't silent.
+        if not self._apply_pending_seek():
+            return
+        if self._ring_buffer is None or self._stream is None:
+            return
+        if self._state != PlaybackState.PAUSED:
+            self._stream.resume()
+        self._feeding_task = asyncio.create_task(self._feeding_loop())
+        if self._state != PlaybackState.PAUSED:
+            self._notify_state_change(PlaybackState.PLAYING)
 
     async def get_position(self) -> int:
         """Get current playback position accounting for buffer latency."""
@@ -558,6 +680,11 @@ class LocalAudioBackend(AudioBackend):
 
     async def disconnect(self) -> None:
         await self.stop()
+        self._cached_audio = None
+        self._cached_audio_track_id = None
+        self._cached_bytes = None
+        self._cached_bytes_track_id = None
+        self._current_track_id = None
         if self._stream:
             self._stream.close()
             self._stream = None

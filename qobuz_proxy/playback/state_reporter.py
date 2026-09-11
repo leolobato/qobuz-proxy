@@ -157,8 +157,11 @@ class StateReporter:
             try:
                 await asyncio.sleep(STATE_UPDATE_INTERVAL_SECONDS)
 
-                # Only send heartbeat if playing (not stopped/paused)
-                if self._player.state == PlaybackState.PLAYING:
+                # Keep heartbeats going while playing or loading a skip. A
+                # LOADING window used to go silent; the app then treated the
+                # last PLAYING report (old queue item) as authority and snapped
+                # the UI back to the speaker's previous track.
+                if self._player.state in (PlaybackState.PLAYING, PlaybackState.LOADING):
                     await self._send_state_update()
 
             except asyncio.CancelledError:
@@ -184,15 +187,14 @@ class StateReporter:
         # Get queue state
         queue_state = await self._queue.get_state()
 
-        # Get current track info
-        current_track = self._player.current_track
-        queue_item_id = current_track.queue_item_id if current_track else 0
+        # Prefer a skip's advertised item over the still-playing outgoing track.
+        queue_item_id = self._player.reported_queue_item_id
 
         # Get position with current timestamp
         now_ms = int(time.time() * 1000)
 
         # For playing state, use timestamp-based position
-        # For paused/stopped, use last known position
+        # For paused/stopped/loading, freeze at the last committed value
         if self._player.state == PlaybackState.PLAYING:
             position_timestamp = self._player._position_timestamp_ms
             position_value = self._player._position_value_ms
@@ -201,7 +203,8 @@ class StateReporter:
                 f"player._position_timestamp_ms={position_timestamp}"
             )
         else:
-            # When paused/stopped, freeze position at current value
+            # LOADING is frozen at 0 after a skip so the app does not
+            # interpolate the outgoing track's position onto the new item.
             position_timestamp = now_ms
             position_value = self._player.current_position_ms
             logger.debug(

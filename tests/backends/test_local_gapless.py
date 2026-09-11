@@ -351,6 +351,60 @@ class TestGaplessStateClearing:
         await backend.stop()
         await backend.disconnect()
 
+    async def test_play_reuses_matching_prefetch(self) -> None:
+        """Manual skip onto the armed next track must not re-download it."""
+        backend = await _create_playing_backend()
+        # Stop the feeding loop so a natural gapless transition cannot consume
+        # the prefetch before play() — skip cancels feeding first as well.
+        await backend._cancel_feeding()
+        download_and_decode = AsyncMock(side_effect=AssertionError("should reuse prefetch"))
+        backend._download_and_decode = download_and_decode
+
+        _arm_next_track(backend)
+        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await _wait_until(
+            lambda: backend._next_prefetch_task is not None and backend._next_prefetch_task.done()
+        )
+
+        await backend.play("http://example.com/track2.flac", _make_metadata("2"))
+
+        backend._download.assert_awaited_once()
+        backend._decode.assert_awaited_once_with(b"fake-flac-bytes")
+        download_and_decode.assert_not_awaited()
+        assert backend._next_prefetch_task is None
+        assert backend._total_frames == TRACK2_FRAMES
+        assert backend._state == PlaybackState.PLAYING
+
+        await backend.stop()
+        await backend.disconnect()
+
+    async def test_play_waits_for_in_flight_matching_prefetch(self) -> None:
+        """Skip must await the existing download rather than cancel and restart it."""
+        backend = await _create_playing_backend()
+        started = asyncio.Event()
+
+        async def slow_download(url):
+            started.set()
+            await asyncio.sleep(0.05)
+            return b"fake-flac-bytes"
+
+        backend._download = slow_download
+        backend._decode = AsyncMock(return_value=(AUDIO_TRACK2.copy(), 44100))
+        download_and_decode = AsyncMock(side_effect=AssertionError("should reuse prefetch"))
+        backend._download_and_decode = download_and_decode
+
+        await backend.set_next_track("http://example.com/track2.flac", _make_metadata("2"))
+        await started.wait()
+
+        await backend.play("http://example.com/track2.flac", _make_metadata("2"))
+
+        download_and_decode.assert_not_awaited()
+        backend._decode.assert_awaited_once_with(b"fake-flac-bytes")
+        assert backend._total_frames == TRACK2_FRAMES
+
+        await backend.stop()
+        await backend.disconnect()
+
     async def test_stop_clears_gapless_state(self) -> None:
         backend = await _create_playing_backend()
 

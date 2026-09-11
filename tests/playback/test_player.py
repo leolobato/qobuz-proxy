@@ -292,6 +292,259 @@ class TestContextUuidPropagation:
         assert player._current_track.context_uuid == ctx
 
 
+class TestSkipReusesArmedNextTrack:
+    """Manual skip onto the gapless-armed next track must keep its prefetch."""
+
+    def _arm_playing(self, player, backend):
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "url": "http://prefetch/222.flac",
+            "metadata": {"title": "Next", "duration_ms": 180000},
+            "backend_meta": None,
+        }
+
+    async def test_apply_remote_state_does_not_stop_or_refetch(self):
+        player, backend = _make_player()
+        self._arm_playing(player, backend)
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=2,
+        )
+
+        backend.stop.assert_not_awaited()
+        player.metadata.get_streaming_url.assert_not_awaited()
+        backend.play.assert_awaited_once()
+        backend.seek.assert_not_awaited()
+        assert player._current_track.track_id == "222"
+        assert player._current_track.streaming_url == "http://prefetch/222.flac"
+        assert player._gapless_armed is False
+        assert player._pending_next_track is None
+        assert player._state == PlaybackState.PLAYING
+
+    async def test_skip_to_other_track_still_stops(self):
+        player, backend = _make_player()
+        self._arm_playing(player, backend)
+
+        await player.apply_remote_state(
+            track_id="333",
+            queue_item_id=10,
+            position_ms=0,
+            playing_state=2,
+        )
+
+        backend.stop.assert_awaited()
+        player.metadata.get_streaming_url.assert_awaited()
+        assert player._gapless_armed is False
+
+    async def test_next_track_reuses_armed_prefetch(self):
+        player, backend = _make_player()
+        self._arm_playing(player, backend)
+        next_track = QueueTrack(queue_item_id=9, track_id="222")
+        player.queue.advance_to_next = AsyncMock(return_value=next_track)
+
+        result = await player.next_track()
+
+        assert result is True
+        backend.stop.assert_not_awaited()
+        backend.play.assert_awaited_once()
+        assert player._current_track.streaming_url == "http://prefetch/222.flac"
+        assert player._gapless_armed is False
+
+
+class TestSkipAcknowledgesImmediately:
+    """The Qobuz app treats renderer currentQueueItemId as authority.
+
+    A skip that keeps advertising the outgoing track while stop/URL I/O runs
+    makes the app snap back to whatever is still playing on the speaker.
+    """
+
+    async def test_new_item_is_current_before_stop_finishes(self):
+        player, backend = _make_player()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        seen_during_stop = []
+
+        async def slow_stop():
+            cur = player.current_track
+            seen_during_stop.append(
+                (
+                    player.state,
+                    cur.track_id if cur else None,
+                    cur.queue_item_id if cur else None,
+                )
+            )
+            await asyncio.sleep(0.01)
+
+        backend.stop = AsyncMock(side_effect=slow_stop)
+
+        reports = []
+
+        async def capture_report():
+            cur = player.current_track
+            reports.append(
+                (
+                    player.state,
+                    cur.track_id if cur else None,
+                    player.reported_queue_item_id,
+                )
+            )
+
+        player._state_update_callback = capture_report
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=2,
+        )
+
+        assert seen_during_stop
+        assert seen_during_stop[0] == (PlaybackState.LOADING, "222", 9)
+        assert reports
+        assert reports[0][2] == 9
+        assert player.current_track is not None
+        assert player.current_track.track_id == "222"
+        assert player.current_track.queue_item_id == 9
+
+    async def test_skip_override_wins_while_previous_load_holds_lock(self):
+        player, backend = _make_player()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        backend.stop = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
+
+        first = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        await asyncio.sleep(0.01)  # first skip is fetching the URL, holding the lock
+
+        second = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="333",
+                queue_item_id=10,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        await asyncio.sleep(0.01)  # let the second skip publish its override
+        assert player.reported_queue_item_id == 10
+
+        await asyncio.gather(first, second)
+        assert player.current_track is not None
+        assert player.current_track.track_id == "333"
+        assert player.reported_queue_item_id == 10
+
+    async def test_armed_skip_reports_new_item_before_play(self):
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "url": "http://prefetch/222.flac",
+            "metadata": {"title": "Next", "duration_ms": 180000},
+            "backend_meta": None,
+        }
+
+        reports = []
+
+        async def capture_report():
+            reports.append(player.reported_queue_item_id)
+
+        player._state_update_callback = capture_report
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=2,
+        )
+
+        assert reports
+        assert reports[0] == 9
+        backend.stop.assert_not_awaited()
+        backend.play.assert_awaited_once()
+
+    async def test_outgoing_track_echo_does_not_undo_armed_skip(self):
+        """A SET_STATE for the previous song while the skip is loading must not
+        bump generation and abort playback of the new track."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+
+        async def slow_play(*args, **kwargs):
+            await asyncio.sleep(0.05)
+
+        backend.play = AsyncMock(side_effect=slow_play)
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "url": "http://prefetch/222.flac",
+            "metadata": {"title": "Next", "duration_ms": 180000},
+            "backend_meta": None,
+        }
+
+        skip = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        for _ in range(50):
+            if player.state == PlaybackState.LOADING and player._skipped_from_track_id == "111":
+                break
+            await asyncio.sleep(0.001)
+        echo = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="111",
+                queue_item_id=8,
+                position_ms=40_000,
+                playing_state=2,
+            )
+        )
+        await asyncio.gather(skip, echo)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "222"
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited_once()
+        player.metadata.get_streaming_url.assert_not_awaited()
+
+
 class TestNextAtEndOfQueue:
     """Skipping past the end of the queue must still report the finished play."""
 

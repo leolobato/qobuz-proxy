@@ -37,9 +37,9 @@ _SD_PATCH = "qobuz_proxy.backends.local.device._import_sounddevice"
 _SF_PATCH = "qobuz_proxy.backends.local.backend.soundfile"
 
 
-def _make_metadata() -> BackendTrackMetadata:
+def _make_metadata(track_id: str = "123") -> BackendTrackMetadata:
     return BackendTrackMetadata(
-        track_id="123",
+        track_id=track_id,
         title="Test Track",
         artist="Test Artist",
         album="Test Album",
@@ -182,7 +182,9 @@ class TestTrackChangeSilencesOldAudio:
             return FAKE_AUDIO_44100.copy(), 44100
 
         backend._download_and_decode = slow_download
-        play_task = asyncio.create_task(backend.play("http://example.com/b.flac", _make_metadata()))
+        play_task = asyncio.create_task(
+            backend.play("http://example.com/b.flac", _make_metadata("456"))
+        )
         await download_entered.wait()
 
         # While the new track downloads, the old audio is already silenced
@@ -366,7 +368,7 @@ class TestSampleRateChange:
             return FAKE_AUDIO_96000.copy(), 96000
 
         backend._download_and_decode = fake_download_96000
-        await backend.play("http://example.com/track2.flac", _make_metadata())
+        await backend.play("http://example.com/track2.flac", _make_metadata("456"))
         await asyncio.sleep(0.01)
 
         assert len(open_calls) == 2
@@ -424,7 +426,9 @@ class TestSeek:
         backend._total_frames = 441000
 
         await backend.seek(5000)  # 5 seconds
-        assert backend._seek_target == int(5000 / 1000 * 44100)
+        # No feeder running: apply immediately onto the decoded PCM.
+        assert backend._seek_target is None
+        assert backend._frames_fed == int(5000 / 1000 * 44100)
 
         await backend.disconnect()
 
@@ -646,6 +650,61 @@ class TestFeedingLoop:
 
         # frames_fed should be at or past 5s mark
         assert backend._frames_fed >= int(5000 / 1000 * 44100)
+
+        await backend.stop()
+        await backend.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Current-track cache (instant seek / replay)
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentTrackCache:
+    async def test_play_same_track_reuses_decoded_audio(self) -> None:
+        """A second play of the same track must not download again."""
+        backend = await _create_connected_backend()
+        downloads = 0
+
+        async def fake_download(url):
+            nonlocal downloads
+            downloads += 1
+            return FAKE_AUDIO_44100.copy(), 44100
+
+        backend._download_and_decode = fake_download
+        backend._stream.set_ring_buffer = MagicMock()
+        backend._stream.open = MagicMock()
+        backend._stream.start = MagicMock()
+        backend._stream.stop = MagicMock()
+        backend._stream.pause = MagicMock()
+
+        await backend.play("http://example.com/track.flac", _make_metadata())
+        await backend.stop()
+        await backend.play("http://example.com/track.flac", _make_metadata())
+
+        assert downloads == 1
+        assert backend._state == PlaybackState.PLAYING
+
+        await backend.stop()
+        await backend.disconnect()
+
+    async def test_play_same_track_does_not_pause_for_redownload(self) -> None:
+        backend = await _create_connected_backend()
+
+        async def fake_download(url):
+            return FAKE_AUDIO_44100.copy(), 44100
+
+        backend._download_and_decode = fake_download
+        backend._stream.set_ring_buffer = MagicMock()
+        backend._stream.open = MagicMock()
+        backend._stream.start = MagicMock()
+        backend._stream.pause = MagicMock()
+
+        await backend.play("http://example.com/track.flac", _make_metadata())
+        backend._stream.pause.reset_mock()
+        await backend.play("http://example.com/track.flac", _make_metadata())
+
+        backend._stream.pause.assert_not_called()
 
         await backend.stop()
         await backend.disconnect()
