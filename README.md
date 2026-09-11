@@ -173,6 +173,10 @@ The container includes a health check that verifies the HTTP server is respondin
 docker inspect --format='{{.State.Health.Status}}' qobuz-proxy
 ```
 
+## Contributing
+
+Bug reports and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first: keep each PR to a single change, leave version bumps to the maintainer, and say how you tested on real hardware.
+
 ## Acknowledgments
 
 This project is based on the Qobuz Connect reverse-engineering work done by [Tobias Guyer](https://github.com/tobiasguyer) in [StreamCore32](https://github.com/tobiasguyer/StreamCore32). Thanks to his efforts in figuring out the Qobuz Connect protocol, this project was possible.

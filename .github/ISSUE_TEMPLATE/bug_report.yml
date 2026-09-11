@@ -1,0 +1,28 @@
+name: Bug report
+description: Something isn't working the way it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: |
+        What did you do and what went wrong? Please mention your speaker model (or "local audio"),
+        the qobuz-proxy version (shown at the top of the web UI), and the Qobuz app you were using.
+      placeholder: |
+        Playing an album from the iOS app to my Sonos One. Skipping twice quickly stops playback
+        and the app shows the previous song. qobuz-proxy v1.7.2 in Docker.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Logs from around the time it happened, ideally at DEBUG level. Set `QOBUZPROXY_LOG_LEVEL=DEBUG`
+        (or run with `--log-level DEBUG`), restart, reproduce, then paste the output of `docker logs qobuz-proxy`.
+        If you only have INFO logs, paste those anyway, they still help.
+      render: text
+    validations:
+      required: false
