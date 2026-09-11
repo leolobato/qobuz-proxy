@@ -87,6 +87,34 @@ class TestOnNextTrackInfoChanged:
         backend.set_next_track.assert_not_called()
         assert player._gapless_armed is True
 
+    async def test_does_not_arm_currently_playing_track(self):
+        """Connect still names the skipped-to song as nextQueueItem; arming it
+        makes Sonos 'transition' to the same URI every poll."""
+        player, backend = _make_player(next_track_info={"trackId": "111", "queueItemId": 8})
+        backend.set_next_track = AsyncMock(return_value=True)
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+
+        await player._prepare_next_track_for_gapless()
+
+        backend.set_next_track.assert_not_awaited()
+        assert player._gapless_armed is False
+
+    async def test_next_info_matching_current_does_not_rearm(self):
+        player, backend = _make_player(next_track_info={"trackId": "111", "queueItemId": 8})
+        backend.clear_next_track = AsyncMock()
+        backend.set_next_track = AsyncMock(return_value=True)
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._gapless_armed = True
+        player._pending_next_track = {"trackId": "111", "queueItemId": 8}
+
+        await player.on_next_track_info_changed()
+
+        backend.clear_next_track.assert_awaited_once()
+        backend.set_next_track.assert_not_awaited()
+        assert player._gapless_armed is False
+
 
 class TestPrepareNextTrackConcurrency:
     """Arming must be serialized — overlapping calls double-queue the next track."""
@@ -290,6 +318,54 @@ class TestContextUuidPropagation:
         await player._handle_gapless_transition()
 
         assert player._current_track.context_uuid == ctx
+
+    async def test_gapless_transition_does_not_override_in_flight_skip(self):
+        player, backend = _make_player()
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._skip_in_flight_track_id = "333"
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "metadata": {"duration_ms": 1000},
+        }
+
+        await player._handle_gapless_transition()
+
+        assert player._current_track.track_id == "111"
+        assert player._skip_in_flight_track_id == "333"
+        assert player._gapless_armed is False
+
+    async def test_adopt_armed_next_clears_stale_next_info(self):
+        held: list[dict | None] = [{"trackId": "222", "queueItemId": 9}]
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player.set_next_track_callbacks(
+            get_callback=lambda: held[0],
+            clear_callback=lambda: held.__setitem__(0, None),
+        )
+        player._state = PlaybackState.PLAYING
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._gapless_armed = True
+        player._pending_next_track = {
+            "trackId": "222",
+            "queueItemId": 9,
+            "url": "http://prefetch/222.flac",
+            "metadata": {"title": "Next", "duration_ms": 180000},
+        }
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=2,
+        )
+
+        assert held[0] is None
+        assert player._current_track.track_id == "222"
 
 
 class TestSkipReusesArmedNextTrack:
@@ -663,6 +739,75 @@ class TestSkipAcknowledgesImmediately:
         backend.play.assert_awaited()
         played_urls = [call.args[0] for call in backend.play.await_args_list]
         assert any("333" in url for url in played_urls)
+
+    async def test_play_state_followup_without_item_does_not_abort_skip(self):
+        """Connect heartbeats often omit currentQueueItem.
+
+        Those must not bump generation and leave the speaker on the previous
+        song while the app already shows the skip target.
+        """
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
+
+        skip = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=None,
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert player._skip_in_flight_track_id == "222"
+        heartbeat = asyncio.create_task(
+            player.apply_remote_state(
+                track_id=None,
+                queue_item_id=None,
+                position_ms=12_000,
+                playing_state=2,
+            )
+        )
+        await asyncio.gather(skip, heartbeat)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "222"
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited()
+        played_urls = [call.args[0] for call in backend.play.await_args_list]
+        assert any("222" in url for url in played_urls)
+
+    async def test_named_item_without_playing_state_plays_if_already_loaded(self):
+        """If a skip committed the new item but never reached play(), a later
+        SET_STATE that only re-names it must still start playback."""
+        player, backend = _make_player()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        backend.stop = AsyncMock()
+        track = QueueTrack(queue_item_id=9, track_id="222")
+        track.set_streaming_url("http://test/222")
+        player._current_track = track
+        player._state = PlaybackState.LOADING
+        player._skip_in_flight_track_id = "222"
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=None,
+        )
+
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited()
 
 
 class TestNextAtEndOfQueue:

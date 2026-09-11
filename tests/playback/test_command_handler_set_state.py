@@ -81,6 +81,49 @@ class TestSetStateHandling:
         assert backend.played == ["2001"]
         assert player.state == PlaybackState.PLAYING
 
+    async def test_records_last_connect_state_from_set_state(self) -> None:
+        player, _backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+
+        msg = _set_state_msg(track_id=2001, queue_item_id=5, playing_state=2, position_ms=1500)
+        msg.srvrRndrSetState.nextQueueItem.queueItemId = 6
+        msg.srvrRndrSetState.nextQueueItem.trackId = 2002
+        await handler._handle_set_state(msg)
+
+        snap = handler.get_last_connect_state()
+        assert snap is not None
+        assert snap["track_id"] == "2001"
+        assert snap["queue_item_id"] == 5
+        assert snap["playing_state"] == "playing"
+        assert snap["position_ms"] == 1500
+        assert snap["next_track_id"] == "2002"
+
+    async def test_connect_state_keeps_track_when_followup_omits_item(self) -> None:
+        """Position/play-only SET_STATE must not blank the Web UI Connect pane."""
+        player, _backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+
+        first = _set_state_msg(track_id=2001, queue_item_id=5, playing_state=2, position_ms=0)
+        first.srvrRndrSetState.nextQueueItem.queueItemId = 6
+        first.srvrRndrSetState.nextQueueItem.trackId = 2002
+        await handler._handle_set_state(first)
+
+        follow = pb.QConnectMessage()
+        follow.messageType = 41
+        follow.srvrRndrSetState.playingState = 2
+        follow.srvrRndrSetState.currentPosition = 12_000
+        await handler._handle_set_state(follow)
+
+        snap = handler.get_last_connect_state()
+        assert snap is not None
+        assert snap["track_id"] == "2001"
+        assert snap["queue_item_id"] == 5
+        assert snap["playing_state"] == "playing"
+        assert snap["position_ms"] == 12_000
+        assert snap["next_track_id"] == "2002"
+
     async def test_set_state_propagates_context_uuid(self) -> None:
         """The currentQueueItem context UUID must reach the played track so
         the play report (listening history / scrobble) carries it."""

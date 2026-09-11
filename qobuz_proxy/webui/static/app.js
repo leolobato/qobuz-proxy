@@ -7,6 +7,9 @@
     var addPanelOpen = false;
     var selectedBackend = null;
     var selectedDevice = null;
+    var volumeDragging = false;
+    var seekDragging = false;
+    var lastUnmutedVolume = {};
 
     // -------------------------------------------------------------------------
     // Auth
@@ -153,6 +156,185 @@
         return html;
     }
 
+    function playbackIcon(kind) {
+        if (kind === "prev") {
+            return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 6h2.2v12H6V6zm3.3 6 9.7 6.2V5.8L9.3 12z"/></svg>';
+        }
+        if (kind === "next") {
+            return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M15.8 6H18v12h-2.2V6zM5 18.2V5.8L14.7 12 5 18.2z"/></svg>';
+        }
+        if (kind === "pause") {
+            return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"/></svg>';
+        }
+        if (kind === "volume") {
+            return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 10v4h4l5 5V5L7 10H3zm13.5 2c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>';
+        }
+        if (kind === "volume-mute") {
+            return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 7.73 9H3v4h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z"/></svg>';
+        }
+        return '<svg class="playback-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M8 5.5v13l11-6.5L8 5.5z"/></svg>';
+    }
+
+    function playbackPosition(s) {
+        if (typeof s.position_ms === "number") return s.position_ms;
+        var device = s.device || {};
+        if (typeof device.position_ms === "number") return device.position_ms;
+        return 0;
+    }
+
+    function playbackDuration(s) {
+        if (typeof s.duration_ms === "number" && s.duration_ms > 0) return s.duration_ms;
+        var device = s.device || {};
+        var np = s.now_playing || {};
+        if (typeof device.duration_ms === "number" && device.duration_ms > 0) return device.duration_ms;
+        if (typeof np.duration_ms === "number" && np.duration_ms > 0) return np.duration_ms;
+        return 0;
+    }
+
+    function renderPlaybackControls(s) {
+        var state = (s.status || "idle").toLowerCase();
+        if (state === "disconnected" || state === "starting") return "";
+        var idArg = escapeAttr(JSON.stringify(s.id));
+        var duration = playbackDuration(s);
+        var position = playbackPosition(s);
+        if (duration > 0 && position > duration) position = duration;
+
+        var html = '<div class="playback-bar">';
+        if (duration > 0) {
+            html += '<div class="playback-seek">';
+            html += '<span class="playback-seek-current">' + escapeHtml(formatClock(position)) + "</span>";
+            html += '<input type="range" min="0" max="' + duration + '" value="' + position + '"';
+            html += ' aria-label="Seek"';
+            html += ' onpointerdown="beginSeekDrag()"';
+            html += ' oninput="previewSeek(this)"';
+            html += ' onchange="commitSeek(' + idArg + ', this)">';
+            html += '<span class="playback-seek-duration">' + escapeHtml(formatClock(duration)) + "</span>";
+            html += "</div>";
+        }
+
+        html += '<div class="playback-controls">';
+        html += '<button type="button" class="playback-btn" title="Previous" aria-label="Previous" onclick="speakerControl(' + idArg + ', \'previous\')">' + playbackIcon("prev") + "</button>";
+        if (state === "playing") {
+            html += '<button type="button" class="playback-btn playback-btn-main" title="Pause" aria-label="Pause" onclick="speakerControl(' + idArg + ', \'pause\')">' + playbackIcon("pause") + "</button>";
+        } else {
+            html += '<button type="button" class="playback-btn playback-btn-main" title="Play" aria-label="Play" onclick="speakerControl(' + idArg + ', \'play\')">' + playbackIcon("play") + "</button>";
+        }
+        html += '<button type="button" class="playback-btn" title="Next" aria-label="Next" onclick="speakerControl(' + idArg + ', \'next\')">' + playbackIcon("next") + "</button>";
+
+        var vol = s.volume;
+        if (vol === undefined && s.now_playing && s.now_playing.volume !== undefined) {
+            vol = s.now_playing.volume;
+        }
+        var cfg = s.config || {};
+        if (!cfg.fixed_volume && vol !== undefined && vol !== null) {
+            vol = parseInt(vol, 10);
+            if (isNaN(vol)) vol = 0;
+            if (vol > 0) lastUnmutedVolume[s.id] = vol;
+            var muted = vol <= 0;
+            var muteLabel = muted ? "Unmute" : "Mute";
+            html += '<div class="playback-volume">';
+            html += '<button type="button" class="playback-btn' + (muted ? " playback-btn-muted" : "") + '" title="' + muteLabel + '" aria-label="' + muteLabel + '" onclick="toggleMute(' + idArg + ', this)">' + playbackIcon(muted ? "volume-mute" : "volume") + "</button>";
+            html += '<input type="range" min="0" max="100" value="' + escapeAttr(String(vol)) + '"';
+            html += ' aria-label="Volume"';
+            html += ' onpointerdown="beginVolumeDrag()"';
+            html += ' oninput="previewVolume(' + idArg + ', this)"';
+            html += ' onchange="commitVolume(' + idArg + ', this)">';
+            html += '<span class="playback-volume-value">' + escapeHtml(String(vol)) + "</span>";
+            html += "</div>";
+        }
+        html += "</div></div>";
+        return html;
+    }
+
+    function beginVolumeDrag() {
+        volumeDragging = true;
+    }
+
+    function previewVolume(id, input) {
+        var vol = parseInt(input.value, 10);
+        if (isNaN(vol)) vol = 0;
+        if (vol > 0) lastUnmutedVolume[id] = vol;
+        var label = input.parentNode && input.parentNode.querySelector(".playback-volume-value");
+        if (label) label.textContent = String(vol);
+        var btn = input.parentNode && input.parentNode.querySelector(".playback-btn");
+        if (btn) {
+            var muted = vol <= 0;
+            btn.title = muted ? "Unmute" : "Mute";
+            btn.setAttribute("aria-label", btn.title);
+            btn.classList.toggle("playback-btn-muted", muted);
+            btn.innerHTML = playbackIcon(muted ? "volume-mute" : "volume");
+        }
+    }
+
+    function commitVolume(id, input) {
+        previewVolume(id, input);
+        speakerControl(id, "volume", { volume: parseInt(input.value, 10) || 0 });
+        setTimeout(function () {
+            volumeDragging = false;
+        }, 500);
+    }
+
+    function toggleMute(id, btn) {
+        var wrap = btn && btn.parentNode;
+        var input = wrap && wrap.querySelector('input[type="range"]');
+        var current = input ? parseInt(input.value, 10) : 0;
+        if (isNaN(current)) current = 0;
+        var next = current > 0 ? 0 : (lastUnmutedVolume[id] || 50);
+        if (current > 0) lastUnmutedVolume[id] = current;
+        volumeDragging = true;
+        if (input) {
+            input.value = String(next);
+            previewVolume(id, input);
+        }
+        speakerControl(id, "volume", { volume: next });
+        setTimeout(function () {
+            volumeDragging = false;
+        }, 500);
+    }
+
+    function beginSeekDrag() {
+        seekDragging = true;
+    }
+
+    function previewSeek(input) {
+        var el = input.parentNode && input.parentNode.querySelector(".playback-seek-current");
+        if (el) el.textContent = formatClock(parseInt(input.value, 10) || 0);
+    }
+
+    function commitSeek(id, input) {
+        previewSeek(input);
+        speakerControl(id, "seek", { position_ms: parseInt(input.value, 10) || 0 });
+        setTimeout(function () {
+            seekDragging = false;
+        }, 500);
+    }
+
+    function speakerControl(id, action, extra) {
+        var payload = { action: action };
+        if (extra && extra.volume != null) payload.volume = extra.volume;
+        if (extra && extra.position_ms != null) payload.position_ms = extra.position_ms;
+        fetch("api/speakers/" + encodeURIComponent(id) + "/control", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        })
+            .then(function (r) {
+                if (!r.ok) {
+                    return r.json().then(function (d) {
+                        throw new Error(d.error || "Control failed");
+                    });
+                }
+                return r.json();
+            })
+            .then(function () {
+                lastSpeakersJson = null;
+                fetchStatus();
+            })
+            .catch(function (err) {
+                showError(err.message);
+            });
+    }
+
     function renderActions(s) {
         var html = '<div class="speaker-actions">';
         var idArg = escapeAttr(JSON.stringify(s.id));
@@ -161,18 +343,43 @@
         return html;
     }
 
+    function formatMs(ms) {
+        if (ms == null || ms === "" || isNaN(ms) || ms < 0) return "";
+        var s = Math.floor(Number(ms) / 1000);
+        var m = Math.floor(s / 60);
+        s = s % 60;
+        return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    function formatClock(ms) {
+        return formatMs(ms) || "0:00";
+    }
+
+    function nowPlayingView(s) {
+        var np = s.now_playing || {};
+        var device = s.device || {};
+        return {
+            title: np.title || device.title || "",
+            artist: np.artist || device.artist || "",
+            album: np.album || device.album || "",
+            album_art_url: np.album_art_url || device.album_art_url || "",
+            quality: np.quality || "",
+            next_title: device.next_title || "",
+            next_track_id: device.next_track_id || "",
+        };
+    }
+
     function renderSpeakerCard(s) {
         var state = (s.status || "idle").toLowerCase();
-        var np = s.now_playing;
+        var np = nowPlayingView(s);
         var cfg = s.config || {};
-        var isActive = np && (state === "playing" || state === "paused");
+        var isActive = state === "playing" || state === "paused" || !!(s.device && s.device.track_id);
 
         var html = '<div class="speaker-card">';
 
         if (isActive) {
             html += '<div class="speaker-card-playing">';
 
-            // Album art
             if (np.album_art_url) {
                 html += '<img class="speaker-album-art" src="' + escapeHtml(np.album_art_url) + '" alt="Album art">';
             } else {
@@ -182,27 +389,30 @@
             html += '<div class="speaker-info">';
             html += renderSpeakerHeader(s);
 
-            if (np.title) {
-                html += '<div class="speaker-track">' + escapeHtml(np.title) + '</div>';
+            var headline = "";
+            if (np.artist && np.title) headline = np.artist + " — " + np.title;
+            else headline = np.title || np.artist;
+            if (headline) {
+                html += '<div class="speaker-track">' + escapeHtml(headline) + '</div>';
             }
-            var artistAlbum = [];
-            if (np.artist) artistAlbum.push(escapeHtml(np.artist));
-            if (np.album) artistAlbum.push(escapeHtml(np.album));
-            if (artistAlbum.length) {
-                html += '<div class="speaker-artist-album">' + artistAlbum.join(' &mdash; ') + '</div>';
+            if (np.album) {
+                html += '<div class="speaker-artist-album">' + escapeHtml(np.album) + '</div>';
+            }
+            var nextLine = np.next_title || (np.next_track_id ? "Track " + np.next_track_id : "");
+            if (nextLine) {
+                html += '<div class="speaker-artist-album">Next: ' + escapeHtml(nextLine) + '</div>';
             }
 
             var meta = [];
             if (np.quality) meta.push(escapeHtml(np.quality));
             if (cfg.fixed_volume) {
                 meta.push('Fixed volume');
-            } else if (np.volume !== undefined) {
-                meta.push('Vol ' + np.volume + '%');
             }
             if (meta.length) {
                 html += '<div class="speaker-meta">' + meta.join(' · ') + '</div>';
             }
 
+            html += renderPlaybackControls(s);
             html += '</div>'; // speaker-info
             html += renderActions(s);
             html += '</div>'; // speaker-card-playing
@@ -234,6 +444,7 @@
                     'Pick a quality in Edit if it supports better than CD.</div>';
             }
 
+            html += renderPlaybackControls(s);
             html += '</div>'; // flex child
             html += renderActions(s);
             html += '</div>';
@@ -296,6 +507,7 @@
 
     function updateSpeakers(speakers) {
         if (addPanelOpen) return;
+        if (volumeDragging || seekDragging) return;
 
         // While editing, skip re-render only after the form is in the DOM —
         // otherwise the initial click-to-edit never gets a chance to render it.
@@ -861,6 +1073,14 @@
     window.cancelEdit = cancelEdit;
     window.submitEditSpeaker = submitEditSpeaker;
     window.removeSpeaker = removeSpeaker;
+    window.speakerControl = speakerControl;
+    window.beginVolumeDrag = beginVolumeDrag;
+    window.previewVolume = previewVolume;
+    window.commitVolume = commitVolume;
+    window.toggleMute = toggleMute;
+    window.beginSeekDrag = beginSeekDrag;
+    window.previewSeek = previewSeek;
+    window.commitSeek = commitSeek;
 
     // Show OAuth error if redirected back with one
     (function checkOAuthError() {
@@ -882,5 +1102,5 @@
 
     // Start polling on page load
     fetchStatus();
-    pollTimer = setInterval(fetchStatus, 3000);
+    pollTimer = setInterval(fetchStatus, 1000);
 })();

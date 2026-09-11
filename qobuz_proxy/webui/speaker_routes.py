@@ -110,6 +110,29 @@ async def _handle_edit_speaker(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=400)
 
 
+async def _handle_speaker_control(request: web.Request) -> web.Response:
+    """Play, pause, skip, or set volume on a running speaker."""
+    speaker_id = request.match_info["speaker_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    if not isinstance(body, dict) or not body.get("action"):
+        return web.json_response({"error": "action is required"}, status=400)
+
+    callback = request.app["on_speaker_control"]
+    try:
+        result = await callback(speaker_id, body)
+        return web.json_response(result)
+    except KeyError:
+        return web.json_response({"error": "speaker not found"}, status=404)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=409)
+
+
 async def _handle_remove_speaker(request: web.Request) -> web.Response:
     """Remove a speaker."""
     speaker_id = request.match_info["speaker_id"]
@@ -129,4 +152,5 @@ def register_speaker_routes(app: web.Application) -> None:
     app.router.add_get("/api/speakers", _handle_get_speakers)
     app.router.add_post("/api/speakers", _handle_add_speaker)
     app.router.add_put("/api/speakers/{speaker_id}", _handle_edit_speaker)
+    app.router.add_post("/api/speakers/{speaker_id}/control", _handle_speaker_control)
     app.router.add_delete("/api/speakers/{speaker_id}", _handle_remove_speaker)

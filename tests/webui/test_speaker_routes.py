@@ -17,6 +17,7 @@ def make_app() -> web.Application:
     app["on_add_speaker"] = AsyncMock(return_value={"id": "test", "name": "Test"})
     app["on_edit_speaker"] = AsyncMock(return_value={"id": "test", "name": "Test"})
     app["on_remove_speaker"] = AsyncMock(return_value=True)
+    app["on_speaker_control"] = AsyncMock(return_value={"ok": True, "id": "living-room"})
     app["local_audio_enabled"] = False
     register_routes(app)
     return app
@@ -183,3 +184,45 @@ class TestSpeakerCRUD:
         client.app["on_remove_speaker"] = AsyncMock(side_effect=KeyError("not-found"))
         resp = await client.delete("/api/speakers/not-found")
         assert resp.status == 404
+
+
+class TestSpeakerControlRoute:
+    async def test_pause(self, client: TestClient) -> None:
+        resp = await client.post("/api/speakers/living-room/control", json={"action": "pause"})
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ok"] is True
+        client.app["on_speaker_control"].assert_awaited_once_with(
+            "living-room", {"action": "pause"}
+        )
+
+    async def test_volume(self, client: TestClient) -> None:
+        resp = await client.post(
+            "/api/speakers/living-room/control", json={"action": "volume", "volume": 30}
+        )
+        assert resp.status == 200
+        client.app["on_speaker_control"].assert_awaited_once()
+
+    async def test_seek(self, client: TestClient) -> None:
+        resp = await client.post(
+            "/api/speakers/living-room/control",
+            json={"action": "seek", "position_ms": 15000},
+        )
+        assert resp.status == 200
+        client.app["on_speaker_control"].assert_awaited_once_with(
+            "living-room", {"action": "seek", "position_ms": 15000}
+        )
+
+    async def test_missing_action(self, client: TestClient) -> None:
+        resp = await client.post("/api/speakers/living-room/control", json={})
+        assert resp.status == 400
+
+    async def test_not_found(self, client: TestClient) -> None:
+        client.app["on_speaker_control"] = AsyncMock(side_effect=KeyError("missing"))
+        resp = await client.post("/api/speakers/missing/control", json={"action": "pause"})
+        assert resp.status == 404
+
+    async def test_not_running(self, client: TestClient) -> None:
+        client.app["on_speaker_control"] = AsyncMock(side_effect=RuntimeError("speaker is not running"))
+        resp = await client.post("/api/speakers/living-room/control", json={"action": "pause"})
+        assert resp.status == 409

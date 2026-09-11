@@ -143,6 +143,15 @@ class Speaker:
             if not fixed_volume:
                 now_playing["volume"] = self._player._volume
 
+        connect = self._connect_view()
+        device = self._device_view()
+        in_sync = True
+        if connect and device:
+            cid = connect.get("track_id")
+            did = device.get("track_id")
+            if cid and did and str(cid) != str(did):
+                in_sync = False
+
         # Build config section
         config_dict: dict = {
             "max_quality": (
@@ -160,14 +169,205 @@ class Speaker:
             config_dict["audio_device"] = self._config.audio_device
             config_dict["buffer_size"] = self._config.audio_buffer_size
 
-        return {
+        status = {
             "id": slugify_name(self._config.name),
             "name": self._config.name,
             "backend": self._config.backend_type,
             "status": playback_status,
             "config": config_dict,
             "now_playing": now_playing,
+            "connect": connect,
+            "device": device,
+            "in_sync": in_sync,
         }
+        if self._player is not None and not (
+            self._config.backend_type == "dlna" and self._config.dlna_fixed_volume
+        ):
+            status["volume"] = getattr(self._player, "_volume", None)
+        if self._player is not None:
+            pos = getattr(self._player, "current_position_ms", None)
+            if not isinstance(pos, int):
+                pos = None
+            dur = getattr(self._player, "duration_ms", None)
+            if not isinstance(dur, int):
+                dur = None
+            if pos is not None:
+                status["position_ms"] = pos
+            if dur:
+                status["duration_ms"] = dur
+        return status
+
+    async def apply_control(
+        self,
+        action: str,
+        volume: Optional[int] = None,
+        position_ms: Optional[int] = None,
+    ) -> dict:
+        """Apply a local transport/volume command from the Web UI.
+
+        Play/pause/skip/seek report back over Connect so the Qobuz app stays in sync.
+        """
+        if not self._is_running or self._player is None:
+            raise RuntimeError("speaker is not running")
+
+        action = (action or "").strip().lower()
+        ok = False
+        if action == "play":
+            ok = await self._player.play()
+        elif action == "pause":
+            ok = await self._player.pause()
+        elif action == "toggle":
+            ok = await self._control_toggle()
+        elif action == "next":
+            ok = await self._control_next()
+        elif action == "previous":
+            ok = await self._control_previous()
+        elif action == "seek":
+            if position_ms is None:
+                raise ValueError("position_ms is required")
+            ok = await self._player.seek(int(position_ms))
+        elif action == "volume":
+            if volume is None:
+                raise ValueError("volume is required")
+            if self._config.backend_type == "dlna" and self._config.dlna_fixed_volume:
+                raise ValueError("volume is fixed on this speaker")
+            await self._player.set_volume(int(volume))
+            ok = True
+        else:
+            raise ValueError(f"unknown action: {action}")
+
+        result = self.get_status()
+        result["ok"] = bool(ok)
+        return result
+
+    async def _control_toggle(self) -> bool:
+        assert self._player is not None
+        if self._player.state == PlaybackState.PAUSED:
+            return await self._player.play()
+        if self._player.state == PlaybackState.PLAYING:
+            return await self._player.pause()
+        if self._player.current_track is not None:
+            return await self._player.play()
+        return False
+
+    async def _control_next(self) -> bool:
+        """Skip forward using Connect's named next item when we have one."""
+        assert self._player is not None
+        info = None
+        if self._playback_handler is not None:
+            getter = getattr(self._playback_handler, "get_next_track_info", None)
+            info = getter() if callable(getter) else None
+        if info and info.get("trackId"):
+            ok = await self._player.play_track(
+                queue_item_id=int(info["queueItemId"]),
+                track_id=str(info["trackId"]),
+                position_ms=0,
+                context_uuid=info.get("contextUuid"),
+            )
+            if ok:
+                nxt = (
+                    self._playback_handler.get_next_track_info()
+                    if self._playback_handler is not None
+                    else None
+                )
+                if nxt and str(nxt.get("trackId")) == str(info["trackId"]):
+                    self._playback_handler.clear_next_track_info()
+                return True
+        ws = self._ws_manager
+        if ws is not None and getattr(ws, "is_renderer_active", False):
+            return await ws.request_next_track(lambda: True)
+        return await self._player.next_track()
+
+    async def _control_previous(self) -> bool:
+        assert self._player is not None
+        if await self._player.previous_track():
+            return True
+        if self._player.current_track is not None:
+            return await self._player.seek(0)
+        return False
+
+    def _connect_view(self) -> Optional[dict]:
+        """Last current item the Qobuz app sent over Connect."""
+        handler = self._playback_handler
+        if handler is None:
+            return None
+        getter = getattr(handler, "get_last_connect_state", None)
+        raw = getter() if callable(getter) else None
+        if not raw or not raw.get("track_id"):
+            return None
+        view = dict(raw)
+        self._apply_cached_titles(view, view.get("track_id"))
+        if view.get("next_track_id"):
+            nxt = {"track_id": view["next_track_id"]}
+            self._apply_cached_titles(nxt, view["next_track_id"])
+            title = nxt.get("title") or ""
+            artist = nxt.get("artist") or ""
+            view["next_title"] = " — ".join(p for p in (artist, title) if p) or None
+        return view
+
+    def _device_view(self) -> Optional[dict]:
+        """What the renderer/player is actually outputting."""
+        backend = self._backend
+        if backend is not None:
+            snap = backend.playback_snapshot()
+            if snap and snap.get("track_id"):
+                self._apply_cached_titles(snap, snap.get("track_id"))
+                return snap
+        return self._player_track_view()
+
+    def _player_track_view(self) -> Optional[dict]:
+        if not self._player or not self._player.current_track:
+            return None
+        track = self._player.current_track
+        track_id = getattr(track, "track_id", None)
+        if not isinstance(track_id, (str, int)):
+            return None
+        meta = track.metadata if isinstance(getattr(track, "metadata", None), dict) else {}
+        pos = getattr(self._player, "current_position_ms", None)
+        if not isinstance(pos, int):
+            pos = None
+        dur = getattr(self._player, "duration_ms", None)
+        if not isinstance(dur, int):
+            dur = None
+        state = getattr(self._player, "state", None)
+        state_name = state.name.lower() if hasattr(state, "name") else None
+        pending = getattr(self._player, "_pending_next_track", None)
+        next_track_id = pending.get("trackId") if isinstance(pending, dict) else None
+        next_meta = pending.get("metadata") if isinstance(pending, dict) else None
+        next_title = None
+        if isinstance(next_meta, dict):
+            next_title = (
+                " — ".join(p for p in (next_meta.get("artist"), next_meta.get("title")) if p)
+                or None
+            )
+        return {
+            "track_id": str(track_id),
+            "queue_item_id": getattr(track, "queue_item_id", None),
+            "title": meta.get("title", ""),
+            "artist": meta.get("artist", ""),
+            "album": meta.get("album", ""),
+            "album_art_url": meta.get("artwork_url", ""),
+            "state": state_name,
+            "position_ms": pos,
+            "duration_ms": dur,
+            "next_track_id": next_track_id,
+            "next_title": next_title,
+        }
+
+    def _apply_cached_titles(self, view: dict, track_id: Optional[str]) -> None:
+        if view.get("title") or not track_id or not self._player:
+            return
+        peek = getattr(getattr(self._player, "metadata", None), "peek_metadata", None)
+        if not callable(peek):
+            return
+        cached = peek(track_id)
+        if not isinstance(cached, dict):
+            return
+        view["title"] = cached.get("title") or ""
+        view["artist"] = cached.get("artist") or ""
+        view["album"] = cached.get("album") or ""
+        if not view.get("album_art_url"):
+            view["album_art_url"] = cached.get("artwork_url") or ""
 
     def _build_component_config(self) -> Config:
         """

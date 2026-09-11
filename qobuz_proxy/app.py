@@ -59,6 +59,9 @@ def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
         "status": status,
         "config": config_dict,
         "now_playing": None,
+        "connect": None,
+        "device": None,
+        "in_sync": True,
     }
 
 
@@ -386,6 +389,26 @@ class QobuzProxy:
     # Speaker management (hot add / edit / remove)
     # ------------------------------------------------------------------
 
+    async def _on_speaker_control(self, speaker_id: str, body: dict) -> dict:
+        """Play/pause/skip/volume from the Web UI."""
+        for speaker in self._speakers:
+            if slugify_name(speaker.name) == speaker_id:
+                volume = body.get("volume")
+                if volume is not None:
+                    volume = int(volume)
+                position_ms = body.get("position_ms")
+                if position_ms is not None:
+                    position_ms = int(position_ms)
+                return await speaker.apply_control(
+                    str(body.get("action", "")),
+                    volume=volume,
+                    position_ms=position_ms,
+                )
+        for sc in self._config.speakers:
+            if slugify_name(sc.name) == speaker_id:
+                raise RuntimeError("speaker is not running")
+        raise KeyError(speaker_id)
+
     async def _on_add_speaker(self, body: dict) -> dict:
         """Add a new speaker at runtime."""
         name = body["name"].strip()
@@ -599,6 +622,7 @@ class QobuzProxy:
         self._web_app["on_add_speaker"] = self._on_add_speaker
         self._web_app["on_edit_speaker"] = self._on_edit_speaker
         self._web_app["on_remove_speaker"] = self._on_remove_speaker
+        self._web_app["on_speaker_control"] = self._on_speaker_control
         self._web_app["local_audio_enabled"] = os.environ.get(
             "QOBUZPROXY_LOCAL_AUDIO_UI", ""
         ).lower() in ("true", "1", "yes")

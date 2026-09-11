@@ -65,6 +65,9 @@ class PlaybackCommandHandler:
         # Store next track info for auto-advance (from SET_STATE nextQueueItem)
         self._next_track_info: Optional[dict] = None
 
+        # Last SET_STATE the app sent, even if the player later ignored it.
+        self._last_connect_state: Optional[dict] = None
+
         # Callback when next track info changes (for gapless re-arming)
         self._on_next_track_changed: Optional[Callable[[], Awaitable[None]]] = None
 
@@ -180,8 +183,6 @@ class PlaybackCommandHandler:
             await self.queue.set_version(
                 QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
             )
-            if not self._active or generation != self._generation:
-                return
         # Extract current queue item info
         current_item = None
         current_queue_item_id = None
@@ -243,6 +244,14 @@ class PlaybackCommandHandler:
             next_track_changed = True
             logger.debug("Next track cleared (nextQueueItem not present in SET_STATE)")
 
+        self._record_connect_set_state(
+            state,
+            current_track_id=current_track_id,
+            current_queue_item_id=current_queue_item_id,
+            next_item=next_item,
+            next_explicit=state.HasField("nextQueueItem"),
+        )
+
         # Keep the queue's current index in sync with the item the app shows.
         # Without this, queue-based fallbacks (auto-advance at track end,
         # get_current_track) act on a stale index — e.g. restarting the same
@@ -282,6 +291,59 @@ class PlaybackCommandHandler:
     def get_next_track_info(self) -> Optional[dict]:
         """Get the stored next track info for auto-advance."""
         return self._next_track_info
+
+    def get_last_connect_state(self) -> Optional[dict]:
+        """Last SET_STATE current item from the Qobuz app (Connect)."""
+        return self._last_connect_state
+
+    def _record_connect_set_state(
+        self,
+        state: Any,
+        *,
+        current_track_id: Optional[int],
+        current_queue_item_id: Optional[int],
+        next_item: Any,
+        next_explicit: bool,
+    ) -> None:
+        """Remember the app's last SET_STATE for the Web UI.
+
+        Connect often omits currentQueueItem or playingState on follow-ups.
+        Those must not wipe the last known current track.
+        """
+        prev = self._last_connect_state or {}
+        playing_raw = state.playingState if state.HasField("playingState") else None
+        playing_label = {1: "stopped", 2: "playing", 3: "paused"}.get(playing_raw)
+        if playing_label is None:
+            playing_label = prev.get("playing_state")
+
+        if current_track_id:
+            track_id = str(current_track_id)
+            queue_item_id = current_queue_item_id
+        else:
+            track_id = prev.get("track_id")
+            queue_item_id = prev.get("queue_item_id")
+
+        if next_item is not None:
+            next_track_id = str(next_item.trackId)
+            next_queue_item_id = next_item.queueItemId
+        elif next_explicit:
+            next_track_id = None
+            next_queue_item_id = None
+        else:
+            next_track_id = prev.get("next_track_id")
+            next_queue_item_id = prev.get("next_queue_item_id")
+
+        position_ms = (
+            state.currentPosition if state.HasField("currentPosition") else prev.get("position_ms")
+        )
+        self._last_connect_state = {
+            "track_id": track_id,
+            "queue_item_id": queue_item_id,
+            "playing_state": playing_label,
+            "position_ms": position_ms,
+            "next_track_id": next_track_id,
+            "next_queue_item_id": next_queue_item_id,
+        }
 
     def clear_next_track_info(self) -> None:
         """Clear the stored next track info after it's been used."""

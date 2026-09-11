@@ -688,6 +688,17 @@ class QobuzPlayer:
                                 track_id=track_id,
                                 context_uuid=self._format_context_uuid(context_uuid),
                             )
+                    # A skip that already committed this item can be superseded
+                    # before backend.play(). Connect then re-names the same
+                    # currentQueueItem without playingState — still play it.
+                    if playing_state != 1 and (
+                        self._state == PlaybackState.LOADING
+                        or (
+                            self._skip_in_flight_track_id is not None
+                            and str(self._skip_in_flight_track_id) == str(track_id)
+                        )
+                    ):
+                        should_play = True
 
             # Position, then play/pause/stop — same order as the app expects.
             # A newly loaded track is not on the backend yet; seeking now would
@@ -745,7 +756,12 @@ class QobuzPlayer:
         if target:
             if playing_state == 1:
                 return False
-            if track_id and track_id != target:
+            # Heartbeats and play-state echoes often omit currentQueueItem.
+            # Bumping generation for those aborts the skip: the app already
+            # shows the new track and the speaker never starts it.
+            if not track_id:
+                return True
+            if track_id != target:
                 outgoing = self._skipped_from_track_id
                 if outgoing is None and self._current_track is not None:
                     outgoing = self._current_track.track_id
@@ -1090,6 +1106,7 @@ class QobuzPlayer:
             context_uuid,
             for_playback=for_playback,
         )
+        self._clear_next_if_current(track_id, queue_item_id)
         await self._send_state_update()
 
         url_task = asyncio.create_task(self._get_track_url(track_id))
@@ -1787,6 +1804,31 @@ class QobuzPlayer:
             return False
         return True
 
+    def _next_is_current(self, track_id: Optional[str], queue_item_id: int = 0) -> bool:
+        """Whether this nextQueueItem is the track already playing."""
+        cur = self._current_track
+        if not track_id or cur is None:
+            return False
+        if str(cur.track_id) != str(track_id):
+            return False
+        if queue_item_id and cur.queue_item_id and int(cur.queue_item_id) != int(queue_item_id):
+            return False
+        return True
+
+    def _clear_next_if_current(self, track_id: str, queue_item_id: int = 0) -> None:
+        """Drop stored nextQueueItem when it still names the current track."""
+        if not self._clear_next_track_callback or not self._get_next_track_callback:
+            return
+        next_info = self._get_next_track_callback()
+        if not next_info:
+            return
+        if str(next_info.get("trackId")) != str(track_id):
+            return
+        nqid = next_info.get("queueItemId")
+        if queue_item_id and nqid and int(nqid) != int(queue_item_id):
+            return
+        self._clear_next_track_callback()
+
     def _adopt_armed_metadata(self, track: QueueTrack) -> None:
         """Copy URL/metadata from the armed next track onto ``track``."""
         pending = self._pending_next_track
@@ -1843,8 +1885,10 @@ class QobuzPlayer:
             await self._report_stopped()
 
         # Player no longer treats this id as "next"; the backend prefetch stays
-        # until play() consumes it.
+        # until play() consumes it. Drop command-handler nextQueueItem if it
+        # still names this song — Connect lags and would re-arm it as next.
         self._clear_gapless_state()
+        self._clear_next_if_current(track_id, queue_item_id)
         return True
 
     def _commit_track_identity_locked(
@@ -1912,6 +1956,9 @@ class QobuzPlayer:
 
         track_id = next_track_info["trackId"]
         queue_item_id = next_track_info["queueItemId"]
+        if self._next_is_current(track_id, queue_item_id):
+            logger.debug("Gapless: not arming currently playing track %s", track_id)
+            return
         my_generation = self._transition_generation
 
         try:
@@ -1919,6 +1966,11 @@ class QobuzPlayer:
             url = await self._get_track_url(track_id)
             if not url:
                 logger.debug(f"Gapless: failed to get URL for next track {track_id}")
+                return
+            if self._next_is_current(track_id, queue_item_id):
+                logger.debug(
+                    "Gapless: track %s became current while fetching, not arming", track_id
+                )
                 return
 
             meta = await self._get_track_metadata(track_id)
@@ -1969,6 +2021,11 @@ class QobuzPlayer:
 
     async def _handle_gapless_transition(self) -> None:
         """Handle a gapless transition to the next track."""
+        async with self._playback_lock:
+            await self._handle_gapless_transition_locked()
+
+    async def _handle_gapless_transition_locked(self) -> None:
+        """Apply a gapless advance. Caller must hold ``_playback_lock``."""
         # Capture generation to detect concurrent state changes (e.g. explicit skip/stop)
         my_generation = self._transition_generation
 
@@ -1985,6 +2042,15 @@ class QobuzPlayer:
         track_id = next_info["trackId"]
         queue_item_id = next_info["queueItemId"]
         meta = next_info.get("metadata")
+
+        if self._skip_in_flight_track_id and str(self._skip_in_flight_track_id) != str(track_id):
+            logger.info(
+                "Gapless: ignoring device transition to %s; skip in flight to %s",
+                track_id,
+                self._skip_in_flight_track_id,
+            )
+            self._clear_gapless_state()
+            return
 
         logger.info(f"Gapless: transitioning to track {track_id}")
 
@@ -2006,6 +2072,9 @@ class QobuzPlayer:
         # Clear gapless state
         self._pending_next_track = None
         self._gapless_armed = False
+        self._skip_in_flight_track_id = None
+        self._skipped_from_track_id = None
+        self._report_queue_item_override = None
 
         # Clear next track info from command handler
         if self._clear_next_track_callback:
@@ -2031,6 +2100,18 @@ class QobuzPlayer:
     async def on_next_track_info_changed(self) -> None:
         """Called when command handler reports the next track info has changed."""
         new_info = self._get_next_track_callback() if self._get_next_track_callback else None
+
+        if new_info is not None and self._next_is_current(
+            new_info.get("trackId"), new_info.get("queueItemId") or 0
+        ):
+            logger.debug("Gapless: next track is the current item, not arming")
+            async with self._gapless_arm_lock:
+                if self._gapless_armed:
+                    self._transition_generation += 1
+                    self._gapless_armed = False
+                    self._pending_next_track = None
+                    await self.backend.clear_next_track()
+            return
 
         # The server resends the same next track in bursts — if it's already
         # armed, re-arming would queue a duplicate on the backend

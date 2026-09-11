@@ -262,3 +262,18 @@ class AudioBackend(ABC):
             name=self.name,
             device_id="",
         )
+
+    def playback_snapshot(self) -> dict:
+        """Sync view of what this backend last sent to the renderer."""
+        return {
+            "track_id": None,
+            "title": "",
+            "artist": "",
+            "album": "",
+            "album_art_url": "",
+            "state": self._state.name.lower() if self._state else None,
+            "position_ms": None,
+            "duration_ms": None,
+            "next_track_id": None,
+            "next_title": None,
+        }

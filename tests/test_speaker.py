@@ -3,6 +3,8 @@
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from qobuz_proxy.config import (
     AUTO_QUALITY,
     Config,
@@ -598,6 +600,65 @@ class TestNowPlayingStatus:
         assert np["volume"] == 50
 
 
+class TestConnectVsDeviceStatus:
+    """Web UI needs the app's SET_STATE alongside what the renderer is playing."""
+
+    def test_reports_mismatch_when_connect_and_device_differ(self):
+        speaker = TestNowPlayingStatus._playing_speaker()
+        handler = MagicMock()
+        handler.get_last_connect_state.return_value = {
+            "track_id": "111",
+            "playing_state": "playing",
+            "position_ms": 1000,
+            "next_track_id": "222",
+        }
+        speaker._playback_handler = handler
+        backend = MagicMock()
+        backend.playback_snapshot.return_value = {
+            "track_id": "333",
+            "title": "Other",
+            "artist": "Act",
+            "album": "",
+            "album_art_url": "",
+            "state": "playing",
+            "position_ms": 50,
+            "next_track_id": None,
+            "next_title": None,
+        }
+        speaker._backend = backend
+
+        status = speaker.get_status()
+        assert status["connect"]["track_id"] == "111"
+        assert status["device"]["track_id"] == "333"
+        assert status["in_sync"] is False
+
+    def test_in_sync_when_track_ids_match(self):
+        speaker = TestNowPlayingStatus._playing_speaker()
+        handler = MagicMock()
+        handler.get_last_connect_state.return_value = {
+            "track_id": "111",
+            "playing_state": "playing",
+            "position_ms": 0,
+            "next_track_id": None,
+        }
+        speaker._playback_handler = handler
+        backend = MagicMock()
+        backend.playback_snapshot.return_value = {
+            "track_id": "111",
+            "title": "Song",
+            "artist": "Artist",
+            "album": "",
+            "album_art_url": "",
+            "state": "playing",
+            "position_ms": 20,
+            "next_track_id": None,
+            "next_title": None,
+        }
+        speaker._backend = backend
+
+        assert speaker.get_status()["in_sync"] is True
+
+
 class TestQualitySourceStatus:
     """get_status() must say where the effective quality came from."""
 
@@ -660,3 +721,91 @@ class TestQualitySourceStatus:
         assert cfg["max_quality"] == 27
         assert cfg["effective_quality"] == 27
         assert cfg["quality_source"] == "manual"
+
+
+class TestSpeakerControl:
+    @staticmethod
+    def _speaker(**config_kwargs) -> Speaker:
+        from qobuz_proxy.backends import PlaybackState
+
+        speaker = TestNowPlayingStatus._playing_speaker(**config_kwargs)
+        player = speaker._player
+        player.state = PlaybackState.PLAYING
+        player.play = AsyncMock(return_value=True)
+        player.pause = AsyncMock(return_value=True)
+        player.play_track = AsyncMock(return_value=True)
+        player.previous_track = AsyncMock(return_value=True)
+        player.next_track = AsyncMock(return_value=True)
+        player.seek = AsyncMock(return_value=True)
+        player.set_volume = AsyncMock(return_value=40)
+        return speaker
+
+    async def test_pause(self) -> None:
+        speaker = self._speaker()
+        result = await speaker.apply_control("pause")
+        speaker._player.pause.assert_awaited_once()
+        assert result["ok"] is True
+        assert result["id"] == "test-speaker"
+
+    async def test_next_plays_connect_named_item(self) -> None:
+        speaker = self._speaker()
+        handler = MagicMock()
+        handler.get_next_track_info.return_value = {
+            "trackId": "99",
+            "queueItemId": 7,
+            "contextUuid": None,
+        }
+        speaker._playback_handler = handler
+        result = await speaker.apply_control("next")
+        speaker._player.play_track.assert_awaited_once_with(
+            queue_item_id=7,
+            track_id="99",
+            position_ms=0,
+            context_uuid=None,
+        )
+        handler.clear_next_track_info.assert_called_once()
+        assert result["ok"] is True
+
+    async def test_next_requests_connect_when_no_named_item(self) -> None:
+        speaker = self._speaker()
+        speaker._playback_handler = MagicMock()
+        speaker._playback_handler.get_next_track_info.return_value = None
+        ws = MagicMock()
+        ws.is_renderer_active = True
+        ws.request_next_track = AsyncMock(return_value=True)
+        speaker._ws_manager = ws
+        result = await speaker.apply_control("next")
+        speaker._player.play_track.assert_not_called()
+        ws.request_next_track.assert_awaited_once()
+        assert result["ok"] is True
+
+    async def test_previous_restarts_when_queue_has_no_prior_track(self) -> None:
+        speaker = self._speaker()
+        speaker._player.previous_track = AsyncMock(return_value=False)
+        result = await speaker.apply_control("previous")
+        speaker._player.seek.assert_awaited_once_with(0)
+        assert result["ok"] is True
+
+    async def test_volume(self) -> None:
+        speaker = self._speaker()
+        result = await speaker.apply_control("volume", volume=40)
+        speaker._player.set_volume.assert_awaited_once_with(40)
+        assert result["ok"] is True
+        assert result["volume"] == 50
+
+    async def test_seek(self) -> None:
+        speaker = self._speaker()
+        result = await speaker.apply_control("seek", position_ms=12_000)
+        speaker._player.seek.assert_awaited_once_with(12_000)
+        assert result["ok"] is True
+
+    async def test_rejects_unknown_action(self) -> None:
+        speaker = self._speaker()
+        with pytest.raises(ValueError, match="unknown action"):
+            await speaker.apply_control("shuffle")
+
+    async def test_rejects_when_not_running(self) -> None:
+        speaker = self._speaker()
+        speaker._is_running = False
+        with pytest.raises(RuntimeError, match="not running"):
+            await speaker.apply_control("pause")

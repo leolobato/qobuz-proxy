@@ -14,7 +14,7 @@ body {
 }
 
 .container {
-    max-width: 640px;
+    max-width: 720px;
     margin: 0 auto;
 }
 
@@ -438,6 +438,120 @@ p {
     color: #666666;
     font-size: 12px;
     margin-top: 4px;
+}
+
+.playback-bar {
+    margin-top: 10px;
+    container-type: inline-size;
+    container-name: playback;
+}
+
+.playback-seek {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: #888;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+.playback-seek input[type="range"] {
+    flex: 1;
+    min-width: 0;
+    accent-color: #1976d2;
+}
+
+.playback-seek-current,
+.playback-seek-duration {
+    min-width: 2.4em;
+}
+
+.playback-seek-duration {
+    text-align: right;
+}
+
+.playback-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.playback-btn {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    color: #ddd;
+    border-radius: 18px;
+}
+
+.playback-btn:hover {
+    background: #252525;
+    color: #fff;
+}
+
+.playback-btn-main {
+    width: 42px;
+    height: 42px;
+    border-radius: 21px;
+    background: #1976d2;
+    border-color: #1976d2;
+    color: #fff;
+}
+
+.playback-btn-main:hover {
+    background: #1565c0;
+    color: #fff;
+}
+
+.playback-icon {
+    width: 16px;
+    height: 16px;
+    display: block;
+}
+
+.playback-btn-main .playback-icon {
+    width: 18px;
+    height: 18px;
+}
+
+.playback-volume {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    min-width: 0;
+}
+
+.playback-volume input[type="range"] {
+    width: 128px;
+    flex: 0 1 128px;
+    min-width: 72px;
+    accent-color: #1976d2;
+}
+
+.playback-btn-muted {
+    color: #888;
+}
+
+.playback-volume-value {
+    width: 2em;
+    flex-shrink: 0;
+    text-align: right;
+    color: #aaa;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+@container playback (max-width: 300px) {
+    .playback-volume {
+        display: none;
+    }
 }
 
 .speaker-actions {

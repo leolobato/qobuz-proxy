@@ -79,6 +79,7 @@ class LocalAudioBackend(AudioBackend):
         # `_audio_data`, which stop() clears so resume() cannot go PLAYING
         # over silence (BUG-25).
         self._current_track_id: Optional[str] = None
+        self._current_meta: Optional[BackendTrackMetadata] = None
         self._cached_audio: Optional[np.ndarray] = None
         self._cached_audio_rate: int = 0
         self._cached_audio_track_id: Optional[str] = None
@@ -187,6 +188,7 @@ class LocalAudioBackend(AudioBackend):
         self._frames_fed = 0
         self._seek_target = None
         self._current_track_id = str(metadata.track_id)
+        self._current_meta = metadata
         self._cached_audio = audio_data
         self._cached_audio_rate = sample_rate
         self._cached_audio_track_id = str(metadata.track_id)
@@ -332,6 +334,27 @@ class LocalAudioBackend(AudioBackend):
     def supports_gapless(self) -> bool:
         """Gapless is supported by prefetching the next track."""
         return True
+
+    def playback_snapshot(self) -> dict:
+        """What local audio last started playing."""
+        meta = self._current_meta
+        nxt = self._next_track_meta
+        next_title = None
+        if nxt is not None:
+            parts = [p for p in (nxt.artist, nxt.title) if p]
+            next_title = " — ".join(parts) if parts else nxt.track_id
+        return {
+            "track_id": self._current_track_id or (meta.track_id if meta else None),
+            "title": meta.title if meta else "",
+            "artist": meta.artist if meta else "",
+            "album": meta.album if meta else "",
+            "album_art_url": meta.artwork_url if meta else "",
+            "state": self._state.name.lower() if self._state else None,
+            "position_ms": self._playback_position_ms(),
+            "duration_ms": meta.duration_ms if meta else 0,
+            "next_track_id": nxt.track_id if nxt else None,
+            "next_title": next_title,
+        }
 
     async def set_next_track(
         self, url: str, metadata: BackendTrackMetadata, queue_item_id: int = 0

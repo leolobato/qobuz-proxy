@@ -235,6 +235,13 @@ class MetadataService:
         metadata = await self.get_metadata(track_id, fetch_url=True)
         return (metadata.streaming_url or None) if metadata else None
 
+    def peek_metadata(self, track_id: Optional[str]) -> Optional[dict[str, Any]]:
+        """Return cached track metadata without hitting the network."""
+        if not track_id:
+            return None
+        cached = self._cache.get(str(track_id))
+        return cached.to_dict() if cached else None
+
     def get_track_format(self, track_id: str) -> tuple[int, int, int]:
         """Return (actual_quality, sample_rate_hz, bit_depth) for a cached track, or (0, 0, 0)."""
         cached = self._cache.get(track_id)

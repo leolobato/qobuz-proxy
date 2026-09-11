@@ -582,6 +582,12 @@ class DLNABackend(AudioBackend):
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
 
+        # Arming the URI already playing makes every poll look like a
+        # gapless transition (current TrackURI == next), which loops.
+        if actual_url == self._current_proxy_url:
+            logger.debug("Gapless: refusing to arm currently playing URI as next")
+            return False
+
         # Send to device — Sonos uses queue, others use SetNextAVTransportURI
         if self._is_sonos:
             # Already armed with this URL — appending again would queue a
@@ -679,7 +685,7 @@ class DLNABackend(AudioBackend):
                         current_uri = await self._client.get_track_uri()
                     else:
                         current_uri = await self._client.get_media_info()
-                    if current_uri and current_uri == self._next_track_proxy_url:
+                    if self._device_reached_next_track(current_uri):
                         logger.info("Gapless: transition detected — device moved to next track")
                         # Update state to reflect the new track
                         self._current_metadata = self._next_track_metadata
@@ -735,6 +741,42 @@ class DLNABackend(AudioBackend):
                 break
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
+
+    def _device_reached_next_track(self, current_uri: Optional[str]) -> bool:
+        """Whether the renderer is now playing the armed next URI.
+
+        The same URI as the current track is not a transition: Connect often
+        still names the song we just skipped to as nextQueueItem, and arming
+        that URI makes every poll look like an advance.
+        """
+        if not current_uri or not self._next_track_proxy_url:
+            return False
+        if current_uri != self._next_track_proxy_url:
+            return False
+        if current_uri == self._current_proxy_url:
+            return False
+        return True
+
+    def playback_snapshot(self) -> dict:
+        """What the renderer was last told to play (including gapless current)."""
+        meta = self._current_metadata
+        nxt = self._next_track_metadata
+        next_title = None
+        if nxt is not None:
+            parts = [p for p in (nxt.artist, nxt.title) if p]
+            next_title = " — ".join(parts) if parts else nxt.track_id
+        return {
+            "track_id": meta.track_id if meta else None,
+            "title": meta.title if meta else "",
+            "artist": meta.artist if meta else "",
+            "album": meta.album if meta else "",
+            "album_art_url": meta.artwork_url if meta else "",
+            "state": self._state.name.lower() if self._state else None,
+            "position_ms": self._position_ms,
+            "duration_ms": self._duration_ms,
+            "next_track_id": nxt.track_id if nxt else None,
+            "next_title": next_title,
+        }
 
     def _build_didl(
         self,
