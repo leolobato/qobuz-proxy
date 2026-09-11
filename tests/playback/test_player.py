@@ -594,6 +594,76 @@ class TestSkipAcknowledgesImmediately:
         backend.play.assert_awaited_once()
         backend.stop.assert_not_awaited()
 
+    async def test_track_change_without_playing_state_while_playing_follows_app(self):
+        """Connect often names the new current item without playingState.
+
+        The Qobuz app is source of truth: a different currentQueueItem while
+        we are already playing is a skip, not a metadata-only load.
+        """
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        await player.apply_remote_state(
+            track_id="222",
+            queue_item_id=9,
+            position_ms=0,
+            playing_state=None,
+        )
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "222"
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited_once()
+
+    async def test_second_skip_without_playing_state_overrides_in_flight(self):
+        """A second skip often arrives as currentQueueItem only (no playingState)
+        while the first skip is still loading. That must play the incoming
+        track, not be dropped as a stale follow-up."""
+        player, backend = _make_player()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        backend.stop = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
+
+        first = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert player._skip_in_flight_track_id == "222"
+
+        second = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="333",
+                queue_item_id=10,
+                position_ms=0,
+                playing_state=None,
+            )
+        )
+        await asyncio.gather(first, second)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "333"
+        assert player.state == PlaybackState.PLAYING
+        backend.play.assert_awaited()
+        played_urls = [call.args[0] for call in backend.play.await_args_list]
+        assert any("333" in url for url in played_urls)
+
 
 class TestNextAtEndOfQueue:
     """Skipping past the end of the queue must still report the finished play."""
