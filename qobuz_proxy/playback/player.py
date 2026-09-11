@@ -571,6 +571,7 @@ class QobuzPlayer:
 
             # Load if a track is specified and differs from the loaded one.
             loaded_new = False
+            should_play = False
             if track_id is not None:
                 cur = self._current_track
                 if (
@@ -599,6 +600,13 @@ class QobuzPlayer:
                         logger.info(f"Skipping to armed next track: {track_id}")
                     else:
                         logger.info(f"Loading new track: {track_id}")
+                    should_play = playing_state == 2 or (
+                        playing_state != 1
+                        and (
+                            self._state in (PlaybackState.PLAYING, PlaybackState.LOADING)
+                            or self._skip_in_flight_track_id is not None
+                        )
+                    )
                     load_context = context_uuid
                     if (
                         load_context is None
@@ -612,7 +620,7 @@ class QobuzPlayer:
                         queue_item_id or 0,
                         track_id,
                         load_context,
-                        for_playback=playing_state == 2,
+                        for_playback=should_play,
                     ):
                         failed = self._current_track
                         if (
@@ -688,17 +696,19 @@ class QobuzPlayer:
             if position_ms is not None and not stale and not loaded_new:
                 await self.seek(position_ms)
 
-            if playing_state is not None and not stale:
+            if (playing_state is not None or should_play) and not stale:
                 if gen != self._command_generation:
                     logger.debug("SET_STATE superseded before applying playback state; skipping")
                     return
-                # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
-                if playing_state == 2:
+                # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED. Connect often names a
+                # new current item without playingState (or with PAUSED); if
+                # we were already playing, that is still a skip — play it.
+                if playing_state == 1:
+                    await self._stop_playback_locked()
+                elif should_play or playing_state == 2:
                     await self._play_locked(position_ms or 0)
                 elif playing_state == 3:
                     await self._pause_locked()
-                elif playing_state == 1:
-                    await self._stop_playback_locked()
 
     def _is_play_skip_intent(self, track_id: Optional[str], playing_state: Optional[int]) -> bool:
         """Whether this SET_STATE is asking to play a different track.
@@ -706,10 +716,20 @@ class QobuzPlayer:
         Used to advertise the new queue item before the playback lock so the
         Qobuz app does not snap back to the outgoing song.
         """
-        if playing_state != 2 or not track_id:
+        if not track_id:
             return False
         cur = self._current_track
-        return cur is None or cur.track_id != track_id
+        if cur is not None and cur.track_id == track_id:
+            return False
+        if playing_state == 2:
+            return True
+        if playing_state == 1:
+            return False
+        # Connect often names the new current item without playingState, or
+        # with PAUSED. That is still a skip if we are already in a session.
+        return self._state in (PlaybackState.PLAYING, PlaybackState.LOADING) or (
+            self._skip_in_flight_track_id is not None
+        )
 
     def _is_stale_skip_followup(
         self, track_id: Optional[str], playing_state: Optional[int]
@@ -725,16 +745,15 @@ class QobuzPlayer:
         if target:
             if playing_state == 1:
                 return False
-            if playing_state == 2 and track_id and track_id != target:
+            if track_id and track_id != target:
                 outgoing = self._skipped_from_track_id
                 if outgoing is None and self._current_track is not None:
                     outgoing = self._current_track.track_id
-                if track_id == outgoing:
-                    return True
-                return False
+                # Only drop the song we just left. A different currentQueueItem
+                # is the app changing track — including playing_state=None,
+                # which Connect uses for skip.
+                return outgoing is not None and track_id == outgoing
             if playing_state == 3:
-                return True
-            if track_id and track_id != target:
                 return True
             return False
         return self._is_outgoing_track_echo(track_id, playing_state) or (
