@@ -453,7 +453,7 @@ class TestSkipAcknowledgesImmediately:
 
         seen_during_stop = []
 
-        async def slow_stop():
+        async def slow_stop(next_track_id=None):
             cur = player.current_track
             seen_during_stop.append(
                 (
