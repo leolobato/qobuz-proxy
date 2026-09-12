@@ -159,3 +159,4 @@ class TestConfigToDict:
         assert isinstance(speaker, dict)
         assert speaker["name"] == "Living Room"
         assert speaker["backend"] == "dlna"
+        assert speaker["uuid"] == "abc-123"

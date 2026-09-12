@@ -241,14 +241,17 @@ def slugify_name(name: str) -> str:
 def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
     """Convert a SpeakerConfig to a YAML-serializable dict.
 
-    Auto-assigned fields (uuid, http_port, proxy_port) are omitted so the
-    config file stays clean and ports can be re-assigned on next startup.
+    Ports are omitted so they can be re-assigned on next startup. The Qobuz
+    Connect device UUID is persisted so the same speaker identity survives
+    restarts (including Docker hostname changes).
     """
     d: dict = {
         "name": sc.name,
         "backend": sc.backend_type,
         "max_quality": "auto" if sc.max_quality == AUTO_QUALITY else sc.max_quality,
     }
+    if sc.uuid:
+        d["uuid"] = sc.uuid
     if sc.backend_type == "dlna":
         d["dlna_ip"] = sc.dlna_ip
         d["dlna_port"] = sc.dlna_port

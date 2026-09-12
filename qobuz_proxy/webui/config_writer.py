@@ -13,7 +13,8 @@ def config_to_dict(config: Config) -> dict:
     """Serialize a Config object to a YAML-ready dict.
 
     Only persists server settings, logging, and speakers. Auth credentials
-    and device UUID are intentionally excluded (managed separately).
+    are excluded (managed separately). Speaker UUIDs are included so Qobuz
+    Connect identity survives restarts.
     """
     return {
         "server": {
