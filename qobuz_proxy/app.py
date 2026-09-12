@@ -33,7 +33,7 @@ from qobuz_proxy.config import (
     slugify_name,
 )
 from qobuz_proxy.speaker import Speaker
-from qobuz_proxy.webui.config_writer import save_config
+from qobuz_proxy.webui.config_writer import persist_speaker_uuids, save_config
 from qobuz_proxy.webui.routes import register_routes
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,14 @@ class QobuzProxy:
 
         # 1. Start the HTTP server so the web UI is reachable immediately
         await self._start_web_server()
+
+        # Persist identities before authentication or speaker startup, so an
+        # offline renderer still keeps its UUID after a container recreation.
+        if self._config.config_path:
+            try:
+                persist_speaker_uuids(self._config, self._config.config_path)
+            except Exception as e:
+                logger.warning(f"Failed to persist speaker UUIDs: {e}")
 
         # 2. Set Qobuz app credentials (desktop app OAuth + signing secret)
         self._app_id = OAUTH_APP_ID

@@ -4,9 +4,10 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
 from qobuz_proxy.app import QobuzProxy
-from qobuz_proxy.config import Config, QobuzConfig, SpeakerConfig
+from qobuz_proxy.config import Config, QobuzConfig, SpeakerConfig, load_config
 
 
 def _make_mock_speaker(name: str, starts: bool) -> MagicMock:
@@ -45,6 +46,93 @@ def _make_config(*speaker_configs: SpeakerConfig) -> Config:
     config.qobuz = QobuzConfig(email="test@example.com", auth_token="secret", user_id="12345")
     config.speakers = list(speaker_configs)
     return config
+
+
+class TestStartupPersistsSpeakerUuids:
+    @pytest.mark.parametrize("missing_uuid", [None, ""])
+    async def test_existing_config_survives_hostname_change(self, tmp_path, missing_uuid):
+        path = tmp_path / "config.yaml"
+        original = {
+            "qobuz": {"auth_token": "saved-token", "user_id": "12345"},
+            "server": {"http_port": 9000, "bind_address": "127.0.0.1"},
+            "custom_setting": "keep-me",
+            "speakers": [
+                {
+                    "name": "Kitchen",
+                    "backend": "dlna",
+                    "dlna_ip": "192.0.2.1",
+                    "http_port": 9001,
+                    "proxy_port": 7200,
+                    "bind_address": "127.0.0.1",
+                },
+                {"name": "Office", "backend": "local", "uuid": "existing-uuid"},
+            ],
+        }
+        if missing_uuid is not None:
+            original["speakers"][0]["uuid"] = missing_uuid
+        path.write_text(yaml.safe_dump(original))
+        with patch("qobuz_proxy.config.platform.node", return_value="container-a"):
+            config = load_config(path)
+        generated_uuid = config.speakers[0].uuid
+        app = QobuzProxy(config)
+        with (
+            patch.object(app, "_start_web_server", new_callable=AsyncMock),
+            patch.object(app, "_stop_web_server", new_callable=AsyncMock),
+            patch.object(app, "_authenticate", new_callable=AsyncMock, return_value=False),
+        ):
+            try:
+                await app.start()
+                # Persist even when authentication fails and speakers never start.
+                assert app._speakers == []
+            finally:
+                await app.stop()
+
+        original["speakers"][0]["uuid"] = generated_uuid
+        assert yaml.safe_load(path.read_text()) == original
+        with patch("qobuz_proxy.config.platform.node", return_value="container-b"):
+            restarted = load_config(path)
+        assert [sc.uuid for sc in restarted.speakers] == [generated_uuid, "existing-uuid"]
+
+    async def test_existing_uuid_does_not_rewrite_file(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        content = (
+            "# Keep this comment and formatting on subsequent starts\n"
+            "speakers:\n  - name: Office\n    backend: local\n    uuid: existing-uuid\n"
+        )
+        path.write_text(content)
+        app = QobuzProxy(load_config(path))
+        with (
+            patch.object(app, "_start_web_server", new_callable=AsyncMock),
+            patch.object(app, "_stop_web_server", new_callable=AsyncMock),
+            patch.object(app, "_get_token_from_config_or_cache", return_value=None),
+            patch("qobuz_proxy.webui.config_writer.os.replace") as replace,
+        ):
+            try:
+                await app.start()
+            finally:
+                await app.stop()
+        replace.assert_not_called()
+        assert path.read_text() == content
+
+    async def test_failed_write_leaves_config_intact_and_startup_available(self, tmp_path, caplog):
+        path = tmp_path / "config.yaml"
+        content = "speakers:\n  - name: Office\n    backend: local\n"
+        path.write_text(content)
+        app = QobuzProxy(load_config(path))
+        with (
+            patch.object(app, "_start_web_server", new_callable=AsyncMock),
+            patch.object(app, "_stop_web_server", new_callable=AsyncMock),
+            patch.object(app, "_get_token_from_config_or_cache", return_value=None),
+            patch("qobuz_proxy.webui.config_writer.os.replace", side_effect=PermissionError),
+        ):
+            try:
+                await app.start()
+                assert app.is_running
+            finally:
+                await app.stop()
+        assert path.read_text() == content
+        assert list(tmp_path.glob("*.tmp")) == []
+        assert "Failed to persist speaker UUIDs" in caplog.text
 
 
 class TestMultiSpeakerOrchestration:

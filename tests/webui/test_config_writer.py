@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from qobuz_proxy.config import AUTO_QUALITY, Config, SpeakerConfig
-from qobuz_proxy.webui.config_writer import config_to_dict, save_config
+from qobuz_proxy.webui.config_writer import config_to_dict, persist_speaker_uuids, save_config
 
 
 def _make_config_with_dlna_speaker() -> Config:
@@ -160,3 +160,17 @@ class TestConfigToDict:
         assert speaker["name"] == "Living Room"
         assert speaker["backend"] == "dlna"
         assert speaker["uuid"] == "abc-123"
+
+
+def test_uuid_migration_does_not_freeze_environment_speakers(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    content = "logging:\n  level: debug\n"
+    path.write_text(content)
+    persist_speaker_uuids(_make_config_with_dlna_speaker(), path)
+    assert path.read_text() == content
+
+
+def test_uuid_migration_does_not_create_config_file(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    persist_speaker_uuids(_make_config_with_dlna_speaker(), path)
+    assert not path.exists()
