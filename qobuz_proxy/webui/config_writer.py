@@ -19,6 +19,11 @@ def config_to_dict(config: Config) -> dict:
         "server": {
             "http_port": config.server.http_port,
             "bind_address": config.server.bind_address,
+            **(
+                {"mdns_interface": config.server.mdns_interface}
+                if config.server.mdns_interface
+                else {}
+            ),
         },
         "logging": {
             "level": config.logging.level,
