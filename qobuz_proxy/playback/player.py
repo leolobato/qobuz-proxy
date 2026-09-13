@@ -507,21 +507,33 @@ class QobuzPlayer:
             )
         ):
             return
-        if self._is_stale_skip_followup(track_id, playing_state):
+        if playing_state == 3 and (
+            self._skip_in_flight_track_id
+            or self._skip_pending_track is not None
+            or self._state == PlaybackState.LOADING
+        ):
+            # Pause-shaped SET_STATE during skip/load: log the wire shape so
+            # buffering echoes can be distinguished from a user pause.
+            logger.debug(
+                "Pause SET_STATE while skip/load in progress (%s)",
+                self._format_skip_followup(track_id, playing_state, position_ms),
+            )
+        if self._is_stale_skip_followup(track_id, playing_state, position_ms):
             logger.info(
-                "Ignoring SET_STATE follow-up during skip to %s (incoming=%s, playing_state=%s)",
-                self._skip_in_flight_track_id
-                or (self._current_track.track_id if self._current_track else "?"),
-                track_id,
-                playing_state,
+                "Ignoring SET_STATE follow-up during skip (%s)",
+                self._format_skip_followup(track_id, playing_state, position_ms),
             )
             return
         gen = self._next_generation()
+        if playing_state in (1, 3):
+            # Stop/pause abort an in-flight skip so backend.play() is not
+            # started after the user changed their mind.
+            self._skip_in_flight_track_id = None
+            self._report_queue_item_override = None
         if self._is_play_skip_intent(track_id, playing_state):
-            # Mark the skip before waiting on the lock so a PAUSED echo or
-            # outgoing-track SET_STATE cannot bump generation and abort it.
-            # The Qobuz app is source of truth for which song plays; those
-            # follow-ups are the app reacting to buffering, not a user pause.
+            # Advertise the new queue item before waiting on the lock so a
+            # heartbeat still naming the outgoing song cannot snap the app
+            # back. Pause/stop are not skip intents and abort this instead.
             self._skip_in_flight_track_id = track_id
             self._report_queue_item_override = queue_item_id or 0
             await self._send_state_update()
@@ -601,7 +613,7 @@ class QobuzPlayer:
                     else:
                         logger.info(f"Loading new track: {track_id}")
                     should_play = playing_state == 2 or (
-                        playing_state != 1
+                        playing_state not in (1, 3)
                         and (
                             self._state in (PlaybackState.PLAYING, PlaybackState.LOADING)
                             or self._skip_in_flight_track_id is not None
@@ -691,7 +703,7 @@ class QobuzPlayer:
                     # A skip that already committed this item can be superseded
                     # before backend.play(). Connect then re-names the same
                     # currentQueueItem without playingState — still play it.
-                    if playing_state != 1 and (
+                    if playing_state not in (1, 3) and (
                         self._state == PlaybackState.LOADING
                         or (
                             self._skip_in_flight_track_id is not None
@@ -732,74 +744,94 @@ class QobuzPlayer:
         cur = self._current_track
         if cur is not None and cur.track_id == track_id:
             return False
+        if playing_state in (1, 3):
+            return False
         if playing_state == 2:
             return True
-        if playing_state == 1:
-            return False
-        # Connect often names the new current item without playingState, or
-        # with PAUSED. That is still a skip if we are already in a session.
+        # Connect often names the new current item without playingState.
+        # That is still a skip if we are already in a session.
         return self._state in (PlaybackState.PLAYING, PlaybackState.LOADING) or (
             self._skip_in_flight_track_id is not None
         )
 
-    def _is_stale_skip_followup(
-        self, track_id: Optional[str], playing_state: Optional[int]
-    ) -> bool:
-        """Whether this SET_STATE would abort an in-flight skip.
-
-        After skip the app often sends PAUSED (it saw buffering) or another
-        SET_STATE still naming the outgoing track. If those bump generation,
-        the skip never reaches backend.play() — the speaker keeps the old
-        song and the app shows paused.
-        """
-        target = self._skip_in_flight_track_id
-        if target:
-            if playing_state == 1:
-                return False
-            # Heartbeats and play-state echoes often omit currentQueueItem.
-            # Bumping generation for those aborts the skip: the app already
-            # shows the new track and the speaker never starts it.
-            if not track_id:
-                return True
-            if track_id != target:
-                outgoing = self._skipped_from_track_id
-                if outgoing is None and self._current_track is not None:
-                    outgoing = self._current_track.track_id
-                # Only drop the song we just left. A different currentQueueItem
-                # is the app changing track — including playing_state=None,
-                # which Connect uses for skip.
-                return outgoing is not None and track_id == outgoing
-            if playing_state == 3:
-                return True
-            return False
-        return self._is_outgoing_track_echo(track_id, playing_state) or (
-            playing_state == 3
-            and self._state == PlaybackState.LOADING
-            and (
-                track_id is None
-                or (self._current_track is not None and self._current_track.track_id == track_id)
-            )
+    def _format_skip_followup(
+        self,
+        track_id: Optional[str],
+        playing_state: Optional[int],
+        position_ms: Optional[int],
+    ) -> str:
+        """Compact SET_STATE shape for skip-echo vs user-intent debugging."""
+        cur = self._current_track
+        pending = self._skip_pending_track
+        return (
+            f"item={'present' if track_id else 'omitted'} incoming={track_id} "
+            f"playing_state={playing_state} position_ms={position_ms} "
+            f"in_flight={self._skip_in_flight_track_id} "
+            f"outgoing={self._skipped_from_track_id} "
+            f"current={cur.track_id if cur else None} "
+            f"pending_unavailable={pending.track_id if pending else None} "
+            f"state={self._state}"
         )
 
-    def _is_outgoing_track_echo(
-        self, track_id: Optional[str], playing_state: Optional[int]
+    def _is_stale_skip_followup(
+        self,
+        track_id: Optional[str],
+        playing_state: Optional[int],
+        position_ms: Optional[int] = None,
     ) -> bool:
-        """Whether this SET_STATE is a stale echo of the track we just skipped.
+        """Whether this SET_STATE is a buffering heartbeat, not a user command.
 
-        After a skip the app may still send the outgoing item (position/play
-        of the speaker's previous song). That must not bump the command
-        generation or undo the skip.
+        After skip the app may echo PLAYING for the outgoing song (old
+        position) or omit currentQueueItem. Those must not bump generation.
+        Pause, stop, play-from-start of the outgoing song, and a new
+        currentQueueItem are user intent and must win.
         """
-        if playing_state == 1:
+        # Unplayable-track wait has its own pause/stop/ack handling. A
+        # wrap-around SET_STATE (repeat-all) also names a previously
+        # outgoing id — that is the next item, not an echo.
+        if self._skip_pending_track is not None:
             return False
-        if self._state != PlaybackState.LOADING:
+
+        target = self._skip_in_flight_track_id
+        if not target and self._state != PlaybackState.LOADING:
             return False
-        if not track_id or not self._skipped_from_track_id:
+
+        if playing_state in (1, 3):
             return False
-        cur = self._current_track
-        if cur is None or cur.track_id == track_id:
+
+        if not track_id:
+            # Heartbeats often omit currentQueueItem. Pause/stop without an
+            # item already returned above.
+            return target is not None
+
+        if target and track_id == target:
             return False
-        return track_id == self._skipped_from_track_id
+
+        return self._is_outgoing_play_heartbeat(track_id, playing_state, position_ms)
+
+    def _is_outgoing_play_heartbeat(
+        self,
+        track_id: str,
+        playing_state: Optional[int],
+        position_ms: Optional[int],
+    ) -> bool:
+        """PLAYING SET_STATE still naming the song we just left, mid-skip.
+
+        Selecting that song again (position 0, or no playingState) is a new
+        skip, not an echo.
+        """
+        if playing_state != 2:
+            return False
+        if (position_ms or 0) <= 0:
+            return False
+        outgoing = self._skipped_from_track_id
+        target = self._skip_in_flight_track_id
+        if outgoing is None:
+            cur = self._current_track
+            if target is None or cur is None or cur.track_id == target:
+                return False
+            outgoing = cur.track_id
+        return track_id == outgoing and track_id != target
 
     def _is_stale_pause_snapshot_locked(
         self,
@@ -985,21 +1017,25 @@ class QobuzPlayer:
             return await self._pause_locked()
 
     async def _pause_locked(self) -> bool:
-        if self._skip_in_flight_track_id is not None:
-            logger.info(
-                "Ignoring pause while skip to %s is in flight",
-                self._skip_in_flight_track_id,
-            )
-            return False
-        if self._state != PlaybackState.PLAYING:
+        if self._state == PlaybackState.PAUSED:
+            return True
+        if self._state not in (PlaybackState.PLAYING, PlaybackState.LOADING):
             logger.debug(f"Cannot pause in state {self._state}")
             return False
+
+        self._skip_in_flight_track_id = None
+        self._report_queue_item_override = None
+        self._skipped_from_track_id = None
 
         # Capture position before pausing
         self._position_value_ms = self.current_position_ms
         self._position_timestamp_ms = int(time.time() * 1000)
 
-        await self.backend.pause()
+        if self._state == PlaybackState.PLAYING:
+            await self.backend.pause()
+        else:
+            # Skip/load in progress: do not start audio. Stop any partial play.
+            await self.backend.stop()
         self._state = PlaybackState.PAUSED
         await self._send_state_update()
         # A pause does not end the listen — keeping the play-reporting session

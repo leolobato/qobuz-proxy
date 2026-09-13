@@ -620,27 +620,25 @@ class TestSkipAcknowledgesImmediately:
         backend.play.assert_awaited_once()
         player.metadata.get_streaming_url.assert_not_awaited()
 
-    async def test_pause_followup_does_not_abort_skip(self):
-        """The app answers a skip's LOADING report with PAUSED; that must not
-        leave the speaker on the previous song."""
+    async def test_user_pause_during_skip_load_is_honored(self):
+        """Pause while the skipped-to track is still fetching must win.
+
+        Buffering heartbeats are PLAYING on the outgoing song; a PAUSED
+        SET_STATE for the new item is the user changing their mind.
+        """
         player, backend = _make_player()
         backend.stop = AsyncMock()
-
-        async def slow_play(*args, **kwargs):
-            await asyncio.sleep(0.05)
-
-        backend.play = AsyncMock(side_effect=slow_play)
+        backend.play = AsyncMock()
         backend.seek = AsyncMock()
+        backend.pause = AsyncMock()
         player._current_track = QueueTrack(queue_item_id=8, track_id="111")
         player._state = PlaybackState.PLAYING
-        player._gapless_armed = True
-        player._pending_next_track = {
-            "trackId": "222",
-            "queueItemId": 9,
-            "url": "http://prefetch/222.flac",
-            "metadata": {"title": "Next", "duration_ms": 180000},
-            "backend_meta": None,
-        }
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
 
         skip = asyncio.create_task(
             player.apply_remote_state(
@@ -659,16 +657,61 @@ class TestSkipAcknowledgesImmediately:
                 track_id="222",
                 queue_item_id=9,
                 position_ms=0,
-                playing_state=3,  # PAUSED
+                playing_state=3,
             )
         )
         await asyncio.gather(skip, pause)
 
         assert player.current_track is not None
         assert player.current_track.track_id == "222"
+        assert player.state == PlaybackState.PAUSED
+        backend.play.assert_not_awaited()
+
+    async def test_reselect_outgoing_track_during_skip_is_honored(self):
+        """Selecting the previous song again while the skip loads is a new
+        intent, not an echo of the outgoing PLAYING heartbeat."""
+        player, backend = _make_player()
+        backend.stop = AsyncMock()
+        backend.play = AsyncMock()
+        backend.seek = AsyncMock()
+        player._current_track = QueueTrack(queue_item_id=8, track_id="111")
+        player._state = PlaybackState.PLAYING
+
+        async def slow_url(track_id: str) -> str:
+            await asyncio.sleep(0.05)
+            return f"http://test/{track_id}"
+
+        player.metadata.get_streaming_url = MagicMock(side_effect=slow_url)
+
+        skip = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="222",
+                queue_item_id=9,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        for _ in range(50):
+            if player._skip_in_flight_track_id == "222":
+                break
+            await asyncio.sleep(0.001)
+        reselect = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="111",
+                queue_item_id=8,
+                position_ms=0,
+                playing_state=2,
+            )
+        )
+        await asyncio.gather(skip, reselect)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "111"
         assert player.state == PlaybackState.PLAYING
-        backend.play.assert_awaited_once()
-        backend.stop.assert_not_awaited()
+        backend.play.assert_awaited()
+        played_urls = [call.args[0] for call in backend.play.await_args_list]
+        assert any("111" in url for url in played_urls)
+        assert not any("222" in url for url in played_urls)
 
     async def test_track_change_without_playing_state_while_playing_follows_app(self):
         """Connect often names the new current item without playingState.
