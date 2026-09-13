@@ -535,6 +535,7 @@ class TestSpeakerEditCallbacks:
         with (
             patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
             patch.object(app, "_save_config") as mock_save,
+            patch.object(app, "_schedule_speaker_retry") as mock_retry,
         ):
             result = await app._on_edit_speaker(
                 "wyse", {"max_quality": 27, "dlna_ip": "192.168.1.60"}
@@ -543,8 +544,10 @@ class TestSpeakerEditCallbacks:
         assert config.speakers[0].max_quality == 27
         assert config.speakers[0].dlna_ip == "192.168.1.60"
         mock_save.assert_called_once()
-        assert app._speakers[0] is new_speaker
-        assert result["status"] == "disconnected"
+        mock_retry.assert_called_once()
+        assert app._speakers == []
+        assert result["status"] == "starting"
+        assert "warning" in result
 
     async def test_edit_toggles_fixed_volume(self):
         """The edit form exposes Fixed volume; the flag must round-trip and survive
@@ -771,3 +774,37 @@ class TestSpeakersApiListsConfig:
         assert app._speakers == []
         assert result["status"] == "starting"
         assert "warning" in result
+
+    async def test_unreachable_running_speaker_is_retried(self):
+        """A mid-session renderer drop must withdraw the speaker and retry start."""
+        config = _make_config(_make_speaker_config(name="Patio"))
+        speaker = _make_mock_speaker("Patio", starts=True)
+        speaker._is_running = True
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [speaker]
+
+        with patch.object(app, "_schedule_speaker_retry") as mock_retry:
+            await app._on_speaker_unreachable(speaker)
+
+        assert app._speakers == []
+        speaker.stop.assert_awaited_once()
+        mock_retry.assert_called_once()
+        assert mock_retry.call_args.args[0] is config.speakers[0]
+
+    async def test_unreachable_during_start_does_not_stop_twice(self):
+        """If start() has not published the speaker yet, leave teardown to start()."""
+        config = _make_config(_make_speaker_config(name="Patio"))
+        speaker = _make_mock_speaker("Patio", starts=True)
+        speaker._is_running = False
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = []
+
+        with patch.object(app, "_schedule_speaker_retry") as mock_retry:
+            await app._on_speaker_unreachable(speaker)
+
+        speaker.stop.assert_not_awaited()
+        mock_retry.assert_not_called()

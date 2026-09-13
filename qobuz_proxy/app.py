@@ -63,7 +63,8 @@ def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
 
 
 # Backoff schedule for speakers that fail to start (renderer offline, boot
-# races between containers). After the ramp, keep trying at a steady pace.
+# races between containers, flaky Wi-Fi). After the ramp, keep trying at a
+# steady pace. The same schedule is reused when a running renderer drops.
 SPEAKER_RETRY_DELAYS_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
 SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 
@@ -438,7 +439,7 @@ class QobuzProxy:
         self._config.speakers.append(sc)
         self._save_config()
 
-        speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
+        speaker = self._make_speaker(sc)
         started = await speaker.start()
         if started:
             self._speakers.append(speaker)
@@ -514,20 +515,24 @@ class QobuzProxy:
             await self._speakers[speaker_idx].stop()
 
         assert self._api_client is not None
-        new_speaker = Speaker(config=new_config, api_client=self._api_client, app_id=self._app_id)
+        new_speaker = self._make_speaker(new_config)
         started = await new_speaker.start()
-        if speaker_idx is not None:
-            self._speakers[speaker_idx] = new_speaker
-        else:
-            self._speakers.append(new_speaker)
+        if started:
+            if speaker_idx is not None:
+                self._speakers[speaker_idx] = new_speaker
+            else:
+                self._speakers.append(new_speaker)
+            return new_speaker.get_status()
 
-        status = new_speaker.get_status()
-        if not started:
-            logger.warning(
-                f"Speaker '{new_config.name}' failed to start with new config "
-                "(configuration saved anyway)"
-            )
-            status["warning"] = "Configuration saved, but the speaker failed to start"
+        if speaker_idx is not None:
+            self._speakers.pop(speaker_idx)
+        logger.warning(
+            f"Speaker '{new_config.name}' failed to start with new config "
+            "(configuration saved anyway) — retrying in background"
+        )
+        self._schedule_speaker_retry(new_config)
+        status = _configured_speaker_status(new_config, "starting")
+        status["warning"] = "Configuration saved, but the speaker failed to start"
         return status
 
     async def _on_remove_speaker(self, speaker_id: str) -> None:
@@ -654,14 +659,7 @@ class QobuzProxy:
         running_ids = {slugify_name(s.name) for s in self._speakers}
         configs = [sc for sc in self._config.speakers if slugify_name(sc.name) not in running_ids]
 
-        speakers = [
-            Speaker(
-                config=sc,
-                api_client=self._api_client,
-                app_id=self._app_id,
-            )
-            for sc in configs
-        ]
+        speakers = [self._make_speaker(sc) for sc in configs]
 
         tasks = [asyncio.ensure_future(s.start()) for s in speakers]
         try:
@@ -695,6 +693,38 @@ class QobuzProxy:
         port = self._config.server.http_port
         logger.info(f"qobuz-proxy ready — {len(self._speakers)} speaker(s): {names}")
         logger.info(f"Web UI: http://localhost:{port}")
+
+    def _make_speaker(self, config: SpeakerConfig) -> Speaker:
+        """Build a Speaker wired to reconnect if the renderer drops."""
+        assert self._api_client is not None
+        return Speaker(
+            config=config,
+            api_client=self._api_client,
+            app_id=self._app_id,
+            offline_handler=self._on_speaker_unreachable,
+        )
+
+    async def _on_speaker_unreachable(self, speaker: Speaker) -> None:
+        """Withdraw a dead renderer and retry the same start schedule as boot."""
+        speaker_id = slugify_name(speaker.name)
+        try:
+            self._speakers.remove(speaker)
+        except ValueError:
+            # start() still owns teardown if the speaker was never published.
+            return
+
+        logger.warning(
+            f"Speaker '{speaker.name}' renderer unreachable — reconnecting"
+        )
+        await speaker.stop()
+        if self._api_client is None:
+            return
+        config = next(
+            (sc for sc in self._config.speakers if slugify_name(sc.name) == speaker_id),
+            None,
+        )
+        if config is not None:
+            self._schedule_speaker_retry(config)
 
     def _schedule_speaker_retry(self, config: SpeakerConfig) -> None:
         """Start (or keep) a background task retrying a failed speaker."""
@@ -733,7 +763,7 @@ class QobuzProxy:
                 if self._api_client is None:
                     return  # Logged out — speakers restart on the next login
 
-                speaker = Speaker(config=config, api_client=self._api_client, app_id=self._app_id)
+                speaker = self._make_speaker(config)
                 try:
                     started = await speaker.start()
                 except asyncio.CancelledError:

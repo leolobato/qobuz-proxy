@@ -1,6 +1,7 @@
 """Tests for audio backend interface and factory."""
 
 import pytest
+from unittest.mock import MagicMock
 
 from qobuz_proxy.backends import (
     AudioBackend,
@@ -159,6 +160,36 @@ class TestBackendFactory:
         """Test DLNA backend creation fails gracefully when device unavailable."""
         with pytest.raises(BackendNotFoundError):
             await BackendFactory.create_dlna(ip="192.168.1.100")
+
+    @pytest.mark.asyncio
+    async def test_create_from_config_rediscovers_stale_description_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A speaker reboot can change the UPnP LOCATION; retry via SSDP."""
+        config = Config()
+        config.backend = BackendConfig(type="dlna")
+        config.backend.dlna.ip = "192.168.1.50"
+        config.backend.dlna.description_url = "http://192.168.1.50:1400/old.xml"
+        urls: list[str | None] = []
+
+        async def fake_create_dlna(**kwargs):  # type: ignore[no-untyped-def]
+            urls.append(kwargs.get("description_url"))
+            if kwargs.get("description_url") == "http://192.168.1.50:1400/old.xml":
+                raise BackendNotFoundError("stale location")
+            return MagicMock()
+
+        async def fake_discover(_ip: str, _port: int) -> str:
+            return "http://192.168.1.50:1400/new.xml"
+
+        monkeypatch.setattr(BackendFactory, "create_dlna", fake_create_dlna)
+        monkeypatch.setattr(BackendFactory, "_discover_description_url", fake_discover)
+
+        backend = await BackendFactory.create_from_config(config)
+        assert backend is not None
+        assert urls == [
+            "http://192.168.1.50:1400/old.xml",
+            "http://192.168.1.50:1400/new.xml",
+        ]
 
 
 class TestAudioBackendInterface:
