@@ -8,7 +8,7 @@ run concurrently, one per physical audio device.
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from aiohttp import web
 
@@ -59,6 +59,7 @@ class Speaker:
         api_client: QobuzAPIClient,
         app_id: str,
         web_app: Optional[web.Application] = None,
+        offline_handler: Optional[Callable[["Speaker"], Awaitable[None]]] = None,
     ) -> None:
         """
         Initialize Speaker.
@@ -68,11 +69,15 @@ class Speaker:
             api_client: Authenticated Qobuz API client (shared across speakers)
             app_id: Qobuz application ID (shared across speakers)
             web_app: Optional shared aiohttp Application for discovery routes
+            offline_handler: Called when the renderer stays unreachable so the
+                app can withdraw mDNS and retry the start
         """
         self._config = config
         self._api_client = api_client
         self._app_id = app_id
         self._web_app = web_app
+        self._offline_handler = offline_handler
+        self._renderer_lost: bool = False
 
         self._is_running: bool = False
         self._ws_connected_event: asyncio.Event = asyncio.Event()
@@ -216,6 +221,7 @@ class Speaker:
             True on success, False if any component fails to start.
         """
         try:
+            self._renderer_lost = False
             logger.info(f"[{self.name}] Starting speaker...")
 
             # 1. Build a per-speaker Config for component factories
@@ -303,6 +309,7 @@ class Speaker:
                 self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
                 self._player.set_playback_permission_check(backend.can_apply_remote_state)
                 backend.on_external_playback(self._on_external_playback)
+                backend.on_renderer_unreachable(self._on_renderer_unreachable)
 
             # 7. Create and start discovery service
             logger.debug(f"[{self.name}] Starting discovery service...")
@@ -315,6 +322,13 @@ class Speaker:
             )
             await self._discovery.start()
             logger.info(f"[{self.name}] Discovery service started on port {self._config.http_port}")
+
+            if self._renderer_lost:
+                logger.warning(
+                    f"[{self.name}] Renderer dropped during start — will retry"
+                )
+                await self.stop()
+                return False
 
             self._is_running = True
             logger.info(
@@ -408,6 +422,15 @@ class Speaker:
             self._ws_manager.release_external_playback()
         if self._player:
             await self._player.release_external_playback()
+
+    async def _on_renderer_unreachable(self) -> None:
+        """Renderer stayed unreachable; let the app reconnect, or stop locally."""
+        self._renderer_lost = True
+        if self._offline_handler:
+            await self._offline_handler(self)
+            return
+        logger.warning(f"[{self.name}] Renderer unreachable — stopping")
+        await self.stop()
 
     async def _setup_websocket(self, tokens: ConnectTokens) -> None:
         """Set up (or refresh) the WebSocket connection after receiving tokens."""

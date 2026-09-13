@@ -37,6 +37,15 @@ STATE_POLL_INTERVAL_SECONDS = 2.0
 # This prevents false track-ended events while the device is loading
 PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 
+# Real STOPPED must be seen this many polls in a row before we treat the
+# track as finished. get_transport_info() is None on a Wi-Fi blip, and older
+# renderers also flap STOPPED while loading; one bad poll must not skip.
+PLAYBACK_STOP_CONFIRMATIONS = 2
+
+# Consecutive failed transport polls (after SOAP retries) before tearing
+# the speaker down so mDNS stops advertising and boot-style reconnect runs.
+RENDERER_UNREACHABLE_POLLS = 2
+
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
 
@@ -105,10 +114,19 @@ class DLNABackend(AudioBackend):
         self._external_playback = False
         self._starting_playback = False
         self._on_external_playback: Optional[Callable[[], Awaitable[None]]] = None
+        self._on_renderer_unreachable: Optional[Callable[[], Awaitable[None]]] = None
+        self._unreachable_polls: int = 0
+        self._unreachable_notified: bool = False
+        self._unreachable_task: Optional[asyncio.Task] = None
+        self._stopped_polls: int = 0
 
     def on_external_playback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Register a callback for another source taking over the renderer."""
         self._on_external_playback = callback
+
+    def on_renderer_unreachable(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Register a callback when the renderer stays unreachable over Wi-Fi."""
+        self._on_renderer_unreachable = callback
 
     def prepare_for_selection(self) -> None:
         """Allow a fresh Qobuz selection to load audio after an external takeover."""
@@ -250,6 +268,18 @@ class DLNABackend(AudioBackend):
         """Disconnect from DLNA device."""
         self._is_connected = False
 
+        if self._unreachable_task and not self._unreachable_task.done():
+            task = self._unreachable_task
+            self._unreachable_task = None
+            # Don't cancel ourselves: this disconnect is often invoked from
+            # the unreachable handler running on that same task.
+            if task is not asyncio.current_task():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         if self._poll_task:
             self._poll_task.cancel()
             try:
@@ -324,6 +354,9 @@ class DLNABackend(AudioBackend):
             self._position_ms = 0
             self._current_proxy_url = actual_url
             self._playback_started_at = time.monotonic()
+            self._unreachable_polls = 0
+            self._unreachable_notified = False
+            self._stopped_polls = 0
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
@@ -474,19 +507,38 @@ class DLNABackend(AudioBackend):
     # =========================================================================
 
     async def get_state(self) -> PlaybackState:
-        """Get current playback state from device."""
+        """Get current playback state from device.
+
+        A failed SOAP read is not STOPPED — that used to look like end-of-track
+        on a Wi-Fi blip. Keep the last known state until a real transport
+        string arrives.
+        """
+        resolved = await self._read_transport_state()
+        if resolved is None:
+            return self._state
+        return resolved
+
+    async def _read_transport_state(self) -> Optional[PlaybackState]:
+        """Map GetTransportInfo to a state, or None when the renderer is unreachable."""
         if not self._client:
+            return None
+        try:
+            state_str = await self._client.get_transport_info()
+        except Exception:
+            return None
+        if not state_str:
+            return None
+        if state_str == "PLAYING":
+            return PlaybackState.PLAYING
+        if state_str == "PAUSED_PLAYBACK":
+            return PlaybackState.PAUSED
+        if state_str == "TRANSITIONING":
+            return PlaybackState.LOADING
+        if state_str in ("STOPPED", "NO_MEDIA_PRESENT"):
             return PlaybackState.STOPPED
-
-        state_str = await self._client.get_transport_info()
-        if state_str:
-            if state_str == "PLAYING":
-                return PlaybackState.PLAYING
-            elif state_str == "PAUSED_PLAYBACK":
-                return PlaybackState.PAUSED
-            elif state_str == "TRANSITIONING":
-                return PlaybackState.LOADING
-
+        # Unrecognized strings still count as STOPPED so a quirky renderer
+        # ends the track rather than hanging forever. Track-end requires
+        # consecutive confirmations in the poll loop.
         return PlaybackState.STOPPED
 
     async def get_buffer_status(self) -> BufferStatus:
@@ -658,8 +710,12 @@ class DLNABackend(AudioBackend):
                 ):
                     continue
 
-                # Get state from device
-                new_state = await self.get_state()
+                # Get state from device. None means SOAP failed — not STOPPED.
+                new_state = await self._read_transport_state()
+                if new_state is None:
+                    await self._note_unreachable_poll()
+                    continue
+                self._unreachable_polls = 0
 
                 # Check if we're in the grace period after starting playback
                 in_grace_period = (
@@ -704,15 +760,6 @@ class DLNABackend(AudioBackend):
 
                     # Check for track end before updating state
                     if self._state == PlaybackState.PLAYING and new_state == PlaybackState.STOPPED:
-                        # If gapless was armed but device stopped, clear and fall through
-                        if self._next_track_proxy_url:
-                            logger.debug(
-                                "Gapless: device stopped despite armed next track, "
-                                "falling through to normal track-ended"
-                            )
-                            self._next_track_proxy_url = None
-                            self._next_track_metadata = None
-
                         if in_grace_period:
                             # During grace period, ignore STOPPED state entirely
                             # This prevents false track-ended events while device is loading
@@ -721,10 +768,31 @@ class DLNABackend(AudioBackend):
                                 f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
                             )
                             continue  # Skip state update entirely
-                        else:
-                            self._notify_track_ended()
+
+                        self._stopped_polls += 1
+                        if self._stopped_polls < PLAYBACK_STOP_CONFIRMATIONS:
+                            logger.debug(
+                                "Ignoring unconfirmed STOPPED poll "
+                                f"({self._stopped_polls}/{PLAYBACK_STOP_CONFIRMATIONS})"
+                            )
+                            continue
+
+                        self._stopped_polls = 0
+                        # If gapless was armed but device stopped, clear and fall through
+                        if self._next_track_proxy_url:
+                            logger.debug(
+                                "Gapless: device stopped despite armed next track, "
+                                "falling through to normal track-ended"
+                            )
+                            self._next_track_proxy_url = None
+                            self._next_track_metadata = None
+                        self._notify_track_ended()
+                    else:
+                        self._stopped_polls = 0
 
                     self._notify_state_change(new_state)
+                else:
+                    self._stopped_polls = 0
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:
@@ -735,6 +803,47 @@ class DLNABackend(AudioBackend):
                 break
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
+
+    async def _note_unreachable_poll(self) -> None:
+        """Count a failed transport read; reconnect after it persists."""
+        self._unreachable_polls += 1
+        self._stopped_polls = 0
+        if self._unreachable_polls == 1:
+            logger.warning(
+                "[%s] Renderer unreachable — resetting SOAP session",
+                self.name,
+            )
+            if self._client:
+                try:
+                    await self._client.reset_session()
+                except Exception:
+                    pass
+        else:
+            logger.warning(
+                "[%s] Renderer still unreachable (%s consecutive poll(s))",
+                self.name,
+                self._unreachable_polls,
+            )
+        if (
+            self._unreachable_polls >= RENDERER_UNREACHABLE_POLLS
+            and not self._unreachable_notified
+        ):
+            self._unreachable_notified = True
+            logger.warning(
+                "[%s] Renderer unreachable after %s polls — reconnecting",
+                self.name,
+                self._unreachable_polls,
+            )
+            self._unreachable_task = asyncio.create_task(self._emit_renderer_unreachable())
+
+    async def _emit_renderer_unreachable(self) -> None:
+        callback = self._on_renderer_unreachable
+        if callback is None:
+            return
+        try:
+            await callback()
+        except Exception:
+            logger.exception("[%s] Renderer unreachable handler failed", self.name)
 
     def _build_didl(
         self,

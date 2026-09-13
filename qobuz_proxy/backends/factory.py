@@ -71,16 +71,39 @@ class BackendFactory:
 
         # Dispatch to type-specific factory method
         if backend_type == "dlna":
-            description_url = config.backend.dlna.description_url or None
+            saved_description = config.backend.dlna.description_url or None
+            description_url = saved_description
             if not description_url:
                 description_url = await cls._discover_description_url(
                     config.backend.dlna.ip, config.backend.dlna.port or 1400
                 )
-            return await cls.create_dlna(
-                ip=config.backend.dlna.ip,
-                port=config.backend.dlna.port or 1400,
-                description_url=description_url,
-            )
+            try:
+                return await cls.create_dlna(
+                    ip=config.backend.dlna.ip,
+                    port=config.backend.dlna.port or 1400,
+                    fixed_volume=config.backend.dlna.fixed_volume,
+                    description_url=description_url,
+                )
+            except BackendNotFoundError:
+                # A speaker reboot often changes the UPnP LOCATION path while
+                # keeping the same IP. Retry once via SSDP before giving up.
+                if not saved_description:
+                    raise
+                rediscovered = await cls._discover_description_url(
+                    config.backend.dlna.ip, config.backend.dlna.port or 1400
+                )
+                if not rediscovered or rediscovered == saved_description:
+                    raise
+                logger.info(
+                    "Saved description URL failed; retrying DLNA connect via SSDP "
+                    f"({saved_description} -> {rediscovered})"
+                )
+                return await cls.create_dlna(
+                    ip=config.backend.dlna.ip,
+                    port=config.backend.dlna.port or 1400,
+                    fixed_volume=config.backend.dlna.fixed_volume,
+                    description_url=rediscovered,
+                )
         elif backend_type == "local":
             return await cls.create_local(
                 device=config.backend.local.device,
