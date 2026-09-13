@@ -180,8 +180,6 @@ class PlaybackCommandHandler:
             await self.queue.set_version(
                 QueueVersion(major=state.queueVersion.major, minor=state.queueVersion.minor)
             )
-            if not self._active or generation != self._generation:
-                return
         # Extract current queue item info
         current_item = None
         current_queue_item_id = None
