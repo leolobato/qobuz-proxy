@@ -221,6 +221,11 @@ Environment Variables:
         metavar="TEXT",
         help="Bind address (default: 0.0.0.0)",
     )
+    server_group.add_argument(
+        "--mdns-interface",
+        metavar="TEXT",
+        help="NIC name or IPv4 for Connect mDNS (default: auto LAN)",
+    )
 
     # Logging
     parser.add_argument(
@@ -262,6 +267,7 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         "http_port": ("server", "http_port"),
         "proxy_port": ("backend", "dlna", "proxy_port"),
         "bind": ("server", "bind_address"),
+        "mdns_interface": ("server", "mdns_interface"),
         "log_level": ("logging", "level"),
     }
 

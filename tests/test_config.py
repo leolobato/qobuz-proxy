@@ -90,6 +90,15 @@ class TestDictToConfigAuthToken:
         assert config.qobuz.email == ""
 
 
+class TestMdnsInterfaceConfig:
+    def test_mdns_interface_from_server_section(self) -> None:
+        config = dict_to_config({"server": {"mdns_interface": "wlan0"}})
+        assert config.server.mdns_interface == "wlan0"
+
+    def test_mdns_interface_defaults_empty(self) -> None:
+        assert dict_to_config({}).server.mdns_interface == ""
+
+
 class TestValidateConfigWithoutCredentials:
     """Test that validation passes without email/password credentials."""
 

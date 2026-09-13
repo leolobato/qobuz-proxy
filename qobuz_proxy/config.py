@@ -58,6 +58,7 @@ ENV_MAPPINGS = {
     "QOBUZPROXY_AUDIO_BUFFER_SIZE": ("backend", "local", "buffer_size"),
     # Server
     "QOBUZPROXY_HTTP_PORT": ("server", "http_port"),
+    "QOBUZPROXY_MDNS_INTERFACE": ("server", "mdns_interface"),
     "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
     # Logging
     "QOBUZPROXY_LOG_LEVEL": ("logging", "level"),
@@ -126,6 +127,9 @@ class ServerConfig:
 
     http_port: int = 8689
     bind_address: str = "0.0.0.0"
+    # NIC name or IPv4 for Connect mDNS. Empty = pick a LAN address
+    # (skip docker/VPN/bridges; prefer the default-route LAN nic).
+    mdns_interface: str = ""
 
 
 @dataclass
@@ -641,6 +645,7 @@ def dict_to_config(d: dict) -> Config:
         s = d["server"]
         config.server.http_port = s.get("http_port", config.server.http_port)
         config.server.bind_address = s.get("bind_address", config.server.bind_address)
+        config.server.mdns_interface = s.get("mdns_interface", config.server.mdns_interface) or ""
 
     # Logging
     if "logging" in d:

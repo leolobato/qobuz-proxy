@@ -11,7 +11,7 @@ import socket
 from typing import Any, Callable, Optional
 
 from aiohttp import web
-from zeroconf import ServiceInfo, Zeroconf
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 from qobuz_proxy.config import Config
 
@@ -291,7 +291,17 @@ class DiscoveryService:
             properties=properties,
         )
 
-        self._zeroconf = Zeroconf()
+        # Advertise only on the LAN address the phone can reach. Zeroconf()
+        # otherwise joins every interface (VPN utun, AWDL, …) and the Qobuz
+        # app on Wi-Fi never sees the speaker even though the Web UI at this IP
+        # loads fine.
+        try:
+            self._zeroconf = Zeroconf(interfaces=[local_ip], ip_version=IPVersion.V4Only)
+        except Exception:
+            logger.warning(
+                "mDNS could not bind to %s; advertising on all interfaces", local_ip
+            )
+            self._zeroconf = Zeroconf()
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(None, self._zeroconf.register_service, self._service_info)
@@ -318,21 +328,201 @@ class DiscoveryService:
             logger.debug("Unregistered mDNS service")
 
     def _get_local_ip(self) -> Optional[str]:
-        """
-        Get the local IP address.
+        """IPv4 the Qobuz app on Wi-Fi can reach.
 
-        Uses a dummy socket connection to determine the outbound IP.
+        Prefer a real LAN NIC over the default-route address: a VPN makes
+        the 8.8.8.8 trick return a utun IP the phone cannot use, while the
+        Web UI is still opened at the Wi-Fi address.
         """
+        preferred = (getattr(self.config.server, "mdns_interface", None) or "").strip() or None
+        lan = _lan_ipv4(preferred=preferred)
+        if lan:
+            return lan
+        route = _default_route_ipv4()
+        if route:
+            return route
+        logger.error("Failed to determine local IP for mDNS")
+        return None
+
+
+# Virtual / container / VPN nics. Binding to these succeeds, but a phone on
+# Wi-Fi never sees the advertisement — so they must not win just by appearing
+# first in ifaddr.get_adapters().
+_SKIP_IFACE_PREFIXES = (
+    "lo",
+    "utun",
+    "awdl",
+    "llw",
+    "bridge",
+    "anpi",
+    "ap",
+    "gif",
+    "stf",
+    "vmnet",
+    "vboxnet",
+    "docker",
+    "br-",
+    "br0",
+    "virbr",
+    "cni",
+    "flannel",
+    "cali",
+    "vxlan",
+    "veth",
+    "tun",
+    "tap",
+    "wg",
+    "tailscale",
+    "zt",
+    "podman",
+    "lxc",
+    "dummy",
+    "ppp",
+    "ip6tnl",
+    "sit",
+    "kube",
+    "nodelocal",
+)
+
+# Physical LAN names. Allowlist so unknown virtual nics cannot sneak through.
+_LAN_IFACE_PREFIXES = (
+    "wlan",
+    "wlp",
+    "wlx",
+    "wl",
+    "eth",
+    "eno",
+    "ens",
+    "enp",
+    "enx",
+    "em",
+    "en",
+)
+_WIFI_IFACE_PREFIXES = ("wlan", "wlp", "wlx", "wl")
+
+
+def _iter_adapters():
+    import ifaddr
+
+    return ifaddr.get_adapters()
+
+
+def _default_route_ipv4() -> Optional[str]:
+    """IPv4 of the interface used for a dummy internet route (may be VPN)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0)
-            try:
-                # Doesn't actually connect, just determines route
-                s.connect(("8.8.8.8", 80))
-                ip = s.getsockname()[0]
-            finally:
-                s.close()
-            return str(ip)
-        except Exception as e:
-            logger.error(f"Failed to determine local IP: {e}")
-            return None
+            s.connect(("8.8.8.8", 80))
+            return str(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def _iface_name(adapter: Any) -> str:
+    return (adapter.nice_name or adapter.name or "").lower()
+
+
+def _adapter_ipv4s(adapter: Any) -> list[str]:
+    addrs: list[str] = []
+    for ip in adapter.ips:
+        addr = ip.ip if isinstance(ip.ip, str) else None
+        if not addr or "." not in addr:
+            continue
+        if addr.startswith("127.") or addr.startswith("169.254."):
+            continue
+        addrs.append(addr)
+    return addrs
+
+
+def _is_skipped_iface(name: str) -> bool:
+    n = name.lower()
+    return any(n.startswith(prefix) for prefix in _SKIP_IFACE_PREFIXES)
+
+
+def _is_lan_iface(name: str) -> bool:
+    if _is_skipped_iface(name):
+        return False
+    n = name.lower()
+    return any(n.startswith(prefix) for prefix in _LAN_IFACE_PREFIXES)
+
+
+def _lan_rank(name: str) -> int:
+    n = name.lower()
+    if any(n.startswith(prefix) for prefix in _WIFI_IFACE_PREFIXES):
+        return 0
+    return 1
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        return False
+
+
+def _ipv4_for_preference(adapters: Any, preferred: str) -> Optional[str]:
+    """Resolve a configured NIC name or IPv4, including virtual nics."""
+    pref = preferred.strip()
+    if _looks_like_ipv4(pref):
+        return pref
+    want = pref.lower()
+    for adapter in adapters:
+        raw = adapter.nice_name or adapter.name or ""
+        if raw.lower() != want:
+            continue
+        addrs = _adapter_ipv4s(adapter)
+        if addrs:
+            return addrs[0]
+        return None
+    return None
+
+
+def _lan_ipv4(preferred: Optional[str] = None) -> Optional[str]:
+    """IPv4 on a real LAN NIC, independent of ifaddr adapter order.
+
+    ``preferred`` is an optional interface name or IPv4 from config. That
+    always wins (including docker/VPN) so a host that must advertise on a
+    specific nic can pin it.
+    """
+    try:
+        adapters = list(_iter_adapters())
+    except ImportError:
+        return None
+    except Exception:
+        logger.exception("Failed to list network adapters for mDNS")
+        return None
+
+    if preferred:
+        found = _ipv4_for_preference(adapters, preferred)
+        if found:
+            return found
+        logger.warning(
+            "mDNS interface %r not found; falling back to automatic LAN selection",
+            preferred,
+        )
+
+    candidates: list[tuple[int, str, str]] = []
+    for adapter in adapters:
+        name = _iface_name(adapter)
+        if not _is_lan_iface(name):
+            continue
+        for addr in _adapter_ipv4s(adapter):
+            candidates.append((_lan_rank(name), name, addr))
+    if not candidates:
+        return None
+
+    # Prefer the default-route address only when it is a LAN nic — a VPN
+    # default route is skipped so Wi-Fi still wins. Sorted by (wifi, name,
+    # ip) so listing order never decides between two physical nics.
+    route = _default_route_ipv4()
+    if route:
+        on_lan = [item for item in candidates if item[2] == route]
+        if on_lan:
+            return sorted(on_lan)[0][2]
+    return sorted(candidates)[0][2]

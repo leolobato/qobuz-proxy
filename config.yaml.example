@@ -30,6 +30,7 @@ backend:
 server:
   http_port: 8689               # mDNS discovery HTTP server
   bind_address: "0.0.0.0"       # Network interface to bind
+  # mdns_interface: "en0"       # optional NIC name or IPv4 if auto-pick is wrong
 
 logging:
   level: "info"                 # debug, info, warning, error
