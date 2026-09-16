@@ -216,7 +216,10 @@ class TestTrackChangeNeverReportsStopped:
         )
 
         assert PlaybackState.STOPPED not in reported
-        assert reported[0] == PlaybackState.LOADING
+        # A skip may first advertise the new queue item while still PLAYING
+        # (before the playback lock); LOADING must follow so the app sees
+        # buffering rather than a stop, and the last report is PLAYING.
+        assert PlaybackState.LOADING in reported
         assert reported[-1] == PlaybackState.PLAYING
         assert backend.played == ["1", "2"]
 

@@ -160,3 +160,29 @@ class TestSonosGaplessQueue:
         await backend.clear_next_track()
 
         client.remove_track_from_queue.assert_not_called()
+
+    async def test_set_next_track_refuses_currently_playing_uri(self):
+        backend, client = self._make_sonos_backend()
+        meta = _make_metadata(track_id="111")
+        current = backend._current_proxy_url
+        assert current is not None
+
+        assert await backend.set_next_track(current, meta, 8) is False
+
+        client.add_uri_to_queue.assert_not_awaited()
+        assert backend._next_track_proxy_url is None
+
+    def test_same_uri_as_current_is_not_a_gapless_transition(self):
+        backend, _client = self._make_sonos_backend()
+        same = "http://proxy/audio/111_8.flac"
+        backend._current_proxy_url = same
+        backend._next_track_proxy_url = same
+
+        assert backend._device_reached_next_track(same) is False
+
+    def test_distinct_next_uri_is_a_gapless_transition(self):
+        backend, _client = self._make_sonos_backend()
+        backend._current_proxy_url = "http://proxy/audio/111.flac"
+        backend._next_track_proxy_url = "http://proxy/audio/222_9.flac"
+
+        assert backend._device_reached_next_track("http://proxy/audio/222_9.flac") is True
