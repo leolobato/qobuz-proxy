@@ -314,7 +314,10 @@ class DLNABackend(AudioBackend):
             return True
 
         except DLNAClientError as e:
-            logger.error(f"Failed to connect to DLNA device: {e}")
+            # An unreachable renderer is an expected state (powered off,
+            # still booting); the caller retries with backoff. Log at info
+            # so an offline speaker does not look like a crash in the logs.
+            logger.info(f"DLNA device not reachable: {e}")
             return False
         except Exception as e:
             logger.error(f"Unexpected error connecting to DLNA: {e}", exc_info=True)

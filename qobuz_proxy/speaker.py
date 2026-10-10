@@ -36,7 +36,7 @@ from qobuz_proxy.playback import (
     StateReporter,
     VolumeCommandHandler,
 )
-from qobuz_proxy.backends import AudioBackend, BackendFactory, PlaybackState
+from qobuz_proxy.backends import AudioBackend, BackendFactory, BackendNotFoundError, PlaybackState
 from qobuz_proxy.playback.play_reporter import PlayReporter
 from qobuz_proxy.playback.state_reporter import PlaybackStateReport, wire_playing_state
 from qobuz_proxy.backends.dlna import AudioProxyServer, DLNABackend, MetadataServiceURLProvider
@@ -323,6 +323,14 @@ class Speaker:
                 f"[{self.name}] Ready — device '{self._config.name}' is now visible in Qobuz app"
             )
             return True
+
+        except BackendNotFoundError as e:
+            # The renderer being offline is an expected state (e.g. a speaker
+            # that is powered off); the app retries with backoff. Log at info
+            # so an offline speaker does not spam the logs with a traceback.
+            logger.info(f"[{self.name}] Backend unavailable: {e}")
+            await self.stop()
+            return False
 
         except Exception as e:
             logger.error(f"[{self.name}] Failed to start: {e}", exc_info=True)
