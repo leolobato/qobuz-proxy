@@ -662,3 +662,50 @@ class TestQualitySourceStatus:
         assert cfg["max_quality"] == 27
         assert cfg["effective_quality"] == 27
         assert cfg["quality_source"] == "manual"
+
+
+class TestStartFailureLogging:
+    """An offline renderer is an expected state and must not log as an error."""
+
+    async def test_offline_backend_logs_info_without_error(self, caplog):
+        import logging
+
+        from qobuz_proxy.backends import BackendNotFoundError
+
+        config = _make_speaker_config()
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+
+        with (
+            caplog.at_level(logging.INFO, logger="qobuz_proxy.speaker"),
+            patch(
+                "qobuz_proxy.speaker.BackendFactory.create_from_config",
+                new_callable=AsyncMock,
+                side_effect=BackendNotFoundError(
+                    "Failed to connect to DLNA device at 192.168.1.100:1400"
+                ),
+            ),
+        ):
+            result = await speaker.start()
+
+        assert result is False
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    async def test_unexpected_start_failure_still_logs_error(self, caplog):
+        import logging
+
+        config = _make_speaker_config()
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="app-id")
+
+        with (
+            caplog.at_level(logging.INFO, logger="qobuz_proxy.speaker"),
+            patch(
+                "qobuz_proxy.speaker.BackendFactory.create_from_config",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            result = await speaker.start()
+
+        assert result is False
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
