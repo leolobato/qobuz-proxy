@@ -31,6 +31,9 @@ from qobuz_proxy.config import (
     SpeakerConfig,
     _assign_ports,
     _generate_uuids,
+    _normalize_group_members,
+    _resolve_group_speakers,
+    _validate_speakers,
     parse_device_type,
     slugify_name,
 )
@@ -47,7 +50,9 @@ def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
         "max_quality": "auto" if sc.max_quality == AUTO_QUALITY else sc.max_quality,
         "device_type": sc.device_type,
     }
-    if sc.backend_type == "dlna":
+    if sc.group_members:
+        config_dict["group_members"] = list(sc.group_members)
+    elif sc.backend_type == "dlna":
         config_dict["dlna_ip"] = sc.dlna_ip
         config_dict["dlna_port"] = sc.dlna_port
         config_dict["description_url"] = sc.dlna_description_url
@@ -59,6 +64,7 @@ def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
         "id": slugify_name(sc.name),
         "name": sc.name,
         "backend": sc.backend_type,
+        "is_group": sc.is_group,
         "status": status,
         "config": config_dict,
         "now_playing": None,
@@ -84,6 +90,11 @@ SPEAKER_RETRY_STEADY_DELAY_SECONDS: float = 300.0
 # proxy recovers on its own instead of waiting for a manual re-login.
 AUTH_RETRY_DELAYS_SECONDS: tuple[float, ...] = (3.0, 8.0, 20.0, 40.0, 60.0)
 AUTH_RETRY_STEADY_DELAY_SECONDS: float = 300.0
+
+
+def _speaker_uses_member(speaker: SpeakerConfig, member_id: str) -> bool:
+    """True if a group speaker lists member_id (name slug) as a room."""
+    return any(slugify_name(member) == member_id for member in speaker.group_members)
 
 
 class QobuzProxy:
@@ -425,6 +436,10 @@ class QobuzProxy:
         else:
             max_quality = int(quality_raw)
 
+        group_members = _normalize_group_members(body.get("group_members"))
+        if group_members:
+            backend_type = "dlna"
+
         sc = SpeakerConfig(
             name=name,
             device_type=_parse_body_device_type(body.get("device_type")),
@@ -436,6 +451,7 @@ class QobuzProxy:
             dlna_description_url=body.get("description_url", ""),
             audio_device=body.get("audio_device", "default"),
             audio_buffer_size=int(body.get("buffer_size", 2048)),
+            group_members=group_members,
         )
 
         assert self._api_client is not None
@@ -445,6 +461,7 @@ class QobuzProxy:
         all_configs = list(self._config.speakers) + [sc]
         _assign_ports(all_configs, webui_port=self._config.server.http_port)
         _generate_uuids([sc])
+        self._apply_group_config(sc, list(self._config.speakers) + [sc])
 
         # Persist first so a restart still has this speaker even if start fails.
         self._config.speakers.append(sc)
@@ -499,6 +516,10 @@ class QobuzProxy:
         else:
             max_quality = int(quality_raw)
 
+        group_members = list(old_config.group_members)
+        if old_config.group_members and "group_members" in body:
+            group_members = _normalize_group_members(body.get("group_members"))
+
         new_config = SpeakerConfig(
             name=new_name,
             uuid=old_config.uuid,
@@ -514,7 +535,20 @@ class QobuzProxy:
             proxy_port=old_config.proxy_port,
             audio_device=body.get("audio_device", old_config.audio_device),
             audio_buffer_size=int(body.get("buffer_size", old_config.audio_buffer_size)),
+            group_members=group_members,
         )
+
+        if not old_config.group_members and slugify_name(new_name) != speaker_id:
+            for group in self._config.speakers:
+                if _speaker_uses_member(group, speaker_id):
+                    group.group_members = [
+                        new_name if slugify_name(member) == speaker_id else member
+                        for member in group.group_members
+                    ]
+
+        pending = list(self._config.speakers)
+        pending[config_idx] = new_config
+        self._apply_group_config(new_config, pending)
 
         # Persist first: the edit is saved even if the restart below fails
         self._config.speakers[config_idx] = new_config
@@ -556,6 +590,15 @@ class QobuzProxy:
         if config_idx is None:
             raise KeyError(speaker_id)
 
+        for group in self._config.speakers:
+            if slugify_name(group.name) == speaker_id:
+                continue
+            if _speaker_uses_member(group, speaker_id):
+                raise ValueError(
+                    f"Cannot remove '{self._config.speakers[config_idx].name}': "
+                    f"used by group '{group.name}'"
+                )
+
         speaker_idx = None
         for i, s in enumerate(self._speakers):
             if slugify_name(s.name) == speaker_id:
@@ -569,6 +612,18 @@ class QobuzProxy:
             await speaker.stop()
 
         self._save_config()
+
+    def _apply_group_config(
+        self, speaker: SpeakerConfig, all_speakers: list[SpeakerConfig]
+    ) -> None:
+        """Resolve coordinator DLNA settings and validate group membership."""
+        if not speaker.group_members:
+            return
+        _resolve_group_speakers(all_speakers)
+        try:
+            _validate_speakers(all_speakers)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
 
     def _save_config(self) -> None:
         """Persist current config to YAML file."""

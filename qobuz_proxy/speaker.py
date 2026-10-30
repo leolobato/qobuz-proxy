@@ -152,7 +152,9 @@ class Speaker:
             "quality_source": self._quality_source,
             "device_type": self._config.device_type,
         }
-        if self._config.backend_type == "dlna":
+        if self._config.group_members:
+            config_dict["group_members"] = list(self._config.group_members)
+        if self._config.backend_type == "dlna" and not self._config.group_members:
             config_dict["dlna_ip"] = self._config.dlna_ip
             config_dict["dlna_port"] = self._config.dlna_port
             config_dict["description_url"] = self._config.dlna_description_url
@@ -165,6 +167,7 @@ class Speaker:
             "id": slugify_name(self._config.name),
             "name": self._config.name,
             "backend": self._config.backend_type,
+            "is_group": self._config.is_group,
             "status": playback_status,
             "config": config_dict,
             "now_playing": now_playing,
@@ -196,6 +199,7 @@ class Speaker:
                     fixed_volume=self._config.dlna_fixed_volume,
                     proxy_port=self._config.proxy_port,
                     description_url=self._config.dlna_description_url,
+                    group_member_endpoints=list(self._config.group_member_endpoints),
                 ),
                 local=LocalConfig(
                     device=self._config.audio_device,

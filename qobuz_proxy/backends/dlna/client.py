@@ -23,6 +23,7 @@ VOLUME_MIN_INTERVAL_MS = 200
 SOAP_ENVELOPE_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 UPNP_AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 UPNP_RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:1"
+UPNP_GROUP_RENDERING_CONTROL = "urn:schemas-upnp-org:service:GroupRenderingControl:1"
 UPNP_CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 
 # Retry configuration
@@ -58,6 +59,7 @@ class DLNADeviceInfo:
     udn: str = ""  # Unique Device Name
     av_transport_url: str = ""
     rendering_control_url: str = ""
+    group_rendering_control_url: str = ""
     connection_manager_url: str = ""
 
 
@@ -487,6 +489,38 @@ class DLNAClient:
         )
         return result is not None
 
+    async def get_group_volume(self) -> Optional[int]:
+        """Get Sonos group volume (0-100). Falls back to room volume."""
+        if not self.device_info or not self.device_info.group_rendering_control_url:
+            return await self.get_volume()
+
+        response = await self._soap_action(
+            self.device_info.group_rendering_control_url,
+            UPNP_GROUP_RENDERING_CONTROL,
+            "GetGroupVolume",
+            {"InstanceID": "0"},
+        )
+        if response:
+            vol_str = self._parse_xml_value(response, "CurrentVolume")
+            if vol_str:
+                return int(vol_str)
+        return None
+
+    async def set_group_volume(self, volume: int) -> bool:
+        """Set Sonos group volume. Falls back to room volume if unavailable."""
+        if not self.device_info or not self.device_info.group_rendering_control_url:
+            return await self.set_volume(volume)
+
+        self._last_volume_time_ms = time.time() * 1000
+        result = await self._soap_action(
+            self.device_info.group_rendering_control_url,
+            UPNP_GROUP_RENDERING_CONTROL,
+            "SetGroupVolume",
+            {"InstanceID": "0", "DesiredVolume": str(volume)},
+            max_retries=1,
+        )
+        return result is not None
+
     # =========================================================================
     # Queue Actions (Sonos-specific)
     # =========================================================================
@@ -568,6 +602,37 @@ class DLNAClient:
             is not None
         )
 
+    def root_device_uid(self) -> str:
+        """Return the Sonos root device UUID (no uuid: prefix or _MR/_MS suffix)."""
+        if not self.device_info:
+            return ""
+        uid = self.device_info.udn.removeprefix("uuid:")
+        for suffix in ("_MR", "_MS"):
+            if uid.endswith(suffix):
+                uid = uid[: -len(suffix)]
+                break
+        return uid
+
+    async def join_group(self, coordinator_uid: str) -> bool:
+        """Join this player to a Sonos group by targeting the coordinator UUID."""
+        if not coordinator_uid:
+            return False
+        return await self.set_av_transport_uri(f"x-rincon:{coordinator_uid}", "")
+
+    async def unjoin(self) -> bool:
+        """Leave the current Sonos group and become a standalone coordinator."""
+        if not self.device_info:
+            return False
+        return (
+            await self._soap_action(
+                self.device_info.av_transport_url,
+                UPNP_AV_TRANSPORT,
+                "BecomeCoordinatorOfStandaloneGroup",
+                {"InstanceID": "0"},
+            )
+            is not None
+        )
+
     async def play_from_queue(self, index: int = 0) -> bool:
         """
         Start playback from a position in the queue.
@@ -584,12 +649,7 @@ class DLNAClient:
         # Set the queue as the active transport source (required by Sonos)
         # UDN may be "uuid:RINCON_xxx_MR" (MediaRenderer sub-device) — strip
         # the prefix and suffix to get the root device ID for the queue URI.
-        uid = self.device_info.udn.removeprefix("uuid:")
-        # Remove sub-device suffixes like _MR, _MS
-        for suffix in ("_MR", "_MS"):
-            if uid.endswith(suffix):
-                uid = uid[: -len(suffix)]
-                break
+        uid = self.root_device_uid()
         queue_uri = f"x-rincon-queue:{uid}#0"
         if not await self.set_av_transport_uri(queue_uri, ""):
             return False
@@ -739,6 +799,12 @@ class DLNAClient:
                         info.av_transport_url = base_url + control_url
                     else:
                         info.av_transport_url = control_url
+
+                elif "GroupRenderingControl" in service_type and control_url:
+                    if control_url.startswith("/"):
+                        info.group_rendering_control_url = base_url + control_url
+                    else:
+                        info.group_rendering_control_url = control_url
 
                 elif "RenderingControl" in service_type and control_url:
                     # Prefer standard RenderingControl over GroupRenderingControl

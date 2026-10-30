@@ -161,6 +161,26 @@ class TestConfigToDict:
         assert speaker["backend"] == "dlna"
         assert speaker["uuid"] == "abc-123"
 
+    def test_group_speaker_round_trip(self, tmp_path: Path) -> None:
+        config = Config()
+        config.speakers = [
+            SpeakerConfig(name="Kitchen", backend_type="dlna", dlna_ip="10.0.1.30"),
+            SpeakerConfig(name="Dining", backend_type="dlna", dlna_ip="10.0.1.31"),
+            SpeakerConfig(
+                name="Downstairs",
+                backend_type="dlna",
+                dlna_ip="10.0.1.30",
+                group_members=["Kitchen", "Dining"],
+            ),
+        ]
+        path = tmp_path / "config.yaml"
+        save_config(config, path)
+        data = yaml.safe_load(path.read_text())
+        group = data["speakers"][2]
+        assert group["name"] == "Downstairs"
+        assert group["group_members"] == ["Kitchen", "Dining"]
+        assert "dlna_ip" not in group
+
 
 def test_uuid_migration_does_not_freeze_environment_speakers(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"

@@ -80,7 +80,8 @@ async def _handle_add_speaker(request: web.Request) -> web.Response:
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
 
-    if backend == "dlna" and not body.get("dlna_ip"):
+    group_members = body.get("group_members") or []
+    if backend == "dlna" and not body.get("dlna_ip") and not group_members:
         return web.json_response({"error": "dlna_ip is required for DLNA backend"}, status=400)
 
     callback = request.app["on_add_speaker"]

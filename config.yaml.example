@@ -66,3 +66,7 @@ logging:
 #     backend: local
 #     audio_device: "Built-in Output"
 #     device_type: headphones    # optional, icon in the Qobuz app (default: speaker)
+#
+#   - name: "Downstairs"
+#     backend: dlna
+#     group_members: ["Living Room", "Office"]  # first speaker is the coordinator

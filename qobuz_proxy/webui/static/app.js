@@ -7,6 +7,8 @@
     var addPanelOpen = false;
     var selectedBackend = null;
     var selectedDevice = null;
+    var latestSpeakers = [];
+    var selectedGroupMembers = [];
 
     // -------------------------------------------------------------------------
     // Auth
@@ -165,7 +167,9 @@
         html += '<span class="speaker-badge ' + badgeClass + '">' + badgeLabel + '</span>';
 
         // Backend badge
-        if (s.backend) {
+        if (s.is_group) {
+            html += '<span class="speaker-badge badge-group">GROUP</span>';
+        } else if (s.backend) {
             var backendClass = s.backend === "dlna" ? "badge-dlna" : "badge-local";
             html += '<span class="speaker-badge ' + backendClass + '">' + escapeHtml(s.backend.toUpperCase()) + '</span>';
         }
@@ -234,7 +238,9 @@
             html += renderSpeakerHeader(s);
 
             var idleParts = [];
-            if (s.backend === "dlna" && cfg.dlna_ip) {
+            if (s.is_group && cfg.group_members && cfg.group_members.length) {
+                idleParts.push(escapeHtml(cfg.group_members.join(" + ")));
+            } else if (s.backend === "dlna" && cfg.dlna_ip) {
                 idleParts.push(escapeHtml(cfg.dlna_ip + ':' + (cfg.dlna_port || 1400)));
             } else if (s.backend === "local" && cfg.audio_device) {
                 idleParts.push(escapeHtml(cfg.audio_device));
@@ -274,7 +280,12 @@
         html += '</div>';
 
         var cfg = s.config || {};
-        if (s.backend === "dlna") {
+        if (s.is_group) {
+            html += '<div class="form-group">';
+            html += '<label>Group members <span class="muted">(first is the coordinator)</span></label>';
+            html += renderGroupMemberChecklist(cfg.group_members || [], "edit-group-members");
+            html += '</div>';
+        } else if (s.backend === "dlna") {
             html += '<div class="form-group">';
             html += '<label>IP Address</label>';
             html += '<input type="text" id="edit-dlna-ip" value="' + escapeHtml(cfg.dlna_ip || "") + '" placeholder="192.168.1.x">';
@@ -311,7 +322,7 @@
         html += '</div>';
 
         html += '<div class="button-group">';
-        html += '<button id="edit-speaker-submit" onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ')">Save</button>';
+        html += '<button id="edit-speaker-submit" onclick="submitEditSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ', ' + escapeAttr(JSON.stringify(s.backend)) + ', ' + escapeAttr(JSON.stringify(!!s.is_group)) + ')">Save</button>';
         html += '<button class="button-secondary" onclick="cancelEdit()">Cancel</button>';
         html += '<button class="button-danger" style="margin-left:auto;" onclick="removeSpeaker(' + escapeAttr(JSON.stringify(s.id)) + ')">Remove</button>';
         html += '</div>';
@@ -386,6 +397,9 @@
         html += '<div class="backend-card" id="bc-dlna" onclick="selectBackend(\'dlna\')">';
         html += '<h3>DLNA</h3><p>Sonos, Denon HEOS, and other UPnP/DLNA renderers</p>';
         html += '</div>';
+        html += '<div class="backend-card" id="bc-group" onclick="selectBackend(\'group\')">';
+        html += '<h3>Sonos group</h3><p>Cast to several Sonos rooms as one Qobuz target</p>';
+        html += '</div>';
         html += '<div class="backend-card" id="bc-local" onclick="selectBackend(\'local\')">';
         html += '<h3>Local</h3><p>Built-in speakers or headphones via PortAudio</p>';
         html += '</div>';
@@ -404,6 +418,9 @@
         if (type === "dlna") {
             panel.innerHTML = renderStep2DLNA();
             startDLNADiscovery();
+        } else if (type === "group") {
+            selectedGroupMembers = [];
+            panel.innerHTML = renderStep2Group();
         } else if (type === "local") {
             panel.innerHTML = renderStep2Local();
             startAudioDeviceDiscovery();
@@ -430,6 +447,81 @@
         html += '<button class="button-secondary" onclick="showAddSpeaker()">Back</button>';
         html += '</div>';
         return html;
+    }
+
+    function roomSpeakersForGroup() {
+        return (latestSpeakers || []).filter(function (s) {
+            return s.backend === "dlna" && !s.is_group;
+        });
+    }
+
+    function renderGroupMemberChecklist(selectedNames, containerId) {
+        var rooms = roomSpeakersForGroup();
+        var selected = selectedNames || [];
+        var selectedSlugs = {};
+        for (var i = 0; i < selected.length; i++) {
+            selectedSlugs[selected[i]] = i;
+            selectedSlugs[String(selected[i]).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")] = i;
+        }
+        if (!rooms.length) {
+            return '<p class="muted">Add at least two Sonos/DLNA speakers first.</p>';
+        }
+        var html = '<div class="device-list" id="' + escapeHtml(containerId) + '">';
+        for (var r = 0; r < rooms.length; r++) {
+            var room = rooms[r];
+            var checked = (selectedSlugs[room.id] !== undefined || selectedSlugs[room.name] !== undefined) ? " checked" : "";
+            var order = selectedSlugs[room.id];
+            if (order === undefined) order = selectedSlugs[room.name];
+            html += '<label class="device-item" style="display:flex;align-items:center;gap:8px;cursor:pointer;">';
+            html += '<input type="checkbox" class="group-member-box" data-name="' + escapeHtml(room.name) + '" data-id="' + escapeHtml(room.id) + '"' + checked + ' style="width:auto;">';
+            html += '<span>' + escapeHtml(room.name);
+            if (order === 0) html += ' <span class="muted">(coordinator)</span>';
+            html += '</span></label>';
+        }
+        html += '</div>';
+        html += '<p class="muted" style="margin:8px 0 0;">Select two or more rooms. The first selected speaker is the group coordinator.</p>';
+        return html;
+    }
+
+    function collectCheckedGroupMembers(containerId, previous) {
+        var container = document.getElementById(containerId);
+        if (!container) return [];
+        var boxes = container.querySelectorAll(".group-member-box");
+        var checked = [];
+        for (var i = 0; i < boxes.length; i++) {
+            if (boxes[i].checked) checked.push(boxes[i].getAttribute("data-name"));
+        }
+        var prev = previous || [];
+        var ordered = [];
+        for (var p = 0; p < prev.length; p++) {
+            if (checked.indexOf(prev[p]) >= 0) ordered.push(prev[p]);
+        }
+        for (var c = 0; c < checked.length; c++) {
+            if (ordered.indexOf(checked[c]) < 0) ordered.push(checked[c]);
+        }
+        return ordered;
+    }
+
+    function renderStep2Group() {
+        var html = '<div class="add-step-header">';
+        html += '<div class="step-number">2</div>';
+        html += '<span style="font-weight:600;color:#fff;">Choose rooms</span>';
+        html += '</div>';
+        html += renderGroupMemberChecklist(selectedGroupMembers, "new-group-members");
+        html += '<div class="button-group" style="margin-top:12px;">';
+        html += '<button onclick="continueGroupConfig()">Next</button>';
+        html += '<button class="button-secondary" onclick="showAddSpeaker()">Back</button>';
+        html += '</div>';
+        return html;
+    }
+
+    function continueGroupConfig() {
+        selectedGroupMembers = collectCheckedGroupMembers("new-group-members");
+        if (selectedGroupMembers.length < 2) {
+            showError("Select at least two Sonos speakers.");
+            return;
+        }
+        showConfigForm("group", null);
     }
 
     function renderStep2Local() {
@@ -594,7 +686,7 @@
         html += '<span style="font-weight:600;color:#fff;">Configure speaker</span>';
         html += '</div>';
 
-        var rawName = device ? (device.friendly_name || "") : "";
+        var rawName = device ? (device.friendly_name || "") : (backend === "group" ? selectedGroupMembers.join(" + ") : "");
         // If friendly_name looks like it contains an IP, prefer model_name
         var defaultName = (/\d+\.\d+\.\d+\.\d+/.test(rawName) && device && device.model_name)
             ? device.model_name : rawName;
@@ -620,6 +712,8 @@
             html += '<input type="text" id="new-dlna-url" value="' + escapeHtml(defaultUrl) + '" placeholder="Leave empty for auto-discovery">';
             html += '</div>';
             html += '<div class="form-group"><label><input type="checkbox" id="new-fixed-vol" style="width:auto;display:inline;margin-right:6px;"> Fixed volume</label></div>';
+        } else if (backend === "group") {
+            html += '<p class="muted">Members: ' + escapeHtml(selectedGroupMembers.join(" + ")) + '</p>';
         } else if (backend === "local") {
             html += '<div class="form-group">';
             html += '<label>Audio device (leave blank for default)</label>';
@@ -639,7 +733,7 @@
 
         html += '<div class="button-group">';
         html += '<button id="add-speaker-submit" onclick="submitAddSpeaker()">Add Speaker</button>';
-        html += '<button class="button-secondary" onclick="' + (backend === "dlna" ? "selectBackend(\'dlna\')" : "selectBackend(\'local\')") + '">Back</button>';
+        html += '<button class="button-secondary" onclick="' + (backend === "dlna" ? "selectBackend(\'dlna\')" : backend === "group" ? "selectBackend(\'group\')" : "selectBackend(\'local\')") + '">Back</button>';
         html += '<button class="button-secondary" onclick="hideAddSpeaker()">Cancel</button>';
         html += '</div>';
 
@@ -658,12 +752,18 @@
         var deviceType = document.getElementById("new-device-type");
         var payload = {
             name: name,
-            backend: selectedBackend,
+            backend: selectedBackend === "group" ? "dlna" : selectedBackend,
             max_quality: quality ? quality.value : "auto",
             device_type: deviceType ? deviceType.value : "speaker",
         };
 
-        if (selectedBackend === "dlna") {
+        if (selectedBackend === "group") {
+            if (selectedGroupMembers.length < 2) {
+                showError("Select at least two Sonos speakers.");
+                return;
+            }
+            payload.group_members = selectedGroupMembers;
+        } else if (selectedBackend === "dlna") {
             var ipEl = document.getElementById("new-dlna-ip");
             var ip = ipEl ? ipEl.value.trim() : "";
             if (!ip) {
@@ -728,7 +828,7 @@
         fetchStatus();
     }
 
-    function submitEditSpeaker(id, backend) {
+    function submitEditSpeaker(id, backend, isGroup) {
         var nameEl = document.getElementById("edit-name");
         var name = nameEl ? nameEl.value.trim() : "";
         if (!name) {
@@ -744,7 +844,20 @@
         var deviceType = document.getElementById("edit-device-type");
         if (deviceType) payload.device_type = deviceType.value;
 
-        if (backend === "dlna") {
+        if (isGroup) {
+            var existing = [];
+            for (var i = 0; i < latestSpeakers.length; i++) {
+                if (latestSpeakers[i].id === id && latestSpeakers[i].config) {
+                    existing = latestSpeakers[i].config.group_members || [];
+                }
+            }
+            var members = collectCheckedGroupMembers("edit-group-members", existing);
+            if (members.length < 2) {
+                showError("Select at least two Sonos speakers.");
+                return;
+            }
+            payload.group_members = members;
+        } else if (backend === "dlna") {
             var ipEl = document.getElementById("edit-dlna-ip");
             var portEl = document.getElementById("edit-dlna-port");
             var urlEl = document.getElementById("edit-dlna-url");
@@ -864,6 +977,7 @@
                 }
 
                 if (auth.authenticated && data.speakers) {
+                    latestSpeakers = data.speakers;
                     updateSpeakers(data.speakers);
                 } else if (!auth.authenticated) {
                     lastSpeakersJson = null;
@@ -887,6 +1001,7 @@
     window.showAddSpeaker = showAddSpeaker;
     window.hideAddSpeaker = hideAddSpeaker;
     window.selectBackend = selectBackend;
+    window.continueGroupConfig = continueGroupConfig;
     window.selectDLNADevice = selectDLNADevice;
     window.selectLocalDevice = selectLocalDevice;
     window.selectManualDevice = selectManualDevice;

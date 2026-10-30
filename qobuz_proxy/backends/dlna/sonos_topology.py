@@ -51,10 +51,46 @@ class SonosZoneMember:
     zone_name: str
     invisible: bool
     is_stereo_pair: bool
+    coordinator_uuid: str = ""
+
+
+@dataclass
+class SonosZoneGroup:
+    """A Sonos zone group: coordinator plus member UUIDs."""
+
+    coordinator_uuid: str
+    member_uuids: list[str]
 
 
 def _is_sonos(manufacturer: str) -> bool:
     return "sonos" in manufacturer.lower()
+
+
+async def fetch_sonos_topology_from_host(
+    ip: str,
+    port: int = 1400,
+    timeout: float = 5.0,
+) -> dict[str, SonosZoneMember] | None:
+    """Fetch household topology from a single Sonos player."""
+    url = f"http://{ip}:{port}{ZONE_GROUP_TOPOLOGY_PATH}"
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        try:
+            async with session.post(
+                url,
+                data=_GET_ZONE_GROUP_STATE_BODY,
+                headers={
+                    "SOAPACTION": f'"{ZONE_GROUP_TOPOLOGY_SERVICE}#GetZoneGroupState"',
+                    "Content-Type": 'text/xml; charset="utf-8"',
+                },
+            ) as response:
+                if response.status != 200:
+                    logger.debug(f"GetZoneGroupState on {ip} returned {response.status}")
+                    return None
+                return parse_zone_group_state(await response.text())
+        except Exception as e:
+            logger.debug(f"GetZoneGroupState on {ip} failed: {e}")
+            return None
 
 
 async def fetch_sonos_topology(
@@ -71,27 +107,10 @@ async def fetch_sonos_topology(
     if not sonos_devices:
         return None
 
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        for device in sonos_devices:
-            url = f"http://{device.ip}:{device.port}{ZONE_GROUP_TOPOLOGY_PATH}"
-            try:
-                async with session.post(
-                    url,
-                    data=_GET_ZONE_GROUP_STATE_BODY,
-                    headers={
-                        "SOAPACTION": f'"{ZONE_GROUP_TOPOLOGY_SERVICE}#GetZoneGroupState"',
-                        "Content-Type": 'text/xml; charset="utf-8"',
-                    },
-                ) as response:
-                    if response.status != 200:
-                        logger.debug(f"GetZoneGroupState on {device.ip} returned {response.status}")
-                        continue
-                    topology = parse_zone_group_state(await response.text())
-                    if topology:
-                        return topology
-            except Exception as e:
-                logger.debug(f"GetZoneGroupState on {device.ip} failed: {e}")
+    for device in sonos_devices:
+        topology = await fetch_sonos_topology_from_host(device.ip, device.port, timeout=timeout)
+        if topology:
+            return topology
 
     logger.debug("No Sonos device answered GetZoneGroupState")
     return None
@@ -113,23 +132,43 @@ def parse_zone_group_state(soap_response: str) -> dict[str, SonosZoneMember] | N
         root = ET.fromstring(state_elem.text)
 
         members: dict[str, SonosZoneMember] = {}
+        zone_groups = list(root.iter("ZoneGroup"))
+        if not zone_groups:
+            zone_groups = [root]
         # Satellite elements (home theater surrounds/sub) carry the same
         # attributes as ZoneGroupMember and are Invisible too
-        for elem in list(root.iter("ZoneGroupMember")) + list(root.iter("Satellite")):
-            uuid = elem.get("UUID", "")
-            if not uuid:
-                continue
-            members[uuid] = SonosZoneMember(
-                uuid=uuid,
-                zone_name=elem.get("ZoneName", ""),
-                invisible=elem.get("Invisible") == "1",
-                is_stereo_pair=bool(elem.get("ChannelMapSet")),
-            )
+        for group in zone_groups:
+            coordinator = group.get("Coordinator", "")
+            for elem in list(group.iter("ZoneGroupMember")) + list(group.iter("Satellite")):
+                uuid = elem.get("UUID", "")
+                if not uuid:
+                    continue
+                members[uuid] = SonosZoneMember(
+                    uuid=uuid,
+                    zone_name=elem.get("ZoneName", ""),
+                    invisible=elem.get("Invisible") == "1",
+                    is_stereo_pair=bool(elem.get("ChannelMapSet")),
+                    coordinator_uuid=coordinator or uuid,
+                )
         return members or None
 
     except ET.ParseError as e:
         logger.debug(f"Error parsing ZoneGroupState XML: {e}")
         return None
+
+
+def sonos_groups_from_topology(
+    topology: dict[str, SonosZoneMember],
+) -> list[SonosZoneGroup]:
+    """Collapse topology members into coordinator + member UUID lists."""
+    grouped: dict[str, list[str]] = {}
+    for member in topology.values():
+        coordinator = member.coordinator_uuid or member.uuid
+        grouped.setdefault(coordinator, []).append(member.uuid)
+    return [
+        SonosZoneGroup(coordinator_uuid=coordinator, member_uuids=uuids)
+        for coordinator, uuids in grouped.items()
+    ]
 
 
 def enrich_discovered_devices(
@@ -164,7 +203,10 @@ def enrich_discovered_devices(
 
 __all__ = [
     "SonosZoneMember",
+    "SonosZoneGroup",
     "fetch_sonos_topology",
+    "fetch_sonos_topology_from_host",
     "parse_zone_group_state",
+    "sonos_groups_from_topology",
     "enrich_discovered_devices",
 ]

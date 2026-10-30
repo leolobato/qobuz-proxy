@@ -416,6 +416,11 @@ p {
     color: #b07ab0;
 }
 
+.badge-group {
+    background: #1a2a1a;
+    color: #7dbe7d;
+}
+
 .speaker-track {
     color: #e0e0e0;
     font-size: 14px;
@@ -531,6 +536,7 @@ p {
 
 .backend-cards {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 12px;
 }

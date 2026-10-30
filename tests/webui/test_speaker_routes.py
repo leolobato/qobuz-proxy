@@ -145,6 +145,21 @@ class TestSpeakerCRUD:
         resp = await client.post("/api/speakers", json={"name": "Test", "backend": "dlna"})
         assert resp.status == 400
 
+    async def test_add_group_speaker_without_dlna_ip(self, client: TestClient) -> None:
+        client.app["on_add_speaker"] = AsyncMock(
+            return_value={"id": "downstairs", "name": "Downstairs", "is_group": True}
+        )
+        resp = await client.post(
+            "/api/speakers",
+            json={
+                "name": "Downstairs",
+                "backend": "dlna",
+                "group_members": ["Kitchen", "Dining"],
+            },
+        )
+        assert resp.status == 201
+        client.app["on_add_speaker"].assert_awaited_once()
+
     async def test_add_speaker_callback_error(self, client: TestClient) -> None:
         client.app["on_add_speaker"] = AsyncMock(side_effect=ValueError("Duplicate speaker name"))
         resp = await client.post(

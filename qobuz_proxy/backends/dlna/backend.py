@@ -19,6 +19,8 @@ from qobuz_proxy.backends.types import (
     BufferStatus,
     PlaybackState,
 )
+from qobuz_proxy.config import GroupMemberEndpoint
+
 from .client import DLNAClient, DLNAClientError, SoapResult
 from .capabilities import (
     DLNACapabilities,
@@ -93,6 +95,7 @@ class DLNABackend(AudioBackend):
         fixed_volume: bool = False,
         name: Optional[str] = None,
         description_url: Optional[str] = None,
+        group_members: Optional[list[GroupMemberEndpoint]] = None,
     ):
         """
         Initialize DLNA backend.
@@ -103,12 +106,14 @@ class DLNABackend(AudioBackend):
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
+            group_members: Additional Sonos rooms to join before playback
         """
         super().__init__(name or f"DLNA ({ip})")
         self._ip = ip
         self._port = port
         self._fixed_volume = fixed_volume
         self._description_url = description_url
+        self._group_members = list(group_members or [])
 
         self._client: Optional[DLNAClient] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -421,6 +426,11 @@ class DLNABackend(AudioBackend):
         # Build DIDL-Lite metadata
         didl = self._build_didl(actual_url, metadata, content_type)
 
+        if self._group_members:
+            await self._ensure_grouped()
+        elif self._is_sonos:
+            await self._ensure_ungrouped()
+
         # Start playback — Sonos uses queue for proper app metadata display
         if self._is_sonos:
             success = await self._play_via_queue(actual_url, didl)
@@ -500,6 +510,80 @@ class DLNABackend(AudioBackend):
 
         self._notify_playback_error("Failed to play from queue")
         return False
+
+    async def _fetch_topology(self):
+        """Fetch Sonos household topology from this renderer."""
+        from .sonos_topology import fetch_sonos_topology_from_host
+
+        return await fetch_sonos_topology_from_host(self._ip, self._port)
+
+    async def _ensure_grouped(self) -> None:
+        """Join configured members to this coordinator before group playback."""
+        if not self._client:
+            return
+        coordinator_uid = self._client.root_device_uid()
+        if not coordinator_uid:
+            logger.warning("Cannot form Sonos group: coordinator UUID unknown")
+            return
+
+        grouped_uids: set[str] = set()
+        topology = await self._fetch_topology()
+        if topology:
+            grouped_uids = {
+                member.uuid
+                for member in topology.values()
+                if member.coordinator_uuid == coordinator_uid
+            }
+
+        for member in self._group_members:
+            client = DLNAClient(
+                member.ip,
+                member.port,
+                description_url=member.description_url or None,
+            )
+            try:
+                await client.connect()
+                member_uid = client.root_device_uid()
+                if member_uid and member_uid in grouped_uids:
+                    continue
+                if await client.join_group(coordinator_uid):
+                    logger.info(
+                        "Joined %s to Sonos group %s",
+                        member.name or member.ip,
+                        coordinator_uid,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to join %s to Sonos group %s",
+                        member.name or member.ip,
+                        coordinator_uid,
+                    )
+            except Exception as exc:
+                logger.warning("Could not join group member %s: %s", member.ip, exc)
+            finally:
+                await client.disconnect()
+
+    async def _ensure_ungrouped(self) -> None:
+        """Leave a multi-room group before playing to this speaker alone."""
+        if not self._client:
+            return
+        uid = self._client.root_device_uid()
+        topology = await self._fetch_topology()
+        if not topology or not uid:
+            return
+        member = topology.get(uid)
+        if member is None:
+            return
+        coordinator = member.coordinator_uuid or uid
+        visible = [
+            item
+            for item in topology.values()
+            if item.coordinator_uuid == coordinator and not item.invisible
+        ]
+        if len(visible) <= 1:
+            return
+        if await self._client.unjoin():
+            logger.info("Ungrouped %s from Sonos group", self.name)
 
     async def pause(self) -> None:
         """Pause playback."""
@@ -586,7 +670,10 @@ class DLNABackend(AudioBackend):
 
         clamped = max(0, min(100, level))
         if self._client:
-            await self._client.set_volume(clamped)
+            if self._group_members:
+                await self._client.set_group_volume(clamped)
+            else:
+                await self._client.set_volume(clamped)
             self._volume = clamped
 
     async def get_volume(self) -> int:
@@ -595,7 +682,11 @@ class DLNABackend(AudioBackend):
             return 100
 
         if self._client:
-            vol = await self._client.get_volume()
+            vol = (
+                await self._client.get_group_volume()
+                if self._group_members
+                else await self._client.get_volume()
+            )
             if vol is not None:
                 self._volume = vol
         return self._volume

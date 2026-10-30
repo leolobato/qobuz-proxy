@@ -662,3 +662,15 @@ class TestQualitySourceStatus:
         assert cfg["max_quality"] == 27
         assert cfg["effective_quality"] == 27
         assert cfg["quality_source"] == "manual"
+
+    def test_group_status_lists_members(self):
+        config = _make_speaker_config(
+            name="Downstairs",
+            group_members=["Kitchen", "Dining"],
+        )
+        speaker = Speaker(config=config, api_client=_make_api_client(), app_id="id")
+        status = speaker.get_status()
+
+        assert status["is_group"] is True
+        assert status["config"]["group_members"] == ["Kitchen", "Dining"]
+        assert "dlna_ip" not in status["config"]
