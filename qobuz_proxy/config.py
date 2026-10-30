@@ -114,6 +114,16 @@ class DeviceConfig:
 
 
 @dataclass
+class GroupMemberEndpoint:
+    """Resolved DLNA endpoint for a Sonos group member (not persisted)."""
+
+    name: str
+    ip: str
+    port: int = 1400
+    description_url: str = ""
+
+
+@dataclass
 class DLNAConfig:
     """DLNA backend configuration."""
 
@@ -122,6 +132,7 @@ class DLNAConfig:
     fixed_volume: bool = False
     proxy_port: int = 7120
     description_url: str = ""  # Full URL to UPnP device description XML (auto-discovered via SSDP)
+    group_member_endpoints: list[GroupMemberEndpoint] = field(default_factory=list)
 
 
 @dataclass
@@ -174,6 +185,15 @@ class SpeakerConfig:
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
     audio_buffer_size: int = 2048
+    # Names of member speakers. First is the Sonos group coordinator.
+    group_members: list[str] = field(default_factory=list)
+    # Resolved member endpoints (derived, not written to YAML).
+    group_member_endpoints: list[GroupMemberEndpoint] = field(default_factory=list)
+
+    @property
+    def is_group(self) -> bool:
+        """True when this speaker is a virtual Sonos group target."""
+        return bool(self.group_members)
 
 
 @dataclass
@@ -281,7 +301,8 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
 
     Ports are omitted so they can be re-assigned on next startup. The Qobuz
     Connect device UUID is persisted so the same speaker identity survives
-    restarts (including Docker hostname changes).
+    restarts (including Docker hostname changes). Group speakers persist
+    member names; coordinator DLNA fields are derived.
     """
     d: dict = {
         "name": sc.name,
@@ -292,7 +313,9 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
         d["uuid"] = sc.uuid
     if sc.device_type != DEFAULT_DEVICE_TYPE:
         d["device_type"] = sc.device_type
-    if sc.backend_type == "dlna":
+    if sc.group_members:
+        d["group_members"] = list(sc.group_members)
+    elif sc.backend_type == "dlna":
         d["dlna_ip"] = sc.dlna_ip
         d["dlna_port"] = sc.dlna_port
         d["dlna_fixed_volume"] = sc.dlna_fixed_volume
@@ -302,6 +325,52 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
         d["audio_device"] = sc.audio_device
         d["audio_buffer_size"] = sc.audio_buffer_size
     return d
+
+
+def _normalize_group_members(value: Any) -> list[str]:
+    """Normalize YAML/API group_members into a list of names."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def find_speaker_by_ref(speakers: list[SpeakerConfig], ref: str) -> Optional[SpeakerConfig]:
+    """Find a speaker by exact name or slug."""
+    if not ref:
+        return None
+    ref_slug = slugify_name(ref)
+    for speaker in speakers:
+        if speaker.name == ref or slugify_name(speaker.name) == ref_slug:
+            return speaker
+    return None
+
+
+def _resolve_group_speakers(speakers: list[SpeakerConfig]) -> None:
+    """Copy coordinator DLNA settings onto group speakers and resolve members."""
+    for speaker in speakers:
+        if not speaker.group_members:
+            speaker.group_member_endpoints = []
+            continue
+        coordinator = find_speaker_by_ref(speakers, speaker.group_members[0])
+        if coordinator and coordinator.dlna_ip:
+            speaker.dlna_ip = coordinator.dlna_ip
+            speaker.dlna_port = coordinator.dlna_port
+            speaker.dlna_description_url = coordinator.dlna_description_url
+        endpoints: list[GroupMemberEndpoint] = []
+        for ref in speaker.group_members[1:]:
+            member = find_speaker_by_ref(speakers, ref)
+            if member and member.dlna_ip:
+                endpoints.append(
+                    GroupMemberEndpoint(
+                        name=member.name,
+                        ip=member.dlna_ip,
+                        port=member.dlna_port,
+                        description_url=member.dlna_description_url,
+                    )
+                )
+        speaker.group_member_endpoints = endpoints
 
 
 def _single_speaker_from_config(config: Config) -> SpeakerConfig:
@@ -389,7 +458,9 @@ def _validate_speakers(speakers: list[SpeakerConfig]) -> None:
     # Per-speaker field validation
     errors = []
     for s in speakers:
-        if s.backend_type == "dlna" and not s.dlna_ip:
+        if s.group_members:
+            errors.extend(_group_member_errors(s, speakers))
+        elif s.backend_type == "dlna" and not s.dlna_ip:
             errors.append(f"Speaker '{s.name}': DLNA IP address is required")
         if s.backend_type not in ("dlna", "local", "stub"):
             errors.append(f"Speaker '{s.name}': unknown backend type '{s.backend_type}'")
@@ -399,6 +470,41 @@ def _validate_speakers(speakers: list[SpeakerConfig]) -> None:
             errors.append(f"Speaker '{s.name}': invalid proxy port {s.proxy_port}")
     if errors:
         raise ConfigError("Speaker validation failed:\n  - " + "\n  - ".join(errors))
+
+
+def _group_member_errors(speaker: SpeakerConfig, speakers: list[SpeakerConfig]) -> list[str]:
+    """Return validation errors for a Sonos group speaker."""
+    errors: list[str] = []
+    if speaker.backend_type != "dlna":
+        errors.append(f"Speaker '{speaker.name}': groups must use the dlna backend")
+    if len(speaker.group_members) < 2:
+        errors.append(f"Speaker '{speaker.name}': group_members needs at least two speakers")
+
+    seen: set[str] = set()
+    for ref in speaker.group_members:
+        member = find_speaker_by_ref(speakers, ref)
+        if member is None:
+            errors.append(f"Speaker '{speaker.name}': unknown group member '{ref}'")
+            continue
+        member_key = slugify_name(member.name)
+        if member_key == slugify_name(speaker.name):
+            errors.append(f"Speaker '{speaker.name}': a group cannot include itself")
+            continue
+        if member_key in seen:
+            errors.append(f"Speaker '{speaker.name}': duplicate group member '{ref}'")
+            continue
+        seen.add(member_key)
+        if member.group_members:
+            errors.append(
+                f"Speaker '{speaker.name}': cannot nest group '{member.name}' inside another group"
+            )
+        elif member.backend_type != "dlna":
+            errors.append(
+                f"Speaker '{speaker.name}': group member '{member.name}' is not a DLNA speaker"
+            )
+    if speaker.backend_type == "dlna" and not speaker.dlna_ip:
+        errors.append(f"Speaker '{speaker.name}': could not resolve coordinator DLNA IP")
+    return errors
 
 
 def _parse_quality_value(value: Any) -> int:
@@ -427,6 +533,7 @@ def _parse_yaml_speakers(raw_speakers: list[dict], config: Config) -> list[Speak
             proxy_port=int(raw.get("proxy_port", 0)),
             audio_device=raw.get("audio_device", "default"),
             audio_buffer_size=int(raw.get("audio_buffer_size", 2048)),
+            group_members=_normalize_group_members(raw.get("group_members")),
         )
         speakers.append(speaker)
     return speakers
@@ -522,6 +629,7 @@ def build_speaker_configs(
 
     _assign_ports(speakers, webui_port=config.server.http_port)
     _generate_uuids(speakers)
+    _resolve_group_speakers(speakers)
     _validate_speakers(speakers)
 
     return speakers

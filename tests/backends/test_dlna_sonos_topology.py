@@ -10,6 +10,7 @@ from qobuz_proxy.backends.dlna.sonos_topology import (
     enrich_discovered_devices,
     fetch_sonos_topology,
     parse_zone_group_state,
+    sonos_groups_from_topology,
 )
 
 # Modeled on a real GetZoneGroupState response (S2 firmware 95.1-78010):
@@ -46,6 +47,23 @@ ZONE_GROUP_STATE = """<ZoneGroupState><ZoneGroups>
   <ZoneGroupMember UUID="RINCON_BOOST"
     Location="http://10.0.1.133:1400/xml/device_description.xml"
     ZoneName="Boost" Invisible="1" IsZoneBridge="1"/>
+</ZoneGroup>
+</ZoneGroups></ZoneGroupState>"""
+
+# Kitchen (stereo pair coordinator) grouped with Bedroom.
+MULTI_ROOM_ZONE_GROUP_STATE = """<ZoneGroupState><ZoneGroups>
+<ZoneGroup Coordinator="RINCON_KITCHEN_LF" ID="RINCON_KITCHEN_LF:2">
+  <ZoneGroupMember UUID="RINCON_KITCHEN_LF"
+    Location="http://10.0.1.30:1400/xml/device_description.xml"
+    ZoneName="Kitchen"
+    ChannelMapSet="RINCON_KITCHEN_LF:LF,LF;RINCON_KITCHEN_RF:RF,RF"/>
+  <ZoneGroupMember UUID="RINCON_KITCHEN_RF"
+    Location="http://10.0.1.33:1400/xml/device_description.xml"
+    ZoneName="Kitchen" Invisible="1"
+    ChannelMapSet="RINCON_KITCHEN_LF:LF,LF;RINCON_KITCHEN_RF:RF,RF"/>
+  <ZoneGroupMember UUID="RINCON_BEDROOM"
+    Location="http://10.0.1.31:1400/xml/device_description.xml"
+    ZoneName="Bedroom"/>
 </ZoneGroup>
 </ZoneGroups></ZoneGroupState>"""
 
@@ -123,6 +141,28 @@ class TestParseZoneGroupState:
 
     def test_invalid_xml_returns_none(self) -> None:
         assert parse_zone_group_state("not xml at all") is None
+
+    def test_members_keep_group_coordinator(self) -> None:
+        topology = parse_zone_group_state(soap_response(ZONE_GROUP_STATE))
+
+        assert topology is not None
+        assert topology["RINCON_KITCHEN_LF"].coordinator_uuid == "RINCON_KITCHEN_LF"
+        assert topology["RINCON_KITCHEN_RF"].coordinator_uuid == "RINCON_KITCHEN_LF"
+        assert topology["RINCON_BEDROOM"].coordinator_uuid == "RINCON_BEDROOM"
+
+    def test_multi_room_group_shares_coordinator(self) -> None:
+        topology = parse_zone_group_state(soap_response(MULTI_ROOM_ZONE_GROUP_STATE))
+
+        assert topology is not None
+        assert topology["RINCON_BEDROOM"].coordinator_uuid == "RINCON_KITCHEN_LF"
+        groups = sonos_groups_from_topology(topology)
+        assert len(groups) == 1
+        assert groups[0].coordinator_uuid == "RINCON_KITCHEN_LF"
+        assert set(groups[0].member_uuids) == {
+            "RINCON_KITCHEN_LF",
+            "RINCON_KITCHEN_RF",
+            "RINCON_BEDROOM",
+        }
 
     def test_empty_zone_group_state_returns_none(self) -> None:
         assert parse_zone_group_state(soap_response("")) is None

@@ -41,6 +41,8 @@ class TestSpeakerConfigDefaults:
         assert s.proxy_port == 0
         assert s.audio_device == "default"
         assert s.audio_buffer_size == 2048
+        assert s.group_members == []
+        assert s.is_group is False
 
     def test_custom_construction(self):
         s = SpeakerConfig(
@@ -325,6 +327,84 @@ class TestSpeakerValidation:
         with pytest.raises(ConfigError, match="unknown backend type"):
             _validate_speakers(speakers)
 
+    def test_group_requires_two_members(self):
+        speakers = [
+            SpeakerConfig(name="Kitchen", http_port=8690, proxy_port=7120, dlna_ip="10.0.1.30"),
+            SpeakerConfig(
+                name="Downstairs",
+                http_port=8691,
+                proxy_port=7121,
+                group_members=["Kitchen"],
+            ),
+        ]
+        with pytest.raises(ConfigError, match="at least two speakers"):
+            _validate_speakers(speakers)
+
+    def test_group_unknown_member_rejected(self):
+        speakers = [
+            SpeakerConfig(name="Kitchen", http_port=8690, proxy_port=7120, dlna_ip="10.0.1.30"),
+            SpeakerConfig(
+                name="Downstairs",
+                http_port=8691,
+                proxy_port=7121,
+                dlna_ip="10.0.1.30",
+                group_members=["Kitchen", "Dining"],
+            ),
+        ]
+        with pytest.raises(ConfigError, match="unknown group member"):
+            _validate_speakers(speakers)
+
+    def test_group_nested_group_rejected(self):
+        speakers = [
+            SpeakerConfig(name="Kitchen", http_port=8690, proxy_port=7120, dlna_ip="10.0.1.30"),
+            SpeakerConfig(name="Dining", http_port=8691, proxy_port=7121, dlna_ip="10.0.1.31"),
+            SpeakerConfig(
+                name="Downstairs",
+                http_port=8692,
+                proxy_port=7122,
+                dlna_ip="10.0.1.30",
+                group_members=["Kitchen", "Dining"],
+            ),
+            SpeakerConfig(
+                name="Whole House",
+                http_port=8693,
+                proxy_port=7123,
+                dlna_ip="10.0.1.30",
+                group_members=["Downstairs", "Kitchen"],
+            ),
+        ]
+        with pytest.raises(ConfigError, match="cannot nest group"):
+            _validate_speakers(speakers)
+
+    def test_group_local_member_rejected(self):
+        speakers = [
+            SpeakerConfig(name="Kitchen", http_port=8690, proxy_port=7120, dlna_ip="10.0.1.30"),
+            SpeakerConfig(name="Headphones", backend_type="local", http_port=8691),
+            SpeakerConfig(
+                name="Downstairs",
+                http_port=8692,
+                proxy_port=7122,
+                dlna_ip="10.0.1.30",
+                group_members=["Kitchen", "Headphones"],
+            ),
+        ]
+        with pytest.raises(ConfigError, match="not a DLNA speaker"):
+            _validate_speakers(speakers)
+
+    def test_valid_group_passes(self):
+        speakers = [
+            SpeakerConfig(name="Kitchen", http_port=8690, proxy_port=7120, dlna_ip="10.0.1.30"),
+            SpeakerConfig(name="Dining", http_port=8691, proxy_port=7121, dlna_ip="10.0.1.31"),
+            SpeakerConfig(
+                name="Downstairs",
+                http_port=8692,
+                proxy_port=7122,
+                dlna_ip="10.0.1.30",
+                group_members=["Kitchen", "Dining"],
+            ),
+        ]
+        _validate_speakers(speakers)
+
     def test_valid_speakers_pass(self):
         speakers = [
             SpeakerConfig(name="A", http_port=8689, proxy_port=7120, dlna_ip="192.168.1.50"),
@@ -379,6 +459,27 @@ backend:
         speakers = build_speaker_configs(config, raw_yaml_speakers=raw_yaml)
         assert len(speakers) == 1
         assert speakers[0].name == "YAML Speaker"
+
+    def test_yaml_group_resolves_coordinator_ip(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+speakers:
+  - name: Kitchen
+    backend: dlna
+    dlna_ip: 10.0.1.30
+  - name: Dining
+    backend: dlna
+    dlna_ip: 10.0.1.31
+  - name: Downstairs
+    backend: dlna
+    group_members: [Kitchen, Dining]
+""")
+        config = load_config(config_path=config_file)
+        group = config.speakers[2]
+        assert group.is_group
+        assert group.dlna_ip == "10.0.1.30"
+        assert group.group_member_endpoints[0].ip == "10.0.1.31"
+        assert group.group_member_endpoints[0].name == "Dining"
 
     def test_build_speaker_configs_env_over_flat(self, monkeypatch):
         monkeypatch.setenv("QOBUZPROXY_DEVICE_NAME", "Env A,Env B")

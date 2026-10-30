@@ -757,6 +757,68 @@ class TestSpeakerEditCallbacks:
         with pytest.raises(KeyError):
             await app._on_remove_speaker("nope")
 
+    async def test_add_group_resolves_coordinator(self):
+        config = _make_config(
+            _make_speaker_config(
+                name="Kitchen", http_port=8690, dlna_ip="10.0.1.30", proxy_port=7120
+            ),
+            _make_speaker_config(
+                name="Dining", http_port=8691, dlna_ip="10.0.1.31", proxy_port=7121
+            ),
+        )
+        kitchen = MagicMock()
+        kitchen.name = "Kitchen"
+        kitchen._config = config.speakers[0]
+        dining = MagicMock()
+        dining.name = "Dining"
+        dining._config = config.speakers[1]
+
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [kitchen, dining]
+
+        new_speaker = MagicMock()
+        new_speaker.name = "Downstairs"
+        new_speaker.start = AsyncMock(return_value=True)
+        new_speaker.get_status.return_value = {"id": "downstairs", "is_group": True}
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_add_speaker(
+                {"name": "Downstairs", "group_members": ["Kitchen", "Dining"]}
+            )
+
+        group = config.speakers[-1]
+        assert group.group_members == ["Kitchen", "Dining"]
+        assert group.dlna_ip == "10.0.1.30"
+        assert group.group_member_endpoints[0].ip == "10.0.1.31"
+
+    async def test_remove_group_member_rejected(self):
+        import pytest
+
+        kitchen = _make_speaker_config(
+            name="Kitchen", http_port=8690, dlna_ip="10.0.1.30", proxy_port=7120
+        )
+        dining = _make_speaker_config(
+            name="Dining", http_port=8691, dlna_ip="10.0.1.31", proxy_port=7121
+        )
+        group = _make_speaker_config(
+            name="Downstairs",
+            http_port=8692,
+            dlna_ip="10.0.1.30",
+            proxy_port=7122,
+            group_members=["Kitchen", "Dining"],
+        )
+        config = _make_config(kitchen, dining, group)
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = []
+
+        with pytest.raises(ValueError, match="used by group"):
+            await app._on_remove_speaker("kitchen")
+
 
 class TestSpeakersApiListsConfig:
     def test_lists_configured_speakers_that_are_not_running(self):

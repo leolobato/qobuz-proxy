@@ -255,6 +255,13 @@ class TestSpeakerConfigToDict:
         d = speaker_config_to_dict(sc)
         assert d["max_quality"] == "auto"
 
+    def test_group_speaker_serializes_members_not_dlna_ip(self) -> None:
+        sc = self._make_dlna_speaker(name="Downstairs", group_members=["Kitchen", "Dining"])
+        d = speaker_config_to_dict(sc)
+        assert d["group_members"] == ["Kitchen", "Dining"]
+        assert "dlna_ip" not in d
+        assert "dlna_port" not in d
+
     def test_numeric_quality_stays_as_int(self) -> None:
         sc = self._make_dlna_speaker(max_quality=6)
         d = speaker_config_to_dict(sc)

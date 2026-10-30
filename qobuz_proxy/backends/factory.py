@@ -7,7 +7,7 @@ Provides factory methods to instantiate backends by type name.
 import logging
 from typing import Optional
 
-from qobuz_proxy.config import Config
+from qobuz_proxy.config import Config, GroupMemberEndpoint
 
 from .base import AudioBackend
 from .dlna import DLNABackend
@@ -80,6 +80,7 @@ class BackendFactory:
                 ip=config.backend.dlna.ip,
                 port=config.backend.dlna.port or 1400,
                 description_url=description_url,
+                group_members=list(config.backend.dlna.group_member_endpoints),
             )
         elif backend_type == "local":
             return await cls.create_local(
@@ -98,6 +99,7 @@ class BackendFactory:
         fixed_volume: bool = False,
         name: Optional[str] = None,
         description_url: Optional[str] = None,
+        group_members: Optional[list[GroupMemberEndpoint]] = None,
     ) -> AudioBackend:
         """
         Create a DLNA backend.
@@ -108,6 +110,7 @@ class BackendFactory:
             fixed_volume: If True, ignore volume commands
             name: Display name (auto-detected if not provided)
             description_url: Full URL to UPnP device description XML
+            group_members: Additional Sonos rooms to join before playback
 
         Returns:
             Connected DLNABackend instance
@@ -121,6 +124,7 @@ class BackendFactory:
             fixed_volume=fixed_volume,
             name=name,
             description_url=description_url,
+            group_members=group_members,
         )
         if await backend.connect():
             return backend
