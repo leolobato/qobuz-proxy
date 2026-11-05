@@ -252,6 +252,38 @@ class TestMultiSpeakerOrchestration:
             still_bad.start.assert_awaited_once()
             good.start.assert_awaited_once()
 
+    async def test_retry_stops_once_speaker_is_running(self):
+        """A retry finding its speaker already running (started by another path,
+        e.g. a second login) ends instead of starting a duplicate whose port
+        bind can never succeed."""
+        sc1 = _make_speaker_config("Living Room")
+        config = _make_config(sc1)
+
+        bad = _make_mock_speaker("Living Room", starts=False)
+        running = _make_mock_speaker("Living Room", starts=True)
+        duplicate = _make_mock_speaker("Living Room", starts=True)
+
+        with (
+            patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
+            patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
+            patch("qobuz_proxy.app.QobuzAPIClient") as MockAPIClient,
+            patch("qobuz_proxy.app.Speaker", side_effect=[bad, duplicate]),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0.01,)),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_STEADY_DELAY_SECONDS", 0.01),
+        ):
+            MockAPIClient.return_value.login_with_token = AsyncMock(return_value=True)
+
+            app = QobuzProxy(config)
+            await app.start()
+            retry_task = app._speaker_retry_tasks["living-room"]
+
+            app._speakers.append(running)
+            await asyncio.wait_for(retry_task, timeout=2.0)
+
+            assert app._speakers == [running]
+            assert app._speaker_retry_tasks == {}
+            duplicate.start.assert_not_awaited()
+
     async def test_stop_cancels_pending_retries(self):
         """Shutting down cancels background speaker retries."""
         sc1 = _make_speaker_config("Living Room")
@@ -446,6 +478,41 @@ class TestWebUICallbacks:
             assert app._auth_state["authenticated"] is True
             assert app._auth_state["user_id"] == "42"
             assert len(app._speakers) == 1
+
+    async def test_concurrent_logins_start_speaker_once(self):
+        """A second OAuth callback landing while the first login is still
+        starting the speaker must not start it again: the duplicate would fail
+        to bind the discovery port and leave a retry loop behind."""
+        config = Config()
+        config.speakers = [_make_speaker_config()]
+
+        async def slow_start() -> bool:
+            await asyncio.sleep(0.05)  # mDNS registration takes ~1-2 s for real
+            return True
+
+        first = _make_mock_speaker("Test Speaker", starts=True)
+        first.start = AsyncMock(side_effect=slow_start)
+        duplicate = _make_mock_speaker("Test Speaker", starts=False)
+
+        with (
+            patch.object(QobuzProxy, "_start_web_server", new_callable=AsyncMock),
+            patch.object(QobuzProxy, "_stop_web_server", new_callable=AsyncMock),
+            patch("qobuz_proxy.app.load_user_token", return_value=None),
+            patch("qobuz_proxy.app.QobuzAPIClient"),
+            patch("qobuz_proxy.app.Speaker", side_effect=[first, duplicate]),
+            patch("qobuz_proxy.app.save_user_token", return_value=True),
+        ):
+            app = QobuzProxy(config)
+            await app.start()
+
+            await asyncio.gather(
+                app._on_auth_token("42", "valid_token"),
+                app._on_auth_token("42", "valid_token"),
+            )
+
+            assert app._speakers == [first]
+            assert app._speaker_retry_tasks == {}
+            duplicate.start.assert_not_awaited()
 
     async def test_on_logout_stops_speakers_and_clears_state(self):
         """Logout stops speakers and resets auth state."""
