@@ -286,9 +286,14 @@ def build_protocol_info(
     """
     entry = caps.best_entry_for_media(mime, sr, bd)
     if entry:
-        # Re-emit exact Sink entry for compatibility
+        # Re-emit exact Sink entry for compatibility. Some renderers advertise a
+        # bare "*" with no DLNA.ORG_OP: re-emitting that makes them treat our
+        # range-capable stream as live (no Pause/Seek), so declare byte-range
+        # support in that case.
         add_str = (
-            ";".join(f"{k}={v}" for k, v in entry.additional.items()) if entry.additional else "*"
+            ";".join(f"{k}={v}" for k, v in entry.additional.items())
+            if entry.additional
+            else "DLNA.ORG_OP=01"
         )
         return f"{entry.protocol}:{entry.network}:{entry.content_format}:{add_str}"
     # Generic fallback

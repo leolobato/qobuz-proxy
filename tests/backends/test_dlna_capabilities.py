@@ -3,6 +3,7 @@
 from qobuz_proxy.backends.dlna.capabilities import (
     QOBUZ_QUALITY_CD,
     QOBUZ_QUALITY_MP3,
+    build_protocol_info,
     parse_protocol_info_sink,
 )
 
@@ -98,3 +99,18 @@ class TestFormatInfoConfirmed:
         caps = parse_protocol_info_sink(sink)
         assert caps.format_info_confirmed is True
         assert caps.max_quality == 7
+
+
+class TestBuildProtocolInfo:
+    """res@protocolInfo must tell the renderer our stream supports byte ranges."""
+
+    def test_bare_sink_entry_declares_range_support(self) -> None:
+        """A bare Sink ("*") echoed back makes the renderer treat the stream as
+        live and reject Pause/Seek, so declare DLNA.ORG_OP=01."""
+        caps = parse_protocol_info_sink(_entry("audio/flac"))
+        assert build_protocol_info(caps, "audio/flac") == "http-get:*:audio/flac:DLNA.ORG_OP=01"
+
+    def test_sink_entry_with_dlna_info_is_echoed_unchanged(self) -> None:
+        sink = "http-get:*:audio/flac:DLNA.ORG_PN=FLAC;DLNA.ORG_OP=01"
+        caps = parse_protocol_info_sink(sink)
+        assert build_protocol_info(caps, "audio/flac") == sink
