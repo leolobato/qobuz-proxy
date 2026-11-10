@@ -7,6 +7,7 @@ sequence to player.apply_remote_state(), which applies it atomically.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -394,3 +395,20 @@ class TestRendererOwnership:
         handler.note_disconnected()
         await stop
         assert player.state == PlaybackState.PLAYING
+
+    async def test_sentinel_current_item_is_ignored(self) -> None:
+        """Play on an empty Qobuz queue sends all-ones ids as currentQueueItem.
+        It must not be loaded as a real track (404, then an int32 overflow when
+        reporting the state back)."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        player.queue.get_current_track = AsyncMock(return_value=None)  # empty queue
+        player.queue.advance_to_next = AsyncMock(return_value=None)
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=0xFFFFFFFF, queue_item_id=0xFFFFFFFFFFFFFFFF)
+        )
+
+        player.metadata.get_streaming_url.assert_not_called()
+        assert backend.played == []
