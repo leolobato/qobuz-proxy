@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 # State polling interval
 STATE_POLL_INTERVAL_SECONDS = 2.0
 
+# In the last seconds of a track, poll faster so the natural end is noticed
+# (and the next track started) sooner. The window covers the normal interval
+# plus a renderer position that lags a little.
+NEAR_END_POLL_INTERVAL_SECONDS = 0.5
+NEAR_END_WINDOW_MS = 6_000
+
 # Grace period after starting playback to ignore STOPPED state (seconds)
 # This prevents false track-ended events while the device is loading
 PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
@@ -776,7 +782,7 @@ class DLNABackend(AudioBackend):
         """Poll device state periodically."""
         while self._is_connected:
             try:
-                await asyncio.sleep(STATE_POLL_INTERVAL_SECONDS)
+                await asyncio.sleep(self._next_poll_delay())
 
                 if not self._is_connected:
                     break
@@ -895,6 +901,15 @@ class DLNABackend(AudioBackend):
                 break
             except Exception as e:
                 logger.debug(f"State poll error: {e}")
+
+    def _next_poll_delay(self) -> float:
+        """Seconds to wait before the next state poll."""
+        near_end = (
+            self._state == PlaybackState.PLAYING
+            and self._duration_ms > 0
+            and self._duration_ms - self._furthest_position_ms <= NEAR_END_WINDOW_MS
+        )
+        return NEAR_END_POLL_INTERVAL_SECONDS if near_end else STATE_POLL_INTERVAL_SECONDS
 
     def _stopped_before_track_end(self) -> bool:
         """Whether a stop landed well before the end of a track that streamed fine.
