@@ -501,7 +501,13 @@ class QobuzPlayer:
             )
         ):
             return
-        gen = self._next_generation()
+        # A bare "PLAYING" SET_STATE (no track), which the app sends right after
+        # the one naming the track, must not supersede an older one that still has
+        # a track change to apply: the track would never load and a quick second
+        # skip would be silently lost. It queues behind it on the lock instead.
+        # Stop/pause without a track are new intents and still supersede.
+        bare_play = track_id is None and playing_state == 2
+        gen = self._command_generation if bare_play else self._next_generation()
         async with self._playback_lock:
             if gen != self._command_generation:
                 logger.debug("SET_STATE superseded by newer command; skipping")
