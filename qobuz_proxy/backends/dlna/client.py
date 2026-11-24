@@ -67,6 +67,10 @@ class DLNAClientError(Exception):
     pass
 
 
+class DLNAUnsupportedDeviceError(DLNAClientError):
+    """The device answered but cannot act as a renderer (no AVTransport)."""
+
+
 class DLNAClient:
     """
     Low-level DLNA/UPnP SOAP client.
@@ -113,7 +117,7 @@ class DLNAClient:
             # Try to fetch device description
             self.device_info = await self._fetch_device_description()
             if not self.device_info.av_transport_url:
-                raise DLNAClientError(
+                raise DLNAUnsupportedDeviceError(
                     f"Device at {self.ip}:{self.port} does not support AVTransport"
                 )
         except BaseException:

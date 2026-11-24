@@ -142,3 +142,26 @@ def test_poll_is_fast_only_near_the_end_of_a_playing_track(backend):
     backend._state = PlaybackState.PLAYING
     backend._duration_ms = 0  # unknown duration: keep the normal interval
     assert backend._next_poll_delay() == STATE_POLL_INTERVAL_SECONDS
+
+
+async def test_transitioning_then_stopped_at_the_end_is_a_track_end(backend, monkeypatch):
+    """Renderers often pass through TRANSITIONING as a track ends. Fast polling
+    near the end catches it; the STOPPED that follows must still advance."""
+    backend._furthest_position_ms = 198_000
+    backend._client.get_transport_info.side_effect = ["TRANSITIONING", "STOPPED", "STOPPED"]
+    await poll(backend, monkeypatch, times=3)
+    backend.ended.assert_called_once()
+    backend.interrupted.assert_not_called()
+
+
+async def test_stop_in_grace_period_keeps_the_armed_next_track(backend, monkeypatch):
+    """A short track can report STOPPED right after it starts while the next
+    track is already armed. The grace period must not drop that next track, or
+    the renderer moving on to it looks like another controller."""
+    import time
+
+    backend._playback_started_at = time.monotonic()
+    backend._next_track_proxy_url = "http://proxy:7120/audio/456.flac"
+    await poll(backend, monkeypatch)
+    assert backend._next_track_proxy_url == "http://proxy:7120/audio/456.flac"
+    backend.ended.assert_not_called()

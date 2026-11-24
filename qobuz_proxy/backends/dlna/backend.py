@@ -19,7 +19,7 @@ from qobuz_proxy.backends.types import (
     BufferStatus,
     PlaybackState,
 )
-from .client import DLNAClient, DLNAClientError, SoapResult
+from .client import DLNAClient, DLNAClientError, DLNAUnsupportedDeviceError, SoapResult
 from .capabilities import (
     DLNACapabilities,
     CapabilityCache,
@@ -125,6 +125,10 @@ class DLNABackend(AudioBackend):
         # a stop drop back to 0, so a stop is judged against this instead.
         self._furthest_position_ms: int = 0
         self._duration_ms: int = 0
+        # Whether the renderer went PLAYING -> TRANSITIONING (reported as
+        # LOADING). Many renderers pass through TRANSITIONING at the end of a
+        # track, so a STOPPED that follows must still count as a track end.
+        self._loading_after_playing = False
 
         # Audio proxy server for URL handling
         self._proxy_server: Optional["AudioProxyServer"] = None
@@ -319,6 +323,11 @@ class DLNABackend(AudioBackend):
             logger.info(f"Connected to DLNA device: {self.name}")
             return True
 
+        except DLNAUnsupportedDeviceError as e:
+            # The device is up but is not a usable renderer: a setup problem
+            # the user needs to see, not an offline speaker.
+            logger.error(f"DLNA device cannot be used as a renderer: {e}")
+            return False
         except DLNAClientError as e:
             # An unreachable renderer is an expected state (powered off,
             # still booting); the caller retries with backoff. Log at info
@@ -443,6 +452,7 @@ class DLNABackend(AudioBackend):
             self._furthest_position_ms = 0
             self._current_proxy_url = actual_url
             self._playback_started_at = time.monotonic()
+            self._loading_after_playing = False
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
@@ -831,6 +841,7 @@ class DLNABackend(AudioBackend):
                         self._position_ms = 0
                         self._furthest_position_ms = 0
                         self._playback_started_at = time.monotonic()
+                        self._loading_after_playing = False
                         # Clear gapless state — the armed entry is now the
                         # playing one, so don't remove it from the queue
                         self._next_track_proxy_url = None
@@ -861,9 +872,23 @@ class DLNABackend(AudioBackend):
                 # Detect state changes
                 if new_state != self._state:
                     logger.debug(f"State changed: {self._state} -> {new_state}")
+                    was_playing = self._state == PlaybackState.PLAYING or (
+                        self._state == PlaybackState.LOADING and self._loading_after_playing
+                    )
 
                     # Check for track end before updating state
-                    if self._state == PlaybackState.PLAYING and new_state == PlaybackState.STOPPED:
+                    if was_playing and new_state == PlaybackState.STOPPED:
+                        if in_grace_period:
+                            # During grace period, ignore STOPPED state entirely
+                            # This prevents false track-ended events while device is
+                            # loading. Checked before touching the armed gapless
+                            # track, which a short track may still move on to.
+                            logger.debug(
+                                f"Ignoring STOPPED state during grace period "
+                                f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
+                            )
+                            continue  # Skip state update entirely
+
                         # If gapless was armed but device stopped, clear and fall through
                         if self._next_track_proxy_url:
                             logger.debug(
@@ -873,15 +898,7 @@ class DLNABackend(AudioBackend):
                             self._next_track_proxy_url = None
                             self._next_track_metadata = None
 
-                        if in_grace_period:
-                            # During grace period, ignore STOPPED state entirely
-                            # This prevents false track-ended events while device is loading
-                            logger.debug(
-                                f"Ignoring STOPPED state during grace period "
-                                f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
-                            )
-                            continue  # Skip state update entirely
-                        elif self._stopped_before_track_end():
+                        if self._stopped_before_track_end():
                             logger.info(
                                 "[%s] Renderer stopped at %s of %s without a Qobuz command; "
                                 "not a track end, so not advancing",
@@ -893,6 +910,7 @@ class DLNABackend(AudioBackend):
                         else:
                             self._notify_track_ended()
 
+                    self._loading_after_playing = was_playing and new_state == PlaybackState.LOADING
                     self._notify_state_change(new_state)
 
                 # Update position while playing

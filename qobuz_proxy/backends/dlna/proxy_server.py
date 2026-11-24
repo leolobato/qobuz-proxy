@@ -263,7 +263,9 @@ class AudioProxyServer:
             async with ClientSession(timeout=timeout) as session:
                 async with session.head(track.qobuz_url, allow_redirects=True) as upstream:
                     cl = upstream.headers.get("Content-Length")
-                    if upstream.status in (200, 206) and cl and cl.isdigit():
+                    # Only a 200 carries the whole file's size; a 206's length
+                    # is just the range the CDN chose to send.
+                    if upstream.status == 200 and cl and cl.isdigit():
                         # Via the header: the content_length property raises on a
                         # body-less Response, so the size was silently dropped.
                         response.headers["Content-Length"] = cl

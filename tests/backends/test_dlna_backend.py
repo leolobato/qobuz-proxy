@@ -189,6 +189,30 @@ class TestConnectLogging:
         assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert any(r.levelno == logging.INFO for r in caplog.records)
 
+    async def test_device_without_avtransport_logs_error(self, caplog):
+        """A device that answers but is not a renderer is a setup problem."""
+        import logging
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna.client import DLNAUnsupportedDeviceError
+
+        backend = DLNABackend("192.168.1.100")
+
+        with (
+            caplog.at_level(logging.INFO, logger="qobuz_proxy.backends.dlna.backend"),
+            patch(
+                "qobuz_proxy.backends.dlna.backend.DLNAClient.connect",
+                new_callable=AsyncMock,
+                side_effect=DLNAUnsupportedDeviceError(
+                    "Device at 192.168.1.100:1400 does not support AVTransport"
+                ),
+            ),
+        ):
+            connected = await backend.connect()
+
+        assert connected is False
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
     async def test_unexpected_connect_failure_still_logs_error(self, caplog):
         import logging
         from unittest.mock import AsyncMock, patch
