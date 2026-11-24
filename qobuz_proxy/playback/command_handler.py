@@ -36,7 +36,7 @@ SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
 
 def _is_sentinel(item: Any) -> bool:
     """True for the all-ones "no item" placeholder (empty queue / no next track)."""
-    return item.trackId == SENTINEL_TRACK_ID or item.queueItemId == SENTINEL_QUEUE_ITEM_ID
+    return bool(item.trackId == SENTINEL_TRACK_ID or item.queueItemId == SENTINEL_QUEUE_ITEM_ID)
 
 
 class PlaybackCommandHandler:
@@ -264,11 +264,23 @@ class PlaybackCommandHandler:
         # a stale track. apply_remote_state() applies the whole sequence under one
         # lock acquisition + generation check (newest SET_STATE wins as a unit),
         # and also handles the stale session-restore snapshot detection.
+        playing_state = state.playingState if state.HasField("playingState") else None
+        position_ms = state.currentPosition if state.HasField("currentPosition") else None
+        if (
+            playing_state == 2
+            and state.HasField("currentQueueItem")
+            and _is_sentinel(state.currentQueueItem)
+        ):
+            # Play on an empty queue: there is nothing to play. Without a track
+            # the player would resume whatever the renderer last had loaded.
+            logger.debug("Ignoring PLAYING SET_STATE for an empty queue")
+            playing_state = None
+            position_ms = None
         await self.player.apply_remote_state(
             track_id=str(current_track_id) if current_item else None,
             queue_item_id=current_queue_item_id,
-            position_ms=state.currentPosition if state.HasField("currentPosition") else None,
-            playing_state=state.playingState if state.HasField("playingState") else None,
+            position_ms=position_ms,
+            playing_state=playing_state,
             context_uuid=current_context_uuid,
         )
 

@@ -396,6 +396,26 @@ class TestRendererOwnership:
         await stop
         assert player.state == PlaybackState.PLAYING
 
+    async def test_sentinel_play_does_not_resume_stopped_track(self) -> None:
+        """After a stop and a cleared queue, Play sends the all-ones current
+        item. It must not restart the track the renderer still has loaded."""
+        player, backend = _make_player()
+        handler = PlaybackCommandHandler(player)
+        await handler._handle_set_active(_set_active_msg(True))
+        await handler._handle_set_state(_set_state_msg(track_id=2001, queue_item_id=1))
+        await handler._handle_set_state(
+            _set_state_msg(track_id=2001, queue_item_id=1, playing_state=1)
+        )
+        assert player.state == PlaybackState.STOPPED
+        played = list(backend.played)
+
+        await handler._handle_set_state(
+            _set_state_msg(track_id=0xFFFFFFFF, queue_item_id=0xFFFFFFFFFFFFFFFF)
+        )
+
+        assert player.state == PlaybackState.STOPPED
+        assert backend.played == played
+
     async def test_sentinel_current_item_is_ignored(self) -> None:
         """Play on an empty Qobuz queue sends all-ones ids as currentQueueItem.
         It must not be loaded as a real track (404, then an int32 overflow when

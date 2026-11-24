@@ -285,3 +285,37 @@ class TestStateOnlySetState:
         assert player.current_track is not None
         assert player.current_track.track_id == "1002"
         assert backend.played == ["1002"]
+
+    async def test_queued_seeks_apply_only_the_latest(self) -> None:
+        """Seeks sent as PLAYING plus a position still supersede each other:
+        dragging the scrubber must not replay every intermediate position."""
+        player, backend = _make_player()
+        seeks: list[int] = []
+
+        async def record_seek(position_ms: int) -> None:
+            seeks.append(position_ms)
+
+        backend.seek = record_seek  # type: ignore[method-assign]
+        await player.apply_remote_state(
+            track_id="1001", queue_item_id=1, position_ms=None, playing_state=2
+        )
+        player._current_duration_ms = 300_000
+        seeks.clear()
+
+        await player._playback_lock.acquire()
+        tasks = []
+        for position in (10_000, 30_000, 80_000):
+            tasks.append(
+                asyncio.create_task(
+                    player.apply_remote_state(
+                        track_id=None, queue_item_id=None, position_ms=position, playing_state=2
+                    )
+                )
+            )
+            await asyncio.sleep(0)
+        player._playback_lock.release()
+        await asyncio.gather(*tasks)
+
+        # The apply path may seek more than once for one SET_STATE; what matters
+        # is that the superseded positions are never applied.
+        assert seeks and set(seeks) == {80_000}

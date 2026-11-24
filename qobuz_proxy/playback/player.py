@@ -505,8 +505,9 @@ class QobuzPlayer:
         # the one naming the track, must not supersede an older one that still has
         # a track change to apply: the track would never load and a quick second
         # skip would be silently lost. It queues behind it on the lock instead.
-        # Stop/pause without a track are new intents and still supersede.
-        bare_play = track_id is None and playing_state == 2
+        # Stop/pause without a track are new intents and still supersede, and so
+        # does a seek (a position): only the latest of several queued seeks runs.
+        bare_play = track_id is None and playing_state == 2 and position_ms is None
         gen = self._command_generation if bare_play else self._next_generation()
         async with self._playback_lock:
             if gen != self._command_generation:
