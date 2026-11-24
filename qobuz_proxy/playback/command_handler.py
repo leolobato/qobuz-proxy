@@ -34,6 +34,11 @@ SENTINEL_TRACK_ID = 0xFFFFFFFF
 SENTINEL_QUEUE_ITEM_ID = 0xFFFFFFFFFFFFFFFF
 
 
+def _is_sentinel(item: Any) -> bool:
+    """True for the all-ones "no item" placeholder (empty queue / no next track)."""
+    return item.trackId == SENTINEL_TRACK_ID or item.queueItemId == SENTINEL_QUEUE_ITEM_ID
+
+
 class PlaybackCommandHandler:
     """
     Handles playback commands from WebSocket.
@@ -187,7 +192,7 @@ class PlaybackCommandHandler:
         current_queue_item_id = None
         current_track_id = None
         current_context_uuid = None
-        if state.HasField("currentQueueItem"):
+        if state.HasField("currentQueueItem") and not _is_sentinel(state.currentQueueItem):
             current_item = state.currentQueueItem
             current_queue_item_id = current_item.queueItemId
             current_track_id = current_item.trackId
@@ -199,10 +204,7 @@ class PlaybackCommandHandler:
         # Extract and store next queue item for auto-advance
         next_track_changed = False
         next_item = state.nextQueueItem if state.HasField("nextQueueItem") else None
-        if next_item is not None and (
-            next_item.trackId == SENTINEL_TRACK_ID
-            or next_item.queueItemId == SENTINEL_QUEUE_ITEM_ID
-        ):
+        if next_item is not None and _is_sentinel(next_item):
             # "No next track" sentinel — treat like an absent nextQueueItem,
             # otherwise auto-advance tries to load track 4294967295 and fails.
             logger.debug("Next track sentinel received (no next track)")
