@@ -255,3 +255,33 @@ class TestPlaybackInterrupted:
         assert player._position_value_ms == 20_000
         assert backend.played == ["7"]
         next_cb.assert_not_called()
+
+
+class TestStateOnlySetState:
+    async def test_state_only_set_state_does_not_cancel_a_pending_track_change(self) -> None:
+        """The app sends the track change, then a bare "PLAYING" SET_STATE right
+        after. The bare one must not supersede the track change (a quick second
+        skip was lost this way): the track loads and then plays."""
+        player, backend = _make_player()
+        player.queue.get_current_track = AsyncMock(return_value=None)  # nothing queued locally
+        player.queue.advance_to_next = AsyncMock(return_value=None)
+
+        await player._playback_lock.acquire()  # a previous SET_STATE is still applying
+        change = asyncio.create_task(
+            player.apply_remote_state(
+                track_id="1002", queue_item_id=2, position_ms=None, playing_state=None
+            )
+        )
+        await asyncio.sleep(0)
+        play = asyncio.create_task(
+            player.apply_remote_state(
+                track_id=None, queue_item_id=None, position_ms=None, playing_state=2
+            )
+        )
+        await asyncio.sleep(0)
+        player._playback_lock.release()
+        await asyncio.gather(change, play)
+
+        assert player.current_track is not None
+        assert player.current_track.track_id == "1002"
+        assert backend.played == ["1002"]
