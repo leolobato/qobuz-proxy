@@ -130,6 +130,10 @@ class QobuzProxy:
         # Background retry tasks for speakers that failed to start, keyed by
         # slugified speaker name. Also keeps strong references to the tasks.
         self._speaker_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        # Serializes speaker starts: two web UI logins, or a login and a
+        # background retry, would otherwise start the same speaker twice and
+        # the second start would fail to bind its discovery port.
+        self._speaker_start_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -664,38 +668,41 @@ class QobuzProxy:
             logger.info(f"No speakers configured — add speakers at http://localhost:{port}")
             return
 
-        running_ids = {slugify_name(s.name) for s in self._speakers}
-        configs = [sc for sc in self._config.speakers if slugify_name(sc.name) not in running_ids]
+        async with self._speaker_start_lock:
+            running_ids = {slugify_name(s.name) for s in self._speakers}
+            configs = [
+                sc for sc in self._config.speakers if slugify_name(sc.name) not in running_ids
+            ]
 
-        speakers = [
-            Speaker(
-                config=sc,
-                api_client=self._api_client,
-                app_id=self._app_id,
-            )
-            for sc in configs
-        ]
-
-        tasks = [asyncio.ensure_future(s.start()) for s in speakers]
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            # Cancelled mid-start (shutdown, or a web UI login/logout racing the
-            # background token validation): let the starts unwind, then release
-            # whatever came up so a later start doesn't find the ports taken.
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.gather(*[s.stop() for s in speakers], return_exceptions=True)
-            raise
-
-        for sc, speaker, result in zip(configs, speakers, results):
-            if isinstance(result, BaseException) or result is False:
-                reason = f": {result}" if isinstance(result, BaseException) else ""
-                logger.warning(
-                    f"Speaker '{speaker.name}' failed to start{reason} — retrying in background"
+            speakers = [
+                Speaker(
+                    config=sc,
+                    api_client=self._api_client,
+                    app_id=self._app_id,
                 )
-                self._schedule_speaker_retry(sc)
-            else:
-                self._speakers.append(speaker)
+                for sc in configs
+            ]
+
+            tasks = [asyncio.ensure_future(s.start()) for s in speakers]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                # Cancelled mid-start (shutdown, or a web UI login/logout racing the
+                # background token validation): let the starts unwind, then release
+                # whatever came up so a later start doesn't find the ports taken.
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*[s.stop() for s in speakers], return_exceptions=True)
+                raise
+
+            for sc, speaker, result in zip(configs, speakers, results):
+                if isinstance(result, BaseException) or result is False:
+                    reason = f": {result}" if isinstance(result, BaseException) else ""
+                    logger.warning(
+                        f"Speaker '{speaker.name}' failed to start{reason} — retrying in background"
+                    )
+                    self._schedule_speaker_retry(sc)
+                else:
+                    self._speakers.append(speaker)
 
         if not self._speakers:
             logger.error(
@@ -746,20 +753,28 @@ class QobuzProxy:
                 if self._api_client is None:
                     return  # Logged out — speakers restart on the next login
 
-                speaker = Speaker(config=config, api_client=self._api_client, app_id=self._app_id)
-                try:
-                    started = await speaker.start()
-                except asyncio.CancelledError:
-                    await speaker.stop()
-                    raise
-                except Exception as e:
-                    logger.debug(f"Speaker '{config.name}' retry raised: {e}")
-                    started = False
+                async with self._speaker_start_lock:
+                    if any(slugify_name(s.name) == speaker_id for s in self._speakers):
+                        return  # Started meanwhile by another path (e.g. a second login)
 
-                if started:
-                    self._speakers.append(speaker)
-                    logger.info(f"Speaker '{config.name}' started after {attempt} retry attempt(s)")
-                    return
+                    speaker = Speaker(
+                        config=config, api_client=self._api_client, app_id=self._app_id
+                    )
+                    try:
+                        started = await speaker.start()
+                    except asyncio.CancelledError:
+                        await speaker.stop()
+                        raise
+                    except Exception as e:
+                        logger.debug(f"Speaker '{config.name}' retry raised: {e}")
+                        started = False
+
+                    if started:
+                        self._speakers.append(speaker)
+                        logger.info(
+                            f"Speaker '{config.name}' started after {attempt} retry attempt(s)"
+                        )
+                        return
 
                 logger.info(
                     f"Speaker '{config.name}' still failing to start "
