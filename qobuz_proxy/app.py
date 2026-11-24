@@ -467,7 +467,7 @@ class QobuzProxy:
             started = await speaker.start()
         finally:
             self._starting_speaker_ids.discard(new_id)
-        if started and await self._adopt_started_speaker(speaker, epoch):
+        if started and await self._adopt_started_speaker(speaker, sc, epoch):
             return speaker.get_status()
 
         logger.warning(f"Speaker '{name}' saved but failed to start — retrying in background")
@@ -539,6 +539,27 @@ class QobuzProxy:
             retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retry_task
+            # Speakers may have been removed or renamed while waiting: find the
+            # entries again so the edit doesn't overwrite another speaker.
+            config_idx = next(
+                (
+                    i
+                    for i, sc in enumerate(self._config.speakers)
+                    if slugify_name(sc.name) == speaker_id
+                ),
+                None,
+            )
+            if config_idx is None:
+                raise KeyError(speaker_id)
+            if new_id != speaker_id and any(
+                i != config_idx and slugify_name(sc.name) == new_id
+                for i, sc in enumerate(self._config.speakers)
+            ):
+                raise ValueError(f"Speaker '{new_name}' already exists")
+            speaker_idx = next(
+                (i for i, s in enumerate(self._speakers) if slugify_name(s.name) == speaker_id),
+                None,
+            )
         if {speaker_id, new_id} & self._starting_speaker_ids:
             # A login is starting it right now; a second instance would fight
             # it for the same ports.
@@ -564,7 +585,7 @@ class QobuzProxy:
         finally:
             self._starting_speaker_ids -= reserved
         # Kept even when the start failed, so the web UI shows its status
-        await self._adopt_started_speaker(new_speaker, epoch)
+        await self._adopt_started_speaker(new_speaker, new_config, epoch)
 
         status = new_speaker.get_status()
         if not started:
@@ -729,14 +750,14 @@ class QobuzProxy:
             if isinstance(result, BaseException) or result is False:
                 reason = f": {result}" if isinstance(result, BaseException) else ""
                 if epoch != self._speakers_epoch:
-                    self._retry_after_stale_start(sc.name)  # Only if logged in again
+                    self._retry_after_stale_start(sc)  # Only if logged in again
                     continue
                 logger.warning(
                     f"Speaker '{speaker.name}' failed to start{reason} — retrying in background"
                 )
                 self._schedule_speaker_retry(sc)
             else:
-                await self._adopt_started_speaker(speaker, epoch)
+                await self._adopt_started_speaker(speaker, sc, epoch)
 
         if epoch != self._speakers_epoch:
             return  # Stopped while starting (logout or shutdown)
@@ -810,7 +831,7 @@ class QobuzProxy:
                     self._starting_speaker_ids.discard(speaker_id)
 
                 if started:
-                    if await self._adopt_started_speaker(speaker, epoch):
+                    if await self._adopt_started_speaker(speaker, config, epoch):
                         logger.info(
                             f"Speaker '{config.name}' started after {attempt} retry attempt(s)"
                         )
@@ -830,33 +851,37 @@ class QobuzProxy:
             slugify_name(s.name) == speaker_id for s in self._speakers
         )
 
-    async def _adopt_started_speaker(self, speaker: Speaker, epoch: int) -> bool:
+    async def _adopt_started_speaker(
+        self, speaker: Speaker, config: SpeakerConfig, epoch: int
+    ) -> bool:
         """Add a just-started speaker to the running list.
 
         If the speakers were stopped while it was starting (logout, shutdown),
-        it is stopped instead, so no speaker outlives a logout.
+        or its config entry was removed or replaced meanwhile, it is stopped
+        instead, so no speaker outlives a logout or its own config.
         """
+        if not any(sc is config for sc in self._config.speakers):
+            logger.info(f"Speaker '{speaker.name}' was removed or edited while starting; releasing")
+            await speaker.stop()
+            return False
         if epoch != self._speakers_epoch:
             logger.info(f"Speaker '{speaker.name}' came up after speakers were stopped; releasing")
             await speaker.stop()
-            self._retry_after_stale_start(speaker.name)
+            self._retry_after_stale_start(config)
             return False
         self._speakers.append(speaker)
         return True
 
-    def _retry_after_stale_start(self, name: str) -> None:
+    def _retry_after_stale_start(self, config: SpeakerConfig) -> None:
         """Restart a speaker whose start straddled a logout and a new login.
 
         The new login skipped it because this start still held its reservation,
         so without a retry it would stay stopped until the next login.
         """
-        if self._api_client is None:
-            return  # Still logged out; the next login starts it
-        speaker_id = slugify_name(name)
-        for sc in self._config.speakers:
-            if slugify_name(sc.name) == speaker_id:
-                self._schedule_speaker_retry(sc)
-                return
+        if self._api_client is None or not self._is_running:
+            return  # Logged out or shutting down; the next login starts it
+        if any(sc is config for sc in self._config.speakers):
+            self._schedule_speaker_retry(config)
 
     async def _stop_speakers(self) -> None:
         """Stop all running speakers and any pending start retries.
@@ -865,9 +890,14 @@ class QobuzProxy:
         when they finish, because the epoch changes here.
         """
         self._speakers_epoch += 1
-        for task in list(self._speaker_retry_tasks.values()):
+        retries = list(self._speaker_retry_tasks.values())
+        for task in retries:
             task.cancel()
         self._speaker_retry_tasks.clear()
+        # Let cancelled attempts unwind (stop their half-started speaker and drop
+        # their reservation) before returning, so a login right after a logout
+        # doesn't skip a speaker whose old attempt still looks like it's starting.
+        await asyncio.gather(*retries, return_exceptions=True)
 
         if self._speakers:
             await asyncio.gather(*[s.stop() for s in self._speakers], return_exceptions=True)

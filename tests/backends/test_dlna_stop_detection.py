@@ -165,3 +165,18 @@ async def test_stop_in_grace_period_keeps_the_armed_next_track(backend, monkeypa
     await poll(backend, monkeypatch)
     assert backend._next_track_proxy_url == "http://proxy:7120/audio/456.flac"
     backend.ended.assert_not_called()
+
+
+async def test_gapless_move_seen_after_transitioning_records_playing(backend, monkeypatch):
+    """The renderer was caught in TRANSITIONING, then is found playing the armed
+    next track. The backend must record PLAYING, or that track's end is lost."""
+    next_uri = "http://proxy:7120/audio/456.flac"
+    backend._state = PlaybackState.LOADING
+    backend._loading_after_playing = True
+    backend._next_track_proxy_url = next_uri
+    backend._next_track_metadata = MagicMock(duration_ms=180_000)
+    backend._client.get_transport_info.return_value = "PLAYING"
+    backend._client.get_media_info.return_value = next_uri
+    await poll(backend, monkeypatch)
+    assert backend._state == PlaybackState.PLAYING
+    assert backend._current_proxy_url == next_uri

@@ -847,6 +847,10 @@ class DLNABackend(AudioBackend):
                         self._next_track_proxy_url = None
                         self._next_track_metadata = None
                         self._next_track_queue_nr = None
+                        # The renderer is playing the new track, even if the last
+                        # poll caught it in TRANSITIONING: record PLAYING so its
+                        # own end is detected.
+                        self._notify_state_change(PlaybackState.PLAYING)
                         # Notify player
                         self._notify_next_track_started()
                         self._notify_position_update(0)
