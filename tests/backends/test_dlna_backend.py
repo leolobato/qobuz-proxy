@@ -160,3 +160,50 @@ class TestSonosGaplessQueue:
         await backend.clear_next_track()
 
         client.remove_track_from_queue.assert_not_called()
+
+
+class TestConnectLogging:
+    """A renderer that is offline is expected, not an error every retry cycle."""
+
+    async def test_unreachable_renderer_logs_info(self, caplog):
+        import logging
+        from unittest.mock import AsyncMock, patch
+
+        from qobuz_proxy.backends.dlna.client import DLNAClientError
+
+        backend = DLNABackend("192.168.1.100")
+
+        with (
+            caplog.at_level(logging.INFO, logger="qobuz_proxy.backends.dlna.backend"),
+            patch(
+                "qobuz_proxy.backends.dlna.backend.DLNAClient.connect",
+                new_callable=AsyncMock,
+                side_effect=DLNAClientError(
+                    "Could not find device description for 192.168.1.100:1400"
+                ),
+            ),
+        ):
+            connected = await backend.connect()
+
+        assert connected is False
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    async def test_unexpected_connect_failure_still_logs_error(self, caplog):
+        import logging
+        from unittest.mock import AsyncMock, patch
+
+        backend = DLNABackend("192.168.1.100")
+
+        with (
+            caplog.at_level(logging.INFO, logger="qobuz_proxy.backends.dlna.backend"),
+            patch(
+                "qobuz_proxy.backends.dlna.backend.DLNAClient.connect",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            connected = await backend.connect()
+
+        assert connected is False
+        assert any(r.levelno >= logging.ERROR for r in caplog.records)
