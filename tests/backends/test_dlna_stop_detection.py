@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from qobuz_proxy.backends.dlna.backend import DLNABackend
+from qobuz_proxy.backends.dlna.backend import (
+    NEAR_END_POLL_INTERVAL_SECONDS,
+    STATE_POLL_INTERVAL_SECONDS,
+    DLNABackend,
+)
 from qobuz_proxy.backends.dlna.client import DLNAClient
 from qobuz_proxy.backends.types import PlaybackState
 
@@ -121,3 +125,20 @@ async def test_new_play_forgets_an_earlier_failure_of_the_same_track(backend):
     meta.bit_depth = 16
     await backend._play("https://cdn/123", meta)
     assert "123" not in backend._delivery_failures
+
+
+def test_poll_is_fast_only_near_the_end_of_a_playing_track(backend):
+    """The natural end is noticed sooner by polling faster in the last seconds."""
+    backend._duration_ms = 200_000
+    backend._furthest_position_ms = 100_000
+    assert backend._next_poll_delay() == STATE_POLL_INTERVAL_SECONDS
+
+    backend._furthest_position_ms = 195_000
+    assert backend._next_poll_delay() == NEAR_END_POLL_INTERVAL_SECONDS
+
+    backend._state = PlaybackState.PAUSED
+    assert backend._next_poll_delay() == STATE_POLL_INTERVAL_SECONDS
+
+    backend._state = PlaybackState.PLAYING
+    backend._duration_ms = 0  # unknown duration: keep the normal interval
+    assert backend._next_poll_delay() == STATE_POLL_INTERVAL_SECONDS
