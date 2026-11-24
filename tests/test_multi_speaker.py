@@ -546,6 +546,93 @@ class TestWebUICallbacks:
             mock_clear.assert_called_once()
 
 
+class TestSpeakerStartRaces:
+    """Starts racing logout, retries and edits."""
+
+    async def test_logout_during_start_releases_speaker(self):
+        """A speaker that finishes starting after a logout must be released,
+        not kept running with no logged-in user."""
+        config = _make_config(_make_speaker_config())
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_start() -> bool:
+            started.set()
+            await release.wait()
+            return True
+
+        speaker = _make_mock_speaker("Test Speaker", starts=True)
+        speaker.start = AsyncMock(side_effect=slow_start)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=speaker),
+            patch("qobuz_proxy.app.clear_user_token"),
+        ):
+            task = asyncio.create_task(app._start_speakers())
+            await started.wait()
+            await app._on_logout()
+            release.set()
+            await task
+
+        assert app._speakers == []
+        speaker.stop.assert_awaited_once()
+        assert app._starting_speaker_ids == set()
+
+    async def test_slow_retry_does_not_block_other_speakers(self):
+        """A retry stuck waiting on an unreachable renderer must not delay a
+        login from starting the other speakers."""
+        config = _make_config(
+            _make_speaker_config("Kitchen", http_port=8689),
+            _make_speaker_config("Office", http_port=8690),
+        )
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        retry_started = asyncio.Event()
+
+        async def hanging_start() -> bool:
+            retry_started.set()
+            await asyncio.Event().wait()
+            return False
+
+        hanging = _make_mock_speaker("Kitchen", starts=False)
+        hanging.start = AsyncMock(side_effect=hanging_start)
+        office = _make_mock_speaker("Office", starts=True)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", side_effect=[hanging, office]),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+        ):
+            app._schedule_speaker_retry(config.speakers[0])
+            await retry_started.wait()
+
+            await asyncio.wait_for(app._start_speakers(), timeout=1.0)
+
+            assert app._speakers == [office]
+            await app._stop_speakers()
+
+        hanging.stop.assert_awaited()
+
+    async def test_edit_refuses_speaker_that_is_starting(self):
+        """Editing a speaker while another path starts it would run two
+        instances on the same ports."""
+        config = _make_config(_make_speaker_config(name="Wyse"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._starting_speaker_ids.add("wyse")
+
+        with (
+            patch("qobuz_proxy.app.Speaker") as MockSpeaker,
+            pytest.raises(ValueError, match="starting"),
+        ):
+            await app._on_edit_speaker("wyse", {"name": "Wyse"})
+
+        MockSpeaker.assert_not_called()
+
+
 class TestSpeakerEditCallbacks:
     """Tests for runtime add/edit speaker callbacks from the web UI."""
 
