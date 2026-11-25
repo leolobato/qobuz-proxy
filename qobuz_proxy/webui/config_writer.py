@@ -9,6 +9,10 @@ import yaml
 from qobuz_proxy.config import Config, speaker_config_to_dict
 
 
+class ConfigSaveError(Exception):
+    """The configuration file could not be written."""
+
+
 def config_to_dict(config: Config) -> dict:
     """Serialize a Config object to a YAML-ready dict.
 

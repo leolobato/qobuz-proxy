@@ -35,7 +35,7 @@ from qobuz_proxy.config import (
     slugify_name,
 )
 from qobuz_proxy.speaker import Speaker
-from qobuz_proxy.webui.config_writer import persist_speaker_uuids, save_config
+from qobuz_proxy.webui.config_writer import ConfigSaveError, persist_speaker_uuids, save_config
 from qobuz_proxy.webui.routes import register_routes
 
 logger = logging.getLogger(__name__)
@@ -458,7 +458,11 @@ class QobuzProxy:
 
         # Persist first so a restart still has this speaker even if start fails.
         self._config.speakers.append(sc)
-        self._save_config()
+        try:
+            self._save_config()
+        except ConfigSaveError:
+            self._config.speakers.remove(sc)
+            raise
 
         speaker = Speaker(config=sc, api_client=self._api_client, app_id=self._app_id)
         epoch = self._speakers_epoch
@@ -502,6 +506,8 @@ class QobuzProxy:
         old_config = self._config.speakers[config_idx]
 
         new_name = body.get("name", old_config.name).strip()
+        if not new_name:
+            raise ValueError("name is required")
         new_id = slugify_name(new_name)
         if new_id != speaker_id:
             for i, sc in enumerate(self._config.speakers):
@@ -530,6 +536,10 @@ class QobuzProxy:
             audio_device=body.get("audio_device", old_config.audio_device),
             audio_buffer_size=int(body.get("buffer_size", old_config.audio_buffer_size)),
         )
+        # Same check as adding a speaker: a DLNA speaker saved without an IP
+        # makes the config invalid, and the app then refuses to start.
+        if new_config.backend_type == "dlna" and not str(new_config.dlna_ip or "").strip():
+            raise ValueError("dlna_ip is required for DLNA backend")
 
         # The edited speaker replaces any pending boot retry of the old config.
         # Wait for an attempt in flight to unwind so its reservation is gone:
@@ -567,7 +577,14 @@ class QobuzProxy:
 
         # Persist first: the edit is saved even if the restart below fails
         self._config.speakers[config_idx] = new_config
-        self._save_config()
+        try:
+            self._save_config()
+        except ConfigSaveError:
+            self._config.speakers[config_idx] = old_config
+            # The old config was waiting for its renderer: keep retrying it
+            if retry_task is not None and speaker_idx is None:
+                self._schedule_speaker_retry(old_config)
+            raise
 
         epoch = self._speakers_epoch
         reserved = {speaker_id, new_id}
@@ -615,21 +632,31 @@ class QobuzProxy:
                 speaker_idx = i
                 break
 
-        self._config.speakers.pop(config_idx)
+        removed = self._config.speakers.pop(config_idx)
+        try:
+            self._save_config()
+        except ConfigSaveError:
+            self._config.speakers.insert(config_idx, removed)
+            raise
+
         self._cancel_speaker_retry(speaker_id)
         if speaker_idx is not None:
             speaker = self._speakers.pop(speaker_idx)
             await speaker.stop()
 
-        self._save_config()
-
     def _save_config(self) -> None:
-        """Persist current config to YAML file."""
+        """Persist current config to YAML file.
+
+        Raises:
+            ConfigSaveError: The file could not be written. The web UI reports
+                it, instead of showing a change that would be lost on restart.
+        """
         if self._config.config_path:
             try:
                 save_config(self._config, self._config.config_path)
             except Exception as e:
                 logger.error(f"Failed to save config: {e}")
+                raise ConfigSaveError(f"Could not save the configuration: {e}") from e
 
     def _speakers_for_api(self) -> list[dict]:
         """Return every configured speaker, with live status when running.

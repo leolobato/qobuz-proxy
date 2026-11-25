@@ -3,6 +3,7 @@
 import logging
 from aiohttp import web
 from qobuz_proxy.backends.dlna.discovery import discover_dlna_devices
+from qobuz_proxy.webui.config_writer import ConfigSaveError
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,8 @@ async def _handle_add_speaker(request: web.Request) -> web.Response:
     try:
         result = await callback(body)
         return web.json_response(result, status=201)
+    except ConfigSaveError as e:
+        return web.json_response({"error": str(e)}, status=500)
     except (ValueError, Exception) as e:
         return web.json_response({"error": str(e)}, status=400)
 
@@ -108,6 +111,8 @@ async def _handle_edit_speaker(request: web.Request) -> web.Response:
         return web.json_response({"error": "speaker not found"}, status=404)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
+    except ConfigSaveError as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def _handle_remove_speaker(request: web.Request) -> web.Response:
@@ -120,6 +125,8 @@ async def _handle_remove_speaker(request: web.Request) -> web.Response:
         return web.Response(status=204)
     except KeyError:
         return web.json_response({"error": "speaker not found"}, status=404)
+    except ConfigSaveError as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 def register_speaker_routes(app: web.Application) -> None:

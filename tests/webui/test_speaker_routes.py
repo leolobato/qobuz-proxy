@@ -183,3 +183,25 @@ class TestSpeakerCRUD:
         client.app["on_remove_speaker"] = AsyncMock(side_effect=KeyError("not-found"))
         resp = await client.delete("/api/speakers/not-found")
         assert resp.status == 404
+
+
+class TestConfigSaveErrors:
+    """GitHub #54: a change that could not be saved is an error, not a success."""
+
+    async def test_failed_save_returns_500_with_message(self, client: TestClient) -> None:
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        client.app["on_edit_speaker"].side_effect = ConfigSaveError("disk full")
+        resp = await client.put("/api/speakers/living-room", json={"max_quality": 6})
+        assert resp.status == 500
+        assert "disk full" in (await resp.json())["error"]
+
+        client.app["on_add_speaker"].side_effect = ConfigSaveError("read-only")
+        resp = await client.post("/api/speakers", json={"name": "A", "dlna_ip": "10.0.0.1"})
+        assert resp.status == 500
+        assert "read-only" in (await resp.json())["error"]
+
+        client.app["on_remove_speaker"].side_effect = ConfigSaveError("read-only")
+        resp = await client.delete("/api/speakers/a")
+        assert resp.status == 500
+        assert "read-only" in (await resp.json())["error"]
