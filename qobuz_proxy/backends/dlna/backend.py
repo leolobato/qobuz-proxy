@@ -135,6 +135,9 @@ class DLNABackend(AudioBackend):
         # Proxy keys the audio proxy failed to serve -> True if the renderer got
         # no audio at all, False if the stream was cut short.
         self._delivery_failures: dict[str, bool] = {}
+        # Proxy URL whose track end was already reported: one end per playback
+        # attempt, so a later stop of the same URL is not a second end.
+        self._end_reported_for: Optional[str] = None
 
         # Device capabilities
         self._capabilities: Optional[DLNACapabilities] = None
@@ -453,6 +456,7 @@ class DLNABackend(AudioBackend):
             self._current_proxy_url = actual_url
             self._playback_started_at = time.monotonic()
             self._loading_after_playing = False
+            self._end_reported_for = None
             self._notify_state_change(PlaybackState.PLAYING)
             logger.info(f"Playing: {metadata.artist} - {metadata.title}")
 
@@ -532,6 +536,7 @@ class DLNABackend(AudioBackend):
         failed SOAP call must not be reported as a successful resume.
         """
         if self._client and await self._owns_transport() and await self._client.play():
+            self._end_reported_for = None
             self._notify_state_change(PlaybackState.PLAYING)
             return True
         return False
@@ -575,6 +580,7 @@ class DLNABackend(AudioBackend):
         if not await self._owns_transport():
             raise RuntimeError("Cannot seek: renderer is not playing the Qobuz track")
         if self._client and await self._client.seek(position_ms):
+            self._end_reported_for = None
             self._position_ms = position_ms
             self._furthest_position_ms = position_ms
             self._notify_position_update(position_ms)
@@ -870,6 +876,7 @@ class DLNABackend(AudioBackend):
                     )
                     # Mark stopped so the renderer's own stop is not a second end.
                     self._state = PlaybackState.STOPPED
+                    self._end_reported_for = self._current_proxy_url
                     self._notify_track_ended()
                     continue
 
@@ -879,6 +886,10 @@ class DLNABackend(AudioBackend):
                     was_playing = self._state == PlaybackState.PLAYING or (
                         self._state == PlaybackState.LOADING and self._loading_after_playing
                     )
+                    # The renderer may report PLAYING and then STOPPED again for a
+                    # track whose end was already reported: not a second end.
+                    if self._end_reported_for == self._current_proxy_url:
+                        was_playing = False
 
                     # Check for track end before updating state
                     if was_playing and new_state == PlaybackState.STOPPED:
@@ -912,6 +923,7 @@ class DLNABackend(AudioBackend):
                             )
                             self._notify_playback_interrupted(self._furthest_position_ms)
                         else:
+                            self._end_reported_for = self._current_proxy_url
                             self._notify_track_ended()
 
                     self._loading_after_playing = was_playing and new_state == PlaybackState.LOADING

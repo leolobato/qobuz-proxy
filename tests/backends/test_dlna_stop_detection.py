@@ -104,6 +104,40 @@ async def test_undeliverable_track_is_skipped_once(backend, monkeypatch, transpo
     backend.interrupted.assert_not_called()
 
 
+async def test_failed_stream_ends_the_track_once(backend, monkeypatch):
+    """GitHub #52: after the skip, the renderer reported PLAYING and then STOPPED
+    for the same URL, and that stop was taken for a second track end."""
+    backend._furthest_position_ms = 199_000
+    backend._on_delivery_failure("123", True)
+    backend._client.get_transport_info.side_effect = ["PLAYING", "PLAYING", "STOPPED", "STOPPED"]
+    await poll(backend, monkeypatch, times=4)
+    backend.ended.assert_called_once()
+    backend.interrupted.assert_not_called()
+
+
+async def test_track_played_again_can_end_again(backend, monkeypatch):
+    backend._furthest_position_ms = 199_000
+    await poll(backend, monkeypatch)
+    backend.ended.assert_called_once()
+
+    # The same track is played again (same proxy URL) and ends again.
+    proxy = MagicMock()
+    proxy.register_track.return_value = QOBUZ_URI
+    backend._proxy_server = proxy
+    backend._client.set_av_transport_uri.return_value = True
+    backend._client.play.return_value = True
+    meta = MagicMock(track_id="123", duration_ms=200_000, title="t", artist="a")
+    meta.album = "b"
+    meta.artwork_url = ""
+    meta.sample_rate = 44100
+    meta.bit_depth = 16
+    await backend._play("https://cdn/123", meta)
+    backend._playback_started_at = 0.0  # past the start grace period
+    backend._furthest_position_ms = 199_000
+    await poll(backend, monkeypatch)
+    assert backend.ended.call_count == 2
+
+
 async def test_failure_of_another_url_is_ignored(backend, monkeypatch):
     backend._client.get_transport_info.return_value = "PLAYING"
     backend._on_delivery_failure("456_2", True)
