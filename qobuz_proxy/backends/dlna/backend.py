@@ -51,6 +51,12 @@ PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 # interval plus renderers whose reported position lags a little.
 EARLY_STOP_MARGIN_MS = 15_000
 
+# Placeholder Bose SoundTouch puts in CurrentURI after a Stop (GitHub #43).
+IDLE_PLACEHOLDER_PREFIX = "qplay:"
+# Transport states of a renderer that is not playing anything. SoundTouch
+# reports PAUSED_PLAYBACK after a Stop.
+NOT_PLAYING_STATES = ("STOPPED", "PAUSED_PLAYBACK", "NO_MEDIA_PRESENT")
+
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
 
@@ -74,6 +80,10 @@ def _source_label(uri: Optional[str]) -> str:
         return f"{parsed.scheme}://{parsed.hostname or ''}{path} [sha256={fingerprint}]"
     except ValueError:
         return f"unparseable [sha256={fingerprint}]"
+
+
+def _is_idle_placeholder(uri: Optional[str]) -> bool:
+    return uri is not None and uri.lower().startswith(IDLE_PLACEHOLDER_PREFIX)
 
 
 def _format_ms(ms: int) -> str:
@@ -193,7 +203,12 @@ class DLNABackend(AudioBackend):
             or not self._client
         ):
             return False
-        if await self._client.get_media_info() != "":
+        uri = await self._client.get_media_info()
+        # After our own Stop, SoundTouch shows a placeholder in CurrentURI
+        # (GitHub #43). While nothing plays it is idle too.
+        if _is_idle_placeholder(uri) and self._last_stop_at is not None:
+            return await self._client.get_transport_info() in NOT_PLAYING_STATES
+        if uri != "":
             return False
         return await self._client.get_transport_info() in ("STOPPED", "NO_MEDIA_PRESENT")
 
@@ -205,9 +220,10 @@ class DLNABackend(AudioBackend):
         if self._is_sonos:
             return await self._client.get_track_uri()
         uri = await self._client.get_media_info()
-        if uri == "":
+        if uri == "" or _is_idle_placeholder(uri):
             # Bose SoundTouch leaves CurrentURI empty while it plays or has
-            # paused our stream; TrackURI still names it (GitHub #43).
+            # paused our stream, and shows a placeholder at its natural end;
+            # TrackURI still names it (GitHub #43).
             track_uri = await self._client.get_track_uri()
             if track_uri and track_uri in (self._current_proxy_url, self._next_track_proxy_url):
                 return track_uri
@@ -260,6 +276,21 @@ class DLNABackend(AudioBackend):
             if transport == "STOPPED":
                 logger.debug("[%s] Sonos reported Qobuz queue head after Stop", self.name)
                 return True
+        # After our own Stop, SoundTouch shows a placeholder in CurrentURI and
+        # an unrelated TrackURI (GitHub #43). While nothing plays, the renderer
+        # is idle: not ours to control, but not taken over either.
+        if _is_idle_placeholder(current_uri) and self._last_stop_at is not None:
+            transport = await self._client.get_transport_info()
+            if (
+                self._external_playback
+                or self._starting_playback
+                or self._stopping_playback
+                or expected != self._current_proxy_url
+                or self._last_stop_at is None
+            ):
+                return False
+            if transport is None or transport in NOT_PLAYING_STATES:
+                return False
         # Renderers can briefly report the old source while loading our URI.
         if time.monotonic() - self._playback_started_at < PLAYBACK_START_GRACE_PERIOD_SECONDS:
             return False
