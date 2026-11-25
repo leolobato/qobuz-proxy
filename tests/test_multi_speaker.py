@@ -1161,3 +1161,113 @@ class TestSpeakersApiListsConfig:
         assert app._speakers == []
         assert result["status"] == "starting"
         assert "warning" in result
+
+
+class TestSpeakerEditValidationAndSaveErrors:
+    """GitHub #54: edits are validated like adds, and a failed save is reported."""
+
+    def _app_with_running(self, name: str = "Desk") -> tuple[QobuzProxy, MagicMock]:
+        config = _make_config(_make_speaker_config(name=name))
+        running = _make_mock_speaker(name, starts=True)
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._speakers = [running]
+        return app, running
+
+    @pytest.mark.parametrize("body", [{"dlna_ip": ""}, {"dlna_ip": "  "}, {"name": " "}])
+    async def test_invalid_edit_changes_nothing(self, body):
+        app, running = self._app_with_running()
+        old_config = app._config.speakers[0]
+
+        with (
+            patch("qobuz_proxy.app.Speaker") as MockSpeaker,
+            patch.object(app, "_save_config") as mock_save,
+            pytest.raises(ValueError),
+        ):
+            await app._on_edit_speaker("desk", body)
+
+        mock_save.assert_not_called()
+        MockSpeaker.assert_not_called()
+        assert app._config.speakers == [old_config]
+        assert app._speakers == [running]
+        running.stop.assert_not_called()
+
+    def test_save_config_raises_when_the_file_cannot_be_written(self, tmp_path):
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        app = QobuzProxy(_make_config(_make_speaker_config(name="Desk")))
+        app._config.config_path = tmp_path / "config.yaml"
+        with (
+            patch("qobuz_proxy.app.save_config", side_effect=OSError("read-only")),
+            pytest.raises(ConfigSaveError, match="read-only"),
+        ):
+            app._save_config()
+
+    async def test_failed_save_rolls_an_edit_back(self):
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        app, running = self._app_with_running()
+        old_config = app._config.speakers[0]
+
+        with (
+            patch("qobuz_proxy.app.Speaker") as MockSpeaker,
+            patch.object(app, "_save_config", side_effect=ConfigSaveError("read-only")),
+            pytest.raises(ConfigSaveError),
+        ):
+            await app._on_edit_speaker("desk", {"max_quality": 6})
+
+        assert app._config.speakers == [old_config]
+        assert app._speakers == [running]
+        running.stop.assert_not_called()
+        MockSpeaker.assert_not_called()
+
+    async def test_failed_save_keeps_retrying_the_old_config(self):
+        """An edit cancels the boot retry; a failed save must not leave it dead."""
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        config = _make_config(_make_speaker_config(name="Desk"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._schedule_speaker_retry(config.speakers[0])
+
+        with (
+            patch.object(app, "_save_config", side_effect=ConfigSaveError("read-only")),
+            pytest.raises(ConfigSaveError),
+        ):
+            await app._on_edit_speaker("desk", {"max_quality": 6})
+
+        retry = app._speaker_retry_tasks.get("desk")
+        assert retry is not None and not retry.done()
+        await app._stop_speakers()
+
+    async def test_failed_save_rolls_an_add_back(self):
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        app = QobuzProxy(_make_config())
+        app._api_client = MagicMock()
+
+        with (
+            patch("qobuz_proxy.app.Speaker") as MockSpeaker,
+            patch.object(app, "_save_config", side_effect=ConfigSaveError("read-only")),
+            pytest.raises(ConfigSaveError),
+        ):
+            await app._on_add_speaker({"name": "Patio", "backend": "dlna", "dlna_ip": "10.0.0.1"})
+
+        assert app._config.speakers == []
+        MockSpeaker.assert_not_called()
+
+    async def test_failed_save_keeps_a_removed_speaker(self):
+        from qobuz_proxy.webui.config_writer import ConfigSaveError
+
+        app, running = self._app_with_running()
+        old_config = app._config.speakers[0]
+
+        with (
+            patch.object(app, "_save_config", side_effect=ConfigSaveError("read-only")),
+            pytest.raises(ConfigSaveError),
+        ):
+            await app._on_remove_speaker("desk")
+
+        assert app._config.speakers == [old_config]
+        assert app._speakers == [running]
+        running.stop.assert_not_called()
