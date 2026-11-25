@@ -624,18 +624,29 @@ class DLNABackend(AudioBackend):
     # =========================================================================
 
     async def get_state(self) -> PlaybackState:
-        """Get current playback state from device."""
+        """Get current playback state from device (the last known one if the read fails)."""
+        state = await self._read_state()
+        return self._state if state is None else state
+
+    async def _read_state(self) -> Optional[PlaybackState]:
+        """Transport state from the device, or None when it could not be read.
+
+        A failed read (SOAP timeout, Wi-Fi blip) is unknown, not STOPPED:
+        treating it as a stop advanced the queue on a renderer that was still
+        playing (GitHub #51).
+        """
         if not self._client:
             return PlaybackState.STOPPED
 
         state_str = await self._client.get_transport_info()
-        if state_str:
-            if state_str == "PLAYING":
-                return PlaybackState.PLAYING
-            elif state_str == "PAUSED_PLAYBACK":
-                return PlaybackState.PAUSED
-            elif state_str == "TRANSITIONING":
-                return PlaybackState.LOADING
+        if not state_str:
+            return None
+        if state_str == "PLAYING":
+            return PlaybackState.PLAYING
+        elif state_str == "PAUSED_PLAYBACK":
+            return PlaybackState.PAUSED
+        elif state_str == "TRANSITIONING":
+            return PlaybackState.LOADING
 
         return PlaybackState.STOPPED
 
@@ -810,8 +821,13 @@ class DLNABackend(AudioBackend):
                 ):
                     continue
 
-                # Get state from device
-                new_state = await self.get_state()
+                # Get state from device; on a failed read keep the last one
+                new_state = await self._read_state()
+                if new_state is None:
+                    logger.debug(
+                        "[%s] Transport state unreadable; keeping %s", self.name, self._state
+                    )
+                    continue
 
                 # Check if we're in the grace period after starting playback
                 in_grace_period = (

@@ -85,6 +85,25 @@ async def test_stop_without_a_known_position_is_a_track_end(backend, monkeypatch
     backend.ended.assert_called_once()
 
 
+async def test_failed_state_read_is_not_a_stop(backend, monkeypatch):
+    """GitHub #51: a SOAP timeout or Wi-Fi blip near the end of a track was read
+    as STOPPED and advanced the queue while the renderer kept playing."""
+    backend._furthest_position_ms = 199_000  # close enough to the end to count
+    backend._client.get_transport_info.return_value = None
+    await poll(backend, monkeypatch, times=3)
+    backend.ended.assert_not_called()
+    backend.interrupted.assert_not_called()
+    assert backend._state == PlaybackState.PLAYING
+    assert await backend.get_state() == PlaybackState.PLAYING
+
+
+async def test_real_stop_after_failed_reads_still_ends_track(backend, monkeypatch):
+    backend._furthest_position_ms = 199_000
+    backend._client.get_transport_info.side_effect = [None, "STOPPED"]
+    await poll(backend, monkeypatch, times=2)
+    backend.ended.assert_called_once()
+
+
 async def test_stream_cut_short_by_the_proxy_still_advances(backend, monkeypatch):
     backend._furthest_position_ms = 20_000
     backend._on_delivery_failure("123", False)
