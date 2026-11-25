@@ -584,16 +584,22 @@ class QobuzProxy:
             started = await new_speaker.start()
         finally:
             self._starting_speaker_ids -= reserved
-        # Kept even when the start failed, so the web UI shows its status
-        await self._adopt_started_speaker(new_speaker, new_config, epoch)
+        if started:
+            await self._adopt_started_speaker(new_speaker, new_config, epoch)
+            return new_speaker.get_status()
 
-        status = new_speaker.get_status()
-        if not started:
-            logger.warning(
-                f"Speaker '{new_config.name}' failed to start with new config "
-                "(configuration saved anyway)"
-            )
-            status["warning"] = "Configuration saved, but the speaker failed to start"
+        # Don't keep the failed instance as running: nothing would ever retry
+        # it. Retry in the background instead, like a speaker that failed at boot.
+        logger.warning(
+            f"Speaker '{new_config.name}' failed to start with new config "
+            "(configuration saved; retrying in background)"
+        )
+        if epoch != self._speakers_epoch:
+            self._retry_after_stale_start(new_config)  # Only if logged in again
+        elif any(sc is new_config for sc in self._config.speakers):  # Not removed meanwhile
+            self._schedule_speaker_retry(new_config)
+        status = _configured_speaker_status(new_config, "starting")
+        status["warning"] = "Configuration saved, but the speaker failed to start"
         return status
 
     async def _on_remove_speaker(self, speaker_id: str) -> None:

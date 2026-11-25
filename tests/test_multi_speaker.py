@@ -852,9 +852,11 @@ class TestSpeakerEditCallbacks:
         assert app._speakers == []
 
     async def test_edit_persists_config_when_restart_fails(self):
-        """Edits must be saved even if the speaker can't start (e.g. device offline)."""
-        import pytest  # noqa: F401
+        """Edits are saved even if the speaker can't start (e.g. device offline).
 
+        GitHub #53: the failed instance must not count as running, and the
+        speaker keeps retrying so it comes up once the renderer is back.
+        """
         config = _make_config(_make_speaker_config(name="Wyse", max_quality=6))
         old_speaker = MagicMock()
         old_speaker.name = "Wyse"
@@ -868,7 +870,6 @@ class TestSpeakerEditCallbacks:
         new_speaker = MagicMock()
         new_speaker.name = "Wyse"
         new_speaker.start = AsyncMock(return_value=False)  # device unreachable
-        new_speaker.get_status.return_value = {"id": "wyse", "status": "disconnected"}
 
         with (
             patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
@@ -881,8 +882,107 @@ class TestSpeakerEditCallbacks:
         assert config.speakers[0].max_quality == 27
         assert config.speakers[0].dlna_ip == "192.168.1.60"
         mock_save.assert_called_once()
-        assert app._speakers[0] is new_speaker
-        assert result["status"] == "disconnected"
+        assert app._speakers == []
+        assert result["status"] == "starting"
+        assert "warning" in result
+        retry = app._speaker_retry_tasks.get("wyse")
+        assert retry is not None and not retry.done()
+        assert {s["status"] for s in app._speakers_for_api()} == {"starting"}
+        await app._stop_speakers()
+
+    async def test_failed_edit_restart_comes_up_when_renderer_is_back(self):
+        """GitHub #53: the background retry starts the edited speaker later."""
+        config = _make_config(_make_speaker_config(name="Wyse"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        offline = _make_mock_speaker("Wyse", starts=False)
+        back = _make_mock_speaker("Wyse", starts=True)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", side_effect=[offline, back]),
+            patch("qobuz_proxy.app.SPEAKER_RETRY_DELAYS_SECONDS", (0,)),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("wyse", {"dlna_ip": "192.168.1.60"})
+            retry = app._speaker_retry_tasks["wyse"]
+            await asyncio.wait_for(retry, timeout=1)
+
+        assert app._speakers == [back]
+        back.start.assert_awaited_once()
+        assert app._speaker_retry_tasks == {}
+
+    async def test_failed_edit_restart_not_retried_after_logout(self):
+        """Speakers stopped while the edit was starting stay stopped."""
+        config = _make_config(_make_speaker_config(name="Wyse"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        offline = _make_mock_speaker("Wyse", starts=False)
+
+        async def start_during_logout() -> bool:
+            app._speakers_epoch += 1  # what _stop_speakers() does on logout
+            return False
+
+        offline.start = AsyncMock(side_effect=start_during_logout)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=offline),
+            patch.object(app, "_save_config"),
+        ):
+            result = await app._on_edit_speaker("wyse", {"dlna_ip": "192.168.1.60"})
+
+        assert app._speakers == []
+        assert app._speaker_retry_tasks == {}
+        assert "warning" in result
+
+    async def test_failed_edit_restart_not_retried_once_removed(self):
+        """A speaker removed while its edit was starting is not retried."""
+        config = _make_config(_make_speaker_config(name="Wyse"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        offline = _make_mock_speaker("Wyse", starts=False)
+
+        async def start_while_removed() -> bool:
+            await app._on_remove_speaker("wyse")
+            return False
+
+        offline.start = AsyncMock(side_effect=start_while_removed)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=offline),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("wyse", {"dlna_ip": "192.168.1.60"})
+
+        assert config.speakers == []
+        assert app._speaker_retry_tasks == {}
+
+    async def test_failed_edit_restart_retried_after_relogin(self):
+        """A login during the edit skipped the reserved speaker, so retry it."""
+        config = _make_config(_make_speaker_config(name="Wyse"))
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+        app._is_running = True
+
+        offline = _make_mock_speaker("Wyse", starts=False)
+
+        async def start_during_relogin() -> bool:
+            app._speakers_epoch += 1  # logout; the login that follows skips "wyse"
+            return False
+
+        offline.start = AsyncMock(side_effect=start_during_relogin)
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=offline),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_edit_speaker("wyse", {"dlna_ip": "192.168.1.60"})
+
+        retry = app._speaker_retry_tasks.get("wyse")
+        assert retry is not None and not retry.done()
+        await app._stop_speakers()
 
     async def test_edit_toggles_fixed_volume(self):
         """The edit form exposes Fixed volume; the flag must round-trip and survive
