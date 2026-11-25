@@ -28,6 +28,11 @@ UPNP_CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2.0
+# UPnP errors a retry cannot fix: 401 Invalid Action, 602 Invalid Args, and
+# AVTransport 710 Seek Mode Not Supported, 711 Illegal Seek Target and 712 Play
+# Mode Not Supported. Retrying a 710 delayed every track start by about five
+# seconds (GitHub #44).
+NO_RETRY_ERROR_CODES = frozenset({401, 602, 710, 711, 712})
 REQUEST_TIMEOUT_SECONDS = 10.0
 
 
@@ -846,8 +851,8 @@ class DLNAClient:
                             logger.warning(
                                 f"UPnP error: code={error_code_str}, description={error_desc}"
                             )
-                        # Don't retry permanent failures
-                        if last_error_code in (401, 602):
+                        # Don't retry errors that a retry cannot fix
+                        if last_error_code in NO_RETRY_ERROR_CODES:
                             return SoapResult(
                                 success=False,
                                 error_code=last_error_code,
