@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from qobuz_proxy.backends.dlna.client import DLNAClient, DLNAClientError
+from qobuz_proxy.backends.dlna import client as client_module
+from qobuz_proxy.backends.dlna.client import DLNAClient, DLNAClientError, SoapResult
 
 ADD_URI_RESPONSE = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -141,3 +142,58 @@ class TestGetMediaInfo:
 
         client._soap_action = AsyncMock(return_value=None)  # type: ignore[method-assign]
         assert await client.get_media_info() is None
+
+
+class _UPnPErrorSession:
+    """A session whose every POST answers with the same UPnP error."""
+
+    def __init__(self, code: int):
+        self.code = code
+        self.posts = 0
+
+    def post(self, *args, **kwargs):
+        session = self
+
+        class _Response:
+            status = 500
+
+            async def __aenter__(self):
+                session.posts += 1
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def text(self) -> str:
+                return (
+                    f"<Envelope><errorCode>{session.code}</errorCode>"
+                    "<errorDescription>nope</errorDescription></Envelope>"
+                )
+
+        return _Response()
+
+
+class TestSoapRetries:
+    @pytest.mark.parametrize("code", [710, 711, 712])
+    async def test_unsupported_seek_or_play_mode_is_not_retried(self, monkeypatch, code):
+        """GitHub #44: a renderer answering Seek with 710 "Seek Mode Not
+        Supported" was asked three times, 2 s apart, delaying every track start."""
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = _make_client()
+        session = _UPnPErrorSession(code)
+        client._session = session  # type: ignore[assignment]
+        assert await client.seek(30_000) is False
+        assert session.posts == 1
+
+    async def test_transient_error_is_retried(self, monkeypatch):
+        monkeypatch.setattr(client_module, "RETRY_DELAY_SECONDS", 0)
+        client = _make_client()
+        session = _UPnPErrorSession(701)
+        client._session = session  # type: ignore[assignment]
+        assert await client.seek(30_000) is False
+        assert session.posts == client_module.MAX_RETRIES
+
+    def test_unsupported_seek_mode_does_not_turn_gapless_off(self):
+        """Only 401/602 mean an action is unsupported (used to disable gapless)."""
+        assert not SoapResult(success=False, error_code=710).is_permanent_failure
+        assert SoapResult(success=False, error_code=401).is_permanent_failure
