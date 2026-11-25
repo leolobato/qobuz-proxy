@@ -76,6 +76,7 @@ ENV_MAPPINGS = {
     # Local audio
     "QOBUZPROXY_AUDIO_DEVICE": ("backend", "local", "device"),
     "QOBUZPROXY_AUDIO_BUFFER_SIZE": ("backend", "local", "buffer_size"),
+    "QOBUZPROXY_AUDIO_FIXED_VOLUME": ("backend", "local", "fixed_volume"),
     # Server
     "QOBUZPROXY_HTTP_PORT": ("server", "http_port"),
     "QOBUZPROXY_PROXY_PORT": ("backend", "dlna", "proxy_port"),
@@ -130,6 +131,7 @@ class LocalConfig:
 
     device: str = "default"  # Device name, index, or "default"
     buffer_size: int = 2048  # Audio buffer size in frames
+    fixed_volume: bool = False  # Keep output at 100%, ignore volume commands
 
 
 @dataclass
@@ -174,6 +176,14 @@ class SpeakerConfig:
     proxy_port: int = 0  # 0 = auto-assign
     audio_device: str = "default"
     audio_buffer_size: int = 2048
+    audio_fixed_volume: bool = False
+
+    @property
+    def fixed_volume(self) -> bool:
+        """Whether volume commands are ignored for this speaker's backend."""
+        if self.backend_type == "dlna":
+            return self.dlna_fixed_volume
+        return self.backend_type == "local" and self.audio_fixed_volume
 
 
 @dataclass
@@ -266,6 +276,13 @@ def parse_device_type(value: Any) -> str:
     return device_type
 
 
+def _parse_bool(value: Any) -> bool:
+    """A YAML or environment boolean ("true", "1", "yes", "on")."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
 def generate_speaker_uuid(speaker_name: str) -> str:
     """Generate a deterministic UUID for a speaker based on hostname and name."""
     return str(uuid.uuid5(_SPEAKER_UUID_NAMESPACE, f"{platform.node()}:{speaker_name}"))
@@ -301,6 +318,8 @@ def speaker_config_to_dict(sc: SpeakerConfig) -> dict:
     elif sc.backend_type == "local":
         d["audio_device"] = sc.audio_device
         d["audio_buffer_size"] = sc.audio_buffer_size
+        if sc.audio_fixed_volume:
+            d["audio_fixed_volume"] = True
     return d
 
 
@@ -321,6 +340,7 @@ def _single_speaker_from_config(config: Config) -> SpeakerConfig:
         proxy_port=config.backend.dlna.proxy_port,
         audio_device=config.backend.local.device,
         audio_buffer_size=config.backend.local.buffer_size,
+        audio_fixed_volume=config.backend.local.fixed_volume,
     )
 
 
@@ -427,6 +447,7 @@ def _parse_yaml_speakers(raw_speakers: list[dict], config: Config) -> list[Speak
             proxy_port=int(raw.get("proxy_port", 0)),
             audio_device=raw.get("audio_device", "default"),
             audio_buffer_size=int(raw.get("audio_buffer_size", 2048)),
+            audio_fixed_volume=_parse_bool(raw.get("audio_fixed_volume", False)),
         )
         speakers.append(speaker)
     return speakers
@@ -474,6 +495,7 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
     proxy_ports_raw = _split_env_padded("QOBUZPROXY_PROXY_PORT", count, "0")
     audio_devices = _split_env_padded("QOBUZPROXY_AUDIO_DEVICE", count, "default")
     audio_buffer_sizes_raw = _split_env_padded("QOBUZPROXY_AUDIO_BUFFER_SIZE", count, "2048")
+    audio_fixed_volumes_raw = _split_env_padded("QOBUZPROXY_AUDIO_FIXED_VOLUME", count, "false")
     qualities_raw = _split_env_padded("QOBUZ_MAX_QUALITY", count, "27")
 
     speakers = []
@@ -491,6 +513,7 @@ def _parse_env_speakers(config: Config) -> list[SpeakerConfig]:
             proxy_port=int(proxy_ports_raw[i]),
             audio_device=audio_devices[i],
             audio_buffer_size=int(audio_buffer_sizes_raw[i]),
+            audio_fixed_volume=_parse_bool(audio_fixed_volumes_raw[i]),
         )
         speakers.append(speaker)
 
@@ -602,7 +625,7 @@ def load_env_config() -> dict:
                     logger.warning(f"Invalid integer for {env_var}: {value}")
                     continue
             # Convert boolean values
-            elif env_var == "QOBUZPROXY_DLNA_FIXED_VOLUME":
+            elif env_var in ("QOBUZPROXY_DLNA_FIXED_VOLUME", "QOBUZPROXY_AUDIO_FIXED_VOLUME"):
                 value = value.lower() in ("true", "1", "yes", "on")
 
             # Set nested value
@@ -686,6 +709,9 @@ def dict_to_config(d: dict) -> Config:
             config.backend.local.device = local.get("device", config.backend.local.device)
             config.backend.local.buffer_size = local.get(
                 "buffer_size", config.backend.local.buffer_size
+            )
+            config.backend.local.fixed_volume = _parse_bool(
+                local.get("fixed_volume", config.backend.local.fixed_volume)
             )
 
     # Server

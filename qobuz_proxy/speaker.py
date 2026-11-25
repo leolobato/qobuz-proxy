@@ -136,11 +136,9 @@ class Speaker:
                 "album_art_url": meta.get("artwork_url", ""),
                 "quality": meta.get("quality_name", ""),
             }
-            # With fixed volume (a DLNA-only setting) the proxy never touches or
-            # tracks the renderer's level, so the cached value is just the
-            # initial default — omit it.
-            fixed_volume = self._config.backend_type == "dlna" and self._config.dlna_fixed_volume
-            if not fixed_volume:
+            # With fixed volume the proxy never touches or tracks the output
+            # level, so the cached value is just the initial default — omit it.
+            if not self._config.fixed_volume:
                 now_playing["volume"] = self._player._volume
 
         # Build config section
@@ -160,6 +158,7 @@ class Speaker:
         elif self._config.backend_type == "local":
             config_dict["audio_device"] = self._config.audio_device
             config_dict["buffer_size"] = self._config.audio_buffer_size
+            config_dict["fixed_volume"] = self._config.audio_fixed_volume
 
         return {
             "id": slugify_name(self._config.name),
@@ -200,6 +199,7 @@ class Speaker:
                 local=LocalConfig(
                     device=self._config.audio_device,
                     buffer_size=self._config.audio_buffer_size,
+                    fixed_volume=self._config.audio_fixed_volume,
                 ),
             ),
             server=ServerConfig(
@@ -305,6 +305,11 @@ class Speaker:
                 self._player.set_fixed_volume_mode(self._config.dlna_fixed_volume)
                 self._player.set_playback_permission_check(backend.can_apply_remote_state)
                 backend.on_external_playback(self._on_external_playback)
+            elif self._config.fixed_volume:
+                # Local output at full scale: volume is set on the DAC or amp,
+                # and digital attenuation would only cost resolution.
+                self._player.set_fixed_volume_mode(True)
+                await backend.set_volume(100)
 
             # 7. Create and start discovery service
             logger.debug(f"[{self.name}] Starting discovery service...")

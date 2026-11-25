@@ -526,6 +526,17 @@ class TestSessionOwnership:
         await manager._send_join_session()
         assert _last_join(manager).deviceInfo.capabilities.volumeRemoteControl == expected
 
+    @pytest.mark.parametrize(("fixed_volume", "expected"), [(True, 1), (False, 2)])
+    async def test_join_volume_capability_local(self, config, valid_tokens, fixed_volume, expected):
+        """GitHub #32: a local speaker with fixed volume has no volume control."""
+        config.backend.type = "local"
+        config.backend.local.fixed_volume = fixed_volume
+        manager = WsManager(config)
+        manager.set_tokens(valid_tokens, activate=True)
+        manager._ws = AsyncMock()
+        await manager._send_join_session()
+        assert _last_join(manager).deviceInfo.capabilities.volumeRemoteControl == expected
+
     @pytest.mark.parametrize(
         ("device_type", "expected"),
         [("speaker", 1), ("streamer", 2), ("soundbar", 4), ("headphones", 8)],

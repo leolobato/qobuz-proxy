@@ -15,8 +15,13 @@ from qobuz_proxy.config import (
     Config,
     ConfigError,
     LocalConfig,
+    SpeakerConfig,
+    _parse_env_speakers,
+    _parse_yaml_speakers,
+    _single_speaker_from_config,
     dict_to_config,
     load_env_config,
+    speaker_config_to_dict,
     validate_config,
 )
 from qobuz_proxy.cli import args_to_dict
@@ -209,6 +214,67 @@ class TestArgsToDict:
         )
         result = args_to_dict(args)
         assert result["backend"]["local"]["buffer_size"] == 4096
+
+    def test_fixed_volume_arg_applies_to_local(self) -> None:
+        from argparse import Namespace
+
+        args = Namespace(fixed_volume=True, backend_type="local")
+        result = args_to_dict(args)
+        assert result["backend"]["local"]["fixed_volume"] is True
+        assert result["backend"]["dlna"]["fixed_volume"] is True
+
+        result = args_to_dict(Namespace(fixed_volume=False))
+        assert "backend" not in result
+
+
+class TestLocalFixedVolume:
+    """GitHub #32: fixed volume for the local backend (output kept at 100%)."""
+
+    def test_default_off(self) -> None:
+        assert LocalConfig().fixed_volume is False
+        assert SpeakerConfig(backend_type="local").fixed_volume is False
+
+    def test_flat_yaml_config(self) -> None:
+        config = dict_to_config({"backend": {"type": "local", "local": {"fixed_volume": True}}})
+        assert config.backend.local.fixed_volume is True
+        assert _single_speaker_from_config(config).fixed_volume is True
+
+    @pytest.mark.parametrize(("value", "expected"), [("true", True), ("0", False)])
+    def test_flat_env_var(self, value: str, expected: bool) -> None:
+        with patch.dict(os.environ, {"QOBUZPROXY_AUDIO_FIXED_VOLUME": value}, clear=False):
+            result = load_env_config()
+        assert result["backend"]["local"]["fixed_volume"] is expected
+
+    def test_env_speakers(self) -> None:
+        env = {
+            "QOBUZPROXY_DEVICE_NAME": "Desk,Den",
+            "QOBUZPROXY_BACKEND": "local",
+            "QOBUZPROXY_AUDIO_FIXED_VOLUME": "true,false",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            speakers = _parse_env_speakers(Config())
+        assert [s.fixed_volume for s in speakers] == [True, False]
+
+    @pytest.mark.parametrize(("value", "expected"), [(True, True), ("false", False)])
+    def test_yaml_speaker(self, value: object, expected: bool) -> None:
+        raw = {"name": "Desk", "backend": "local", "audio_fixed_volume": value}
+        assert _parse_yaml_speakers([raw], Config())[0].fixed_volume is expected
+
+    def test_round_trip_through_config_file(self) -> None:
+        sc = SpeakerConfig(name="Desk", backend_type="local", audio_fixed_volume=True)
+        d = speaker_config_to_dict(sc)
+        assert d["audio_fixed_volume"] is True
+        assert _parse_yaml_speakers([d], Config())[0].fixed_volume is True
+        # Not written when off, so existing config files stay unchanged
+        assert "audio_fixed_volume" not in speaker_config_to_dict(
+            SpeakerConfig(name="Desk", backend_type="local")
+        )
+
+    def test_dlna_flag_does_not_apply_to_local(self) -> None:
+        sc = SpeakerConfig(backend_type="local", dlna_fixed_volume=True)
+        assert sc.fixed_volume is False
+        sc = SpeakerConfig(backend_type="dlna", audio_fixed_volume=True)
+        assert sc.fixed_volume is False
 
 
 def _mock_sounddevice():

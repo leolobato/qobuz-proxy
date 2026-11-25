@@ -580,7 +580,9 @@ class WsManager:
             session_uuid=self._session_uuid,
             max_audio_quality=self._max_audio_quality,
             supports_volume_control=not (
-                self.config.backend.type == "dlna" and self.config.backend.dlna.fixed_volume
+                self.config.backend.dlna.fixed_volume
+                if self.config.backend.type == "dlna"
+                else self.config.backend.type == "local" and self.config.backend.local.fixed_volume
             ),
             device_type=DEVICE_TYPES[self.config.device.device_type],
             is_active=is_active,
