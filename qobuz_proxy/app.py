@@ -55,6 +55,7 @@ def _configured_speaker_status(sc: SpeakerConfig, status: str) -> dict:
     elif sc.backend_type == "local":
         config_dict["audio_device"] = sc.audio_device
         config_dict["buffer_size"] = sc.audio_buffer_size
+        config_dict["fixed_volume"] = sc.audio_fixed_volume
     return {
         "id": slugify_name(sc.name),
         "name": sc.name,
@@ -446,6 +447,7 @@ class QobuzProxy:
             dlna_description_url=body.get("description_url", ""),
             audio_device=body.get("audio_device", "default"),
             audio_buffer_size=int(body.get("buffer_size", 2048)),
+            audio_fixed_volume=backend_type == "local" and bool(body.get("fixed_volume", False)),
         )
 
         assert self._api_client is not None
@@ -529,6 +531,11 @@ class QobuzProxy:
             proxy_port=old_config.proxy_port,
             audio_device=body.get("audio_device", old_config.audio_device),
             audio_buffer_size=int(body.get("buffer_size", old_config.audio_buffer_size)),
+            audio_fixed_volume=(
+                bool(body.get("fixed_volume", old_config.audio_fixed_volume))
+                if old_config.backend_type == "local"
+                else old_config.audio_fixed_volume
+            ),
         )
 
         # The edited speaker replaces any pending boot retry of the old config.

@@ -177,7 +177,7 @@ Environment Variables:
     dlna_group.add_argument(
         "--fixed-volume",
         action="store_true",
-        help="Ignore volume commands (for external amp control)",
+        help="Ignore volume commands (for external amp control); local audio stays at 100%%",
     )
 
     # Local Audio Backend
@@ -273,6 +273,9 @@ def args_to_dict(args: argparse.Namespace) -> dict:
         if arg_name == "fixed_volume" and not value:
             continue
         _set_nested(result, path, value)
+    # --fixed-volume applies to whichever backend the speaker uses
+    if getattr(args, "fixed_volume", None):
+        _set_nested(result, ("backend", "local", "fixed_volume"), True)
 
     return result
 
@@ -289,6 +292,8 @@ def log_config(config: Config) -> None:
             logger.info(f"  Proxy server: {sc.bind_address}:{sc.proxy_port}")
         elif sc.backend_type == "local":
             logger.info(f"  Audio device: {sc.audio_device}")
+            if sc.audio_fixed_volume:
+                logger.info("  Volume control: disabled (fixed_volume=true, output at 100%)")
             logger.info(f"  Buffer size: {sc.audio_buffer_size} frames")
         logger.info(f"  HTTP server: {sc.bind_address}:{sc.http_port}")
         logger.info(f"  Max quality: {sc.max_quality}")

@@ -917,6 +917,35 @@ class TestSpeakerEditCallbacks:
             await app._on_edit_speaker("moode", {"fixed_volume": False})
             assert config.speakers[0].dlna_fixed_volume is False
 
+    async def test_local_speaker_fixed_volume_from_web_ui(self):
+        """GitHub #32: the web UI's Fixed volume checkbox works for local speakers."""
+        config = _make_config()
+        app = QobuzProxy(config)
+        app._api_client = MagicMock()
+
+        new_speaker = MagicMock()
+        new_speaker.name = "Desk"
+        new_speaker.start = AsyncMock(return_value=True)
+        new_speaker.stop = AsyncMock()
+
+        with (
+            patch("qobuz_proxy.app.Speaker", return_value=new_speaker),
+            patch.object(app, "_save_config"),
+        ):
+            await app._on_add_speaker({"name": "Desk", "backend": "local", "fixed_volume": True})
+            assert config.speakers[0].fixed_volume is True
+
+            # An edit that doesn't mention the flag keeps the current value
+            await app._on_edit_speaker("desk", {"max_quality": 6})
+            assert config.speakers[0].fixed_volume is True
+
+            await app._on_edit_speaker("desk", {"fixed_volume": False})
+            assert config.speakers[0].fixed_volume is False
+
+        app._speakers = []
+        status = app._speakers_for_api()[0]
+        assert status["config"]["fixed_volume"] is False
+
     async def test_edit_sets_device_type(self):
         """The edit form's device type must round-trip and survive edits that omit it."""
         import pytest

@@ -51,6 +51,8 @@ docker run -d --network host \
 
 Note: The `--device /dev/snd` flag gives the container access to the host's audio devices (Linux only). Qobuz credentials should be in your `data/config.yaml`.
 
+If you set the volume on your DAC or amplifier, set `QOBUZPROXY_AUDIO_FIXED_VOLUME=true` (or `audio_fixed_volume: true` for the speaker in `config.yaml`, or tick "Fixed volume" in the web UI). The output then stays at 100% with no digital attenuation, and the Qobuz app shows no volume control.
+
 ## Installation
 
 A pre-built Docker image is available from GitHub Container Registry:

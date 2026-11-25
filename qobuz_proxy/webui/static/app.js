@@ -293,6 +293,7 @@
             html += '<label>Audio Device (leave blank for default)</label>';
             html += '<input type="text" id="edit-audio-device" value="' + escapeHtml(cfg.audio_device || "") + '" placeholder="default">';
             html += '</div>';
+            html += '<div class="form-group"><label><input type="checkbox" id="edit-fixed-vol" style="width:auto;display:inline;margin-right:6px;"' + (cfg.fixed_volume ? ' checked' : '') + '> Fixed volume (output at 100%)</label></div>';
         }
 
         html += '<div class="form-group">';
@@ -625,6 +626,7 @@
             html += '<label>Audio device (leave blank for default)</label>';
             html += '<input type="text" id="new-audio-device" value="' + escapeHtml(defaultDevice) + '" placeholder="default">';
             html += '</div>';
+            html += '<div class="form-group"><label><input type="checkbox" id="new-fixed-vol" style="width:auto;display:inline;margin-right:6px;"> Fixed volume (output at 100%)</label></div>';
         }
 
         html += '<div class="form-group">';
@@ -679,6 +681,8 @@
         } else if (selectedBackend === "local") {
             var devEl = document.getElementById("new-audio-device");
             payload.audio_device = devEl ? devEl.value.trim() : "";
+            var localFixedVolEl = document.getElementById("new-fixed-vol");
+            payload.fixed_volume = localFixedVolEl ? localFixedVolEl.checked : false;
         }
 
         var submitBtn = document.getElementById("add-speaker-submit");
@@ -761,6 +765,8 @@
         } else if (backend === "local") {
             var devEl = document.getElementById("edit-audio-device");
             payload.audio_device = devEl ? devEl.value.trim() : "";
+            var localFixedVolEl = document.getElementById("edit-fixed-vol");
+            if (localFixedVolEl) payload.fixed_volume = localFixedVolEl.checked;
         }
 
         var submitBtn = document.getElementById("edit-speaker-submit");

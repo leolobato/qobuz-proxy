@@ -599,6 +599,13 @@ class TestNowPlayingStatus:
 
         assert np["volume"] == 50
 
+    def test_omits_volume_for_local_fixed_volume_speaker(self):
+        speaker = self._playing_speaker(backend_type="local", audio_fixed_volume=True)
+        status = speaker.get_status()
+
+        assert "volume" not in status["now_playing"]
+        assert status["config"]["fixed_volume"] is True
+
 
 class TestQualitySourceStatus:
     """get_status() must say where the effective quality came from."""
